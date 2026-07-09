@@ -4,40 +4,62 @@ date: '2024-10-27'
 tags: ["Networking", "Go", "Memory Optimization", "Database"]
 category: Tech
 draft: false
-summary: "Optimizing memory usage in Mess With DNS by reducing IP address lookup memory usage."
+summary: "How I cut the IP lookup database from 117MB to 46MB in a Go DNS playground, fixing OOM crashes on a tiny 465MB server."
 ---
 
-Mess With DNS is a DNS playground, but it ran into a critical issue: **periodic out-of-memory (OOM) errors**. The culprit was the IP address lookup database, which consumed a massive chunk of our limited 465MB of RAM.
+I run a DNS playground called Mess With DNS. It's a fun project, but it kept crashing. The server only has 465MB of RAM, and the IP address lookup database was eating 117MB of it. That's a quarter of all memory, gone.
+
+PowerDNS took another 100MB. Mess With DNS itself needed 200MB. Add it up and the server was constantly living at the edge. One bad request and boom, OOM kill.
+
+Here's how I fixed it.
 
 <Callout type="danger" title="The Memory Crisis">
   Out of 465MB total RAM, the IP address lookup database was eating **117MB**. Combined with PowerDNS (100MB) and Mess With DNS (200MB), the server was constantly pushed to its breaking point.
 </Callout>
 
-Here is the journey of how we optimized it.
+## Trying the Obvious Thing First
 
-## The Optimization Journey
+My first thought was SQLite. Move the database to disk, keep RAM for the things that actually need speed. Simple, right?
 
-<Stepper>
-  <Step title="Attempt 1: Using SQLite">
-    **The Idea:** Move the database to disk using SQLite to free up RAM.
-    
-    **The Result:** A failure. SQLite lacked support for big integers (forcing IPv6 addresses to be stored as text), and the disk lookups were **500x slower** than the original binary search implementation.
-  </Step>
+Wrong.
 
-  <Step title="Attempt 2: Using a Trie">
-    **The Idea:** Store IPs in an in-memory Trie data structure for fast prefix matching.
-    
-    **The Result:** Worse than before. The Trie implementation bloated memory usage to a staggering **800MB** and was somehow slower than the baseline binary search.
-  </Step>
+SQLite doesn't support big integers properly. IPv6 addresses had to be stored as text strings. That felt wrong, but I pushed ahead anyway to see if it would work.
 
-  <Step title="Attempt 3: Optimizing the Array (Success!)">
-    **The Idea:** Go back to the original array-based binary search, but optimize the data layout.
-    
-    **The Fixes:**
-    1. **Deduplicate ASN information:** We moved repeated ASN data into a separate array and referenced it by index. *Saved 50MB.*
-    2. **Use `netip.Addr` instead of `net.IP`:** Go's `netip.Addr` is much smaller and more efficient than the legacy `net.IP` type. *Saved 20MB.*
-  </Step>
-</Stepper>
+The real killer was performance. Disk lookups were **500x slower** than the array-based binary search I already had. I'm not talking about microseconds here. We're in "noticeably hangs" territory. A DNS playground that hangs isn't a playground. It's a frustration machine.
+
+So that was a dead end.
+
+## Making Things Worse With a Trie
+
+Next I tried a trie. In theory, tries are great for prefix matching, which is exactly what IP lookups need. I was confident this would work.
+
+It did not work.
+
+The trie ballooned memory to **800MB**. That's more RAM than the server has period. And it was somehow slower than the original binary search too. I'd made the problem worse, not better.
+
+<Callout type="idea" title="What I Learned Early">
+  Sometimes the elegant data structure isn't the right one. A simple array with binary search was already beating fancier approaches on both speed and memory.
+</Callout>
+
+At this point I stepped back. I already had something that worked well: the array-based binary search. It was fast and correct. The only problem was memory. So instead of replacing the whole thing, why not fix what I had?
+
+## What Actually Worked
+
+I went back to the original approach and looked for waste. Two big things stood out.
+
+### Deduplicating ASN Information
+
+The original data structure stored ASN information inline with every IP range. The problem? Lots of ranges share the same ASN. If 10,000 ranges belong to the same ISP, you're storing the same company name, country code, and description ten thousand times.
+
+I pulled ASN data into a separate array and stored an index instead. One copy of each ASN. Everything else just points to it.
+
+This saved **50MB**. Not bad for a refactor that took an afternoon.
+
+### Switching to `netip.Addr`
+
+The original code used Go's old `net.IP` type. It's the standard library type everyone reaches for. But it has a problem: it's a byte slice under the hood. Every `net.IP` value carries slice header overhead plus the backing array.
+
+Go 1.18 introduced `netip.Addr` in the `net/netip` package. It's a value type: 16 bytes on the stack, no heap allocation. That's dramatically smaller than a byte slice.
 
 <Callout type="info" title="Memory Profiling in Go">
   If you're tracking down memory leaks in Go, use the `runtime` and `pprof` packages:
@@ -46,6 +68,26 @@ Here is the journey of how we optimized it.
   * Pass `--alloc-space` or `--inuse-space` to differentiate between historical allocations and active memory usage.
 </Callout>
 
-## Conclusion
+Switching types saved another **20MB**. All without changing the lookup logic.
 
-By analyzing our data structures and making targeted changes to our Go code, we reduced the IP lookup database's memory footprint from **117MB down to 46MB**—a **60% reduction**. The final solution retained the blazing speed of binary search without crashing the server!
+## The Results
+
+The IP lookup database went from 117MB to 46MB. That's a 60% reduction. Binary search speed stayed exactly the same.
+
+The server stopped crashing. Users could actually use the playground without random disconnects. A win all around.
+
+<Callout type="info" title="Final Numbers">
+  | Metric | Before | After |
+  |--------|--------|-------|
+  | IP lookup memory | 117MB | 46MB |
+  | Server margin | ~48MB | ~119MB |
+  | Lookup speed | Fast | Same |
+</Callout>
+
+## What I'd Do Differently
+
+If I could go back, I'd skip the trie entirely. It was the wrong tool for the data size I was dealing with. Maybe it would work at internet scale, but this isn't Google's BGP table. It's a hobby project.
+
+I'd also profile first instead of guessing. A quick pprof heap profile would have shown me the ASN duplication problem in minutes instead of the days I spent trying SQLite and tries. Measuring beats assuming every time.
+
+The real lesson? You don't always need a clever solution. Sometimes you need to look at what you already have and ask: where's the waste?
