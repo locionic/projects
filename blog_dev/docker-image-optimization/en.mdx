@@ -1,0 +1,208 @@
+---
+title: "Why My Docker Images Were 1GB (And How I Shrank Them to 50MB)"
+date: '2026-07-13'
+lastUpdated: '2026-07-13'
+tags: [Docker, DevOps, optimization, containerization]
+category: Tech
+draft: false
+summary: "I cut my Docker images from 1GB to 50MB using multi-stage builds, Alpine, and a few hard lessons. Here's exactly how I did it."
+---
+
+I pushed a Docker image to production and watched the deploy spinner spin for three minutes. Then it crashed. Not because of a bug, but because pulling that 1.2GB image took forever and our CI runner timed out.
+
+I knew my image was big. I didn't realize how big until I ran `docker images` and saw the number staring back at me. Over a gigabyte for a simple Node.js API. Embarrassing.
+
+So I went on a diet. Not my own, my Docker images. Here's what I learned about shrinking them from bloated monsters into lean, mean containers.
+
+## The Problem: What Was Eating All That Space?
+
+Let me guess. Your Dockerfile looks something like what mine did.
+
+<DiffView
+  oldCode={`FROM node:18
+WORKDIR /app
+COPY . .
+RUN npm install
+RUN npm run build
+EXPOSE 3000
+CMD ["npm", "start"]`}
+  newCode={`FROM node:18-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+COPY . .
+RUN npm run build
+
+FROM node:18-alpine
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+EXPOSE 3000
+CMD ["node", "dist/index.js"]`}
+  language="dockerfile"
+  mode="unified"
+/>
+
+Seven lines. Innocent looking. But that one image was carrying around the entire Node.js SDK, build tools, dev dependencies, and every layer of my source code including the kitchen sink.
+
+I ran `docker image history` on that beast. It showed me each layer and its size. The npm install step alone was 450MB. The full Node base image was another 350MB. And my `COPY . .` line? That copied everything, including the node_modules I'd installed locally and a folder full of 4K video assets I used for testing.
+
+## How I Diagnosed the Bloat
+
+Before you can fix anything, you need a clear picture of the damage.
+
+I used three tools that changed everything:
+
+<Callout type="info" title="My Bloat-Detection Toolkit">
+  Run `docker image history <image>` to see per-layer sizes. Then `docker system df` for total disk usage. And if you want the real story, install `dive` and run `dive <image>` for an interactive breakdown of every layer's contents.
+</Callout>
+
+Dive was the eye-opener. It showed me a color-coded view of each layer with the files added or modified. I could literally see the 200MB of test fixtures and the entire `.git` folder sitting inside my production image.
+
+I spent a whole weekend experimenting. By Monday, I had cut the image size by 95%. Here's exactly how.
+
+## Step 1: Multi-Stage Builds (The Big One)
+
+Multi-stage builds were the single most impactful change I made.
+
+The concept is simple. You use multiple `FROM` statements in one Dockerfile. The first stages handle compilation and dependency installation. The final stage copies only the artifacts you need.
+
+<Callout type="idea" title="The Core Insight">
+  Each FROM statement creates a new stage. Only the last stage becomes your final image. Everything in earlier stages is discarded. Build tools, intermediate files, cached dependencies, all gone.
+</Callout>
+
+My original Dockerfile used one stage. It installed TypeScript, all dev dependencies, and every npm package known to humanity. Then it ran the app. That meant sharp, eslint, prettier, and a dozen other dev tools were living in my production container.
+
+My new approach used two stages. The builder stage installed everything and compiled the code. The production stage copied only the compiled output and production dependencies.
+
+The result? My image went from 1.2GB to 280MB. A decent start, but I wasn't done yet.
+
+## Step 2: Alpine Saved Me 200MB
+
+Node's official `node:18` image is based on Ubuntu. It's comfortable, but it weighs 350MB before you add a single line of your code.
+
+The `node:18-alpine` variant? It's 30MB.
+
+Alpine Linux uses musl libc instead of glibc. It replaces bash with ash. It trades comfort for compactness. And in most cases, your app won't notice the difference.
+
+<Alert type="warning" title="Watch Out for Native Modules">
+  If your app uses native Node modules (node-gyp, bcrypt, sharp), Alpine can cause headaches. You might need to install build dependencies like python3 and g++ in your builder stage. I learned this the hard way when my bcrypt bindings failed at runtime.
+</Alert>
+
+Switching to Alpine cut my base image from 350MB to 30MB. Combined with multi-stage builds, I was down to around 120MB total.
+
+## Step 3: The .dockerignore I Should Have Written
+
+Here's a confession. My first Dockerfile used `COPY . .` and I never thought twice about it.
+
+That single line was copying my entire project directory into every build. Including node_modules, .git, .env files, test fixtures, and design mockups I'd downloaded months ago.
+
+The fix was embarrassingly simple.
+
+<DiffView
+  oldCode={``}
+  newCode={`node_modules
+.git
+.env
+.env.local
+*.md
+test/
+tests/
+coverage/
+.vscode/
+design-assets/
+*.log`}
+  language="dockerfile"
+  mode="unified"
+/>
+
+A .dockerignore file. One file, maybe 10 lines. It tells Docker what NOT to send to the build context.
+
+This alone saved me about 150MB. But more importantly, it made my builds faster. Docker wasn't packaging and sending hundreds of megabytes of irrelevant files to the daemon on every build.
+
+## Step 4: Dependency Triage
+
+<Accordion type="single" defaultValue="npm">
+  <AccordionItem title="npm ci vs npm install" value="npm">
+    <Badge variant="primary">60MB saved</Badge>
+
+    `npm install` installs devDependencies by default. `npm ci --only=production` installs exactly what's in your lockfile and skips dev packages. This cut my node_modules from 300MB to 60MB.
+  </AccordionItem>
+  <AccordionItem title="Unused Packages" value="unused">
+    <Badge variant="primary">40MB saved</Badge>
+
+    I ran `depcheck` and found 14 packages I wasn't even using. Moment.js, lodash, a dozen utility libraries. Dead weight. I removed them all.
+  </AccordionItem>
+  <AccordionItem title="Layer Caching" value="layers">
+    <Badge variant="primary">Faster builds</Badge>
+
+    I reordered my Dockerfile to copy package.json before source code. Docker caches each layer. When source changes don't invalidate the npm install layer, builds are seconds instead of minutes.
+  </AccordionItem>
+</Accordion>
+
+I'll be honest. The npm ecosystem encourages bloat. `npm install` pulls in everything including the kitchen sink. But `npm ci --only=production` is your friend. It uses the lockfile, installs exactly what's specified, and skips dev dependencies entirely.
+
+One thing I learned the hard way. Order your COPY commands strategically. Copy `package.json` and `package-lock.json` first, run npm install, then copy the rest of your source. This way Docker caches the npm layer and only reruns it when your dependencies change.
+
+## Step 5: Breaking It Down With Docker Slim
+
+Sometimes you need a scalpel instead of a sledgehammer. That's where DockerSlim comes in.
+
+<Callout type="info" title="DockerSlim Results">
+  DockerSlim analyzes your running container and strips out everything your app doesn't actually touch. It removes unused binaries, files, libraries, and permissions. On my API image, it removed another 40MB of cruft that my manual cleanup missed.
+</Callout>
+
+I ran `docker-slim build --http-probe my-image` and watched it shrink from 120MB to 78MB. It performed static analysis on the binary, dynamic analysis on the running process, and eliminated files that my Node runtime never opened.
+
+## The Final Results
+
+Let me show you the numbers.
+
+<ConceptCompare
+  columns={["Metric", "Before", "After"]}
+  rows={[
+    { feature: "Image Size", cells: [{ text: "1.2 GB", type: "negative" }, { text: "48 MB", type: "positive" }] },
+    { feature: "Build Time", cells: [{ text: "4 min 30 s", type: "negative" }, { text: "45 s", type: "positive" }] },
+    { feature: "Pull Time (10 Mbps)", cells: [{ text: "~16 min", type: "negative" }, { text: "~40 s", type: "positive" }] },
+    { feature: "Layers", cells: [{ text: "14", type: "warning" }, { text: "5", type: "positive" }] },
+    { feature: "Vulnerabilities", cells: [{ text: "127", type: "negative" }, { text: "23", type: "positive" }] }
+  ]}
+/>
+
+A 1.2GB image became 48MB. Build time dropped from four and a half minutes to under a minute. Pull time went from a coffee break to a quick stretch.
+
+The vulnerability reduction surprised me. Fewer packages means fewer CVE targets. My security scan went from 127 findings to 23. Not a coincidence.
+
+<Callout type="warning" title="Your Mileage May Vary">
+  These numbers depend on your stack. A Go binary will shrink differently than a Python app. A Java app with Spring Boot is a different beast entirely. But the principles are universal.
+</Callout>
+
+## What I'd Tell My Past Self
+
+If I could go back six months and write myself a note, it would say:
+
+**Start with the base image.** Default images are comfortable but fat. Alpine or distroless will save you hundreds of megabytes before you write a single line of code.
+
+**Use multi-stage builds from day one.** It takes five minutes to set up and saves you a mountain of headache later. Your builder stage installs everything. Your production stage takes only what it needs.
+
+**Ignore .dockerignore at your own peril.** That file is the cheapest optimization you'll ever make. Write it before your first `docker build`.
+
+**Measure everything.** Run `dive` before and after each change. If you can't measure it, you're guessing.
+
+## The Real Lesson
+
+Smaller images are faster to deploy. They're more secure. They're cheaper to store in your registry. They use less bandwidth. They make your CI pipeline happy.
+
+But the real win? I stopped dreading deployments. My image goes from commit to production in under two minutes. When something breaks, I ship a fix in seconds, not minutes.
+
+That 1GB image wasn't just wasting disk space. It was wasting my time.
+
+Don't wait until your CI times out. Cut the fat now. Your future self will thank you.
+
+<Quiz
+  question="What is the most impactful technique for reducing Docker image size?"
+  options={["Switching to a smaller base image", "Using .dockerignore", "Multi-stage builds", "Running DockerSlim"]
+  }
+  correctIndex={2}
+  explanation="Multi-stage builds separate the build environment from the runtime environment, letting you discard build tools, dev dependencies, and intermediate files entirely. It typically yields the biggest single reduction."
+/>
