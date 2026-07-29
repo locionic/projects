@@ -1,0 +1,298 @@
+---
+title: 'Kubernetes HPA Custom Metrics with Prometheus Adapter'
+images: ['/static/images/kubernetes-hpa-custom-prometheus-metrics.jpg']
+date: '2026-07-29'
+tags: ['kubernetes', 'devops', 'prometheus', 'hpa', 'metrics']
+draft: true
+summary: 'Learn how to configure Kubernetes Horizontal Pod Autoscaler using custom Prometheus metrics with step-by-step manifests and troubleshooting.'
+images:
+  - '/static/images/kubernetes-hpa-custom-prometheus-metrics-featured.jpg'
+  - '/static/images/kubernetes-hpa-custom-prometheus-metrics-architecture.jpg'
+  - '/static/images/kubernetes-hpa-custom-prometheus-metrics-adapter-config.jpg'
+  - '/static/images/kubernetes-hpa-custom-prometheus-metrics-hpa-manifest.jpg'
+  - '/static/images/kubernetes-hpa-custom-prometheus-metrics-troubleshooting.jpg'
+  - '/static/images/kubernetes-hpa-custom-prometheus-metrics-behavior-tuning.jpg'
+authors: ['default']
+category: 'DevOps'
+---
+
+
+Scaling application workloads based on real workload pressure requires looking beyond basic node resource metrics like CPU percentage or memory consumption. Modern microservices frequently experience performance bottlenecks caused by HTTP request backlogs, active worker thread saturation, or asynchronous message queue depths long before CPU usage crosses scale triggers. By connecting the Kubernetes Horizontal Pod Autoscaler directly to custom Prometheus application metrics, you're able to scale target pods dynamically based on real traffic demands.
+
+## How Does Custom Metric Autoscaling Work in Kubernetes?
+
+Custom metric autoscaling works in Kubernetes by querying the Custom Metrics API aggregation layer, which routes telemetry requests directly to an adapter like Prometheus Adapter to convert raw time-series data into Kubernetes metric objects. When the Horizontal Pod Autoscaler control loop executes every fifteen seconds, it queries `custom.metrics.k8s.io` rather than the standard resource metrics endpoint. The custom metrics adapter translates incoming PromQL expressions into standardized Kubernetes API responses containing target metric values. Once the autoscaler retrieves these metric values, it calculates the desired replica count using the ratio between current metric observations and defined target thresholds.
+
+![Custom Metrics Architecture Overview](/static/images/kubernetes-hpa-custom-prometheus-metrics-architecture.jpg)
+
+Understanding the internal control flow prevents common architectural mistakes during cluster setup. The Kubernetes control plane doesn't scrape application endpoints directly. Instead, your application exposes Prometheus formatted metrics at an HTTP endpoint like `/metrics`. Prometheus continuously scrapes these endpoints, stores the time-series records in its local storage database, and makes them available for querying. The Prometheus Adapter acts as an API extension server that implements the `custom.metrics.k8s.io/v1beta1` interface. It regularly executes registered PromQL queries against your Prometheus server, caches the calculation results, and responds to API requests initiated by the Horizontal Pod Autoscaler controller.
+
+To ensure deterministic scaling behavior, the custom metric values must be associated with specific Kubernetes resources like Pods, Namespaces, or Services. The API server enforces strict label matching between the metric definition and the target workload selectors. If your application metric lacks pod name labels or namespace identification, the adapter can't map the scalar value back to individual pod instances. This decoupling ensures that cluster control loops remain isolated from specific monitoring vendors while giving platform operators complete flexibility to write sophisticated PromQL queries.
+
+Here's an architectural overview of how telemetry metrics flow through the control plane components during a scaling decision:
+
+```
++
+----
+----
+----
+------+         Scrapes         +
+----
+----
+----
+----
+----+
+| Application Pod  | <
+----
+----
+----
+----
+------ | Prometheus Server  |
+|  (/metrics)      |                         |  (TSDB Storage)    |
++
+----
+----
+----
+------+                         +
+----
+----
+----
+----
+----+
+         ^                                             ^
+         |                                             | PromQL Queries
+         | Managed By                                  v
++
+----
+----
+----
+------+     Queries API         +
+----
+----
+----
+----
+----+
+| HPA Controller   | 
+----
+----
+----
+----
+------> | Prometheus Adapter |
+| (Control Loop)   |  custom.metrics.k8s.io  | (API Extension)    |
++
+----
+----
+----
+------+                         +
+----
+----
+----
+----
+----+
+```
+
+## How Do You Configure Prometheus Adapter Rules for Custom Metrics?
+
+You configure Prometheus Adapter rules for custom metrics by editing the adapter configuration Map to define series matching regex patterns, resource associations, metric naming templates, and explicit PromQL aggregation queries. The configuration file governs how raw Prometheus metric series translate into queryable Kubernetes API endpoints. Without explicit adapter rules, the API server won't expose your custom application metrics to the Horizontal Pod Autoscaler controller.
+
+![Prometheus Adapter Rules Configuration](/static/images/kubernetes-hpa-custom-prometheus-metrics-adapter-config.jpg)
+
+The configuration file consists of four primary sections for every rule block: `seriesQuery`, `resources`, `name`, and `metricsQuery`. The `seriesQuery` selects candidate time-series from Prometheus matching specific metric name patterns and label key presence. The `resources` block maps Prometheus metric labels like `kubernetes_pod_name` or `namespace` to Kubernetes API resource types like `pod` and `namespace`. The `name` block renames the raw Prometheus metric into a clean metric name presented by the custom metrics API. Finally, the `metricsQuery` defines the exact PromQL expression used to aggregate metrics when the autoscaler requests scalar values.
+
+Let me show you a complete, production-ready Helm `values.yaml` configuration block for Prometheus Adapter that transforms raw HTTP request rates into a pod-level metric:
+
+```yaml
+rules:
+  default: false
+  custom:
+    - seriesQuery: 'http_requests_total{kubernetes_pod_name!="",kubernetes_namespace!=""}'
+      resources:
+        overrides:
+          kubernetes_namespace: {resource: "namespace"}
+          kubernetes_pod_name: {resource: "pod"}
+      name:
+        matches: "^(.*)_total"
+        as: "${1}_per_second"
+      metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)'
+    - seriesQuery: 'queue_depth_messages{kubernetes_pod_name!="",kubernetes_namespace!=""}'
+      resources:
+        overrides:
+          kubernetes_namespace: {resource: "namespace"}
+          kubernetes_pod_name: {resource: "pod"}
+      name:
+        matches: "^(.*)"
+        as: "queue_depth_messages"
+      metricsQuery: 'sum(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+```
+
+Notice how template variables like `<<.Series>>`, `<<.LabelMatchers>>`, and `<<.GroupBy>>` dynamicize the query evaluation. When the HPA requests the metric `http_requests_per_second` for pods in the `default` namespace, the Prometheus Adapter substitutes `<<.Series>>` with `http_requests_total`, populates `<<.LabelMatchers>>` with pod name filters, and sets `<<.GroupBy>>` to `kubernetes_pod_name`. This automatic parameter substitution allows a single rule pattern to serve hundreds of distinct microservices running across your cluster without writing boilerplate queries for every application.
+
+When defining `metricsQuery`, you should always use rate functions over short time windows like two minutes rather than instantaneous gauge values for counter metrics. Raw counter values continuously increment over time, making them unsuitable for direct target thresholds. Applying `rate()` converts raw counters into per-second rates that reflect real-time workload throughput. Furthermore, setting `default: false` in your Helm configuration prevents the adapter from automatically discovering thousands of unused cluster metrics, which dramatically reduces CPU overhead and memory consumption on the adapter pods.
+
+## How Do You Define an HPA Manifest Using Custom Prometheus Metrics?
+
+You define an HPA manifest using custom Prometheus metrics by specifying `v2` as the `apiVersion`, selecting `Pods` or `Object` as the metric source type, and setting target metric thresholds in the `metrics` array. The Kubernetes `autoscaling/v2` API specification provides native support for multiple metric types including resource, custom pod, object, and external metrics. When targeting pod-level custom metrics, you must select `type: Pods` and set `metric.name` to match the exact name exposed by your Prometheus Adapter rule.
+
+![HPA Custom Metric Manifest Setup](/static/images/kubernetes-hpa-custom-prometheus-metrics-hpa-manifest.jpg)
+
+In the HPA manifest spec, `type: Pods` tells the controller that the metric value represents a per-pod metric that must be averaged across all active pods in the target workload. The metric target must use `type: AverageValue` with a quantity like `50` or `500m` (which represents 0.5 requests per second). The autoscaler sums the metric values across all running pods, divides by the current replica count, and compares the result against your specified target average value to decide whether to scale out or scale in.
+
+Here's a production manifest that scales an API deployment based on HTTP request throughput per pod:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-service-hpa
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "35"
+```
+
+If you need to scale your deployment based on an un-namespaced resource or an external system like an AWS SQS queue or Redis list depth, you should use `type: External` or `type: Object` instead of `type: Pods`. For instance, when scaling a background queue worker deployment, the metric value reflects the total length of the queue rather than a value measured inside individual worker pods. In that scenario, setting `type: Value` under an `Object` or `External` target allows the HPA to divide total queue length by the desired workload processing capacity per pod.
+
+Combining multiple metric sources in a single HPA manifest provides dependable fail-safe scaling guarantees for mission-critical deployments. When multiple metrics are configured in the `metrics` array, the Horizontal Pod Autoscaler calculates the proposed replica count for each metric independently and picks the highest calculated replica count. This means if CPU utilization suddenly spikes due to a expensive garbage collection cycle while request rates remain low, the HPA will still scale up pods to protect service availability.
+
+```yaml
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "35"
+```
+
+## How Do You Troubleshoot Custom Metrics API Errors and HPA Failure Modes?
+
+You troubleshoot Custom Metrics API errors by querying the raw custom metrics REST API endpoint with `kubectl get --raw`, checking Prometheus Adapter logs for PromQL execution failures, and describing the HPA resource to inspect status conditions. When the HPA reports `unable to fetch metric` or `invalid metric value`, the issue almost always lies in label matching mismatches or adapter configuration errors. Direct API queries allow you to isolate whether the failure stems from Prometheus data ingestion, adapter query translation, or Kubernetes RBAC permissions.
+
+![Troubleshooting Custom Metrics API Endpoint](/static/images/kubernetes-hpa-custom-prometheus-metrics-troubleshooting.jpg)
+
+The first step in diagnosing custom metrics failures is verifying that the extension API server is registered and healthy within the Kubernetes control plane. Running `kubectl get apiservices v1beta1.custom.metrics.k8s.io` should display `AVAILABLE: True`. If the status shows false or degraded, check whether the Prometheus Adapter deployment is running, healthy, and accessible over TLS on port 6443. If certificate verification fails between the API aggregator and the adapter, custom metric queries will fail immediately with connection refused errors.
+
+Once you confirm API service health, query the raw custom metrics endpoint directly using `kubectl` to verify metric exposure:
+
+```bash
+kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/production/pods/*/http_requests_per_second" | jq .
+```
+
+If this command returns an empty item list, the Prometheus Adapter can't find matching metric series in Prometheus that satisfy your rule's `seriesQuery` and label criteria. Verify that your application pods export the metric with exact label keys like `kubernetes_pod_name` or `pod`. Common Prometheus scraping setups using ServiceMonitors often rename pod labels to `pod_name` or `instance`. If label keys don't match your adapter rule overrides, the adapter can't associate time-series data with Kubernetes pod resources, causing empty API query responses.
+
+Inspect the status conditions section of your HPA resource using `kubectl describe hpa api-service-hpa -n production`. The command output includes a detailed event log and active conditions like `AbleToScale`, `ScalingActive`, and `ScalingLimited`. If `ScalingActive` shows `False` with reason `FailedGetResourceMetric`, review your Prometheus Adapter pod logs using `kubectl logs -n monitoring -l app.kubernetes.io/name=prometheus-adapter`. Look for explicit PromQL syntax errors, HTTP timeout warnings when connecting to Prometheus, or standard authentication failures.
+
+Common operational failure modes and their root cause solutions include:
+
+| Observed HPA Error Message | Root Cause Mechanism | Remediation Step |
+| :
+--- | :
+--- | :
+--- |
+| `unable to fetch metric: no metrics returned` | Label key mismatch between adapter rule and Prometheus TSDB | Update `seriesQuery` label overrides to match scraped pod labels |
+| `selector missing from metric` | Missing pod resource mapping in Prometheus Adapter rule | Ensure `resources.overrides` maps Prometheus label to `pod` |
+| `API server request timeout` | Prometheus server struggling under heavy PromQL query load | Optimize adapter `metricsQuery` or increase Prometheus resources |
+| `invalid metric value: scalar expected` | PromQL query returning vector without pod label grouping | Add `by (<<.GroupBy>>)` aggregation to adapter rule PromQL |
+
+## How Do You Tune HPA Scaling Behavior and Stabilization Windows?
+
+You tune HPA scaling behavior by configuring the `behavior` field inside the `autoscaling/v2` spec to set explicit scale-up and scale-down stabilization windows, rate limits, and step sizing policies. By default, the HPA controller scales up quickly when metric thresholds are breached but waits five minutes before executing scale-down actions to prevent rapid fluctuation. Customizing these stabilization windows ensures rapid scaling response during sudden traffic spikes while preventing premature pod termination during temporary traffic lulls.
+
+![HPA Scaling Behavior and Stabilization](/static/images/kubernetes-hpa-custom-prometheus-metrics-behavior-tuning.jpg)
+
+The `behavior` section gives system engineers granular control over scaling velocity in both directions using `scaleUp` and `scaleDown` policy blocks. Each block supports a `stabilizationWindowSeconds` setting alongside an array of explicit `policies`. The `stabilizationWindowSeconds` causes the autoscaler to retain past calculated recommendations for a set duration, picking the highest recommendation for scale-up operations and the lowest recommendation for scale-down operations. This algorithm smooths out metric noise caused by bursty background tasks or short-lived traffic spikes.
+
+Here's an advanced behavior configuration that enables aggressive scaling up while applying conservative scaling down:
+
+```yaml
+spec:
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        - type: Pods
+          value: 4
+          periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+```
+
+In this production configuration, setting `stabilizationWindowSeconds: 0` for `scaleUp` instructs the autoscaler to respond immediately to metric spikes without waiting for metric smoothing. The `selectPolicy: Max` directive ensures that if both policies are evaluated, the policy generating the higher pod count takes effect. The HPA can double the replica count (`100%` increase) or add up to `4` pods every `15` seconds, whichever is larger. This prevents pod capacity exhaustion when unexpected client traffic hits your production endpoints.
+
+Conversely, the `scaleDown` configuration sets `stabilizationWindowSeconds: 300` (five minutes) to guarantee that traffic volume remains consistently low before terminating pods. The scale-down velocity is strictly capped at `10%` of existing replica count per minute (`periodSeconds: 60`). Slowing down pod termination prevents cascading overload scenarios where terminating pods forces remaining pods to handle excess traffic, triggering immediate re-scale cycles.
+
+When tuning scaling behavior, you must also align Prometheus scraping intervals with your HPA evaluation loop. If Prometheus scrapes metrics every thirty seconds but your adapter calculates two-minute rate averages, short traffic bursts under thirty seconds might fail to trigger scaling actions. Ensure your application scrapers run every ten to fifteen seconds for high-frequency scaling workloads, and configure your adapter PromQL rate windows to cover at least four scrape intervals to prevent transient metric dropouts.
+
+## How Do You Monitor HPA Performance Metrics in Production Grafana Dashboards?
+
+You monitor HPA performance metrics in production Grafana dashboards by tracking `kube_horizontalpodautoscaler_status_current_replicas`, `kube_horizontalpodautoscaler_status_desired_replicas`, and custom metric target saturation levels over time. Integrating HPA telemetry into centralized dashboards allows platform engineers to identify misconfigured scaling thresholds, detect scaling oscillations, and evaluate workload capacity planning. Without dedicated dashboard visibility, scaling inefficiencies can silently degrade application response latency or inflate cloud infrastructure expenditures.
+
+Prometheus exports Kubernetes HPA telemetry through `kube-state-metrics`, providing real-time visibility into autoscaler control loop decisions. Key metrics include `kube_horizontalpodautoscaler_spec_min_replicas`, `kube_horizontalpodautoscaler_spec_max_replicas`, and `kube_horizontalpodautoscaler_status_desired_replicas`. By plotting desired replicas against actual running pod replicas, you can measure scaling latency and identify whether container bootstrap times delay workload capacity expansion.
+
+Here's a production PromQL expression for calculating HPA scaling headroom saturation across your cluster:
+
+```promql
+sum(kube_horizontalpodautoscaler_status_current_replicas{namespace="production"}) by (horizontalpodautoscaler)
+/
+sum(kube_horizontalpodautoscaler_spec_max_replicas{namespace="production"}) by (horizontalpodautoscaler) * 100
+```
+
+When this saturation query approaches one hundred percent, your deployment has reached its maximum replica ceiling and cannot expand further to accommodate incoming traffic spikes. Setting up Grafana alerts on high HPA saturation notifies on-call SRE teams to increase `maxReplicas` limits before application request latency breaches SLA boundaries.
+
+## What Are the Frequently Asked Questions About Custom HPA Metrics?
+
+### Can you scale Kubernetes deployments using custom metrics from external providers like Datadog or CloudWatch?
+
+Yes, you can scale Kubernetes deployments using metrics from external SaaS providers by deploying vendor-supplied metric adapters like the Datadog Cluster Agent or KEDA (Kubernetes Event-driven Autoscaling). These external metric adapters implement the `external.metrics.k8s.io` API interface instead of `custom.metrics.k8s.io`. In your HPA manifest, set `type: External` and specify the metric name defined by your vendor adapter configuration. KEDA is particularly popular because it provides pre-built scalers for over sixty external services including AWS SQS, Azure Event Hubs, Kafka, and PostgreSQL queries.
+
+### What's the difference between Custom Metrics and External Metrics in Kubernetes autoscaling?
+
+The primary difference between Custom Metrics and External Metrics lies in whether the metric is bound to a specific Kubernetes cluster object. Custom Metrics (`custom.metrics.k8s.io`) are strictly attached to Kubernetes resources like Pods or Services running inside your cluster. External Metrics (`external.metrics.k8s.io`) represent global metrics that exist independently of specific cluster objects, such as cloud queue lengths or external database connections.
+
+### How do you verify that Prometheus Adapter rules are properly loaded by the Kubernetes API server?
+
+You verify that Prometheus Adapter rules are properly loaded by querying the extension API using `kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1"`. This command returns a complete JSON listing of all custom metrics currently exposed by the adapter across your cluster namespaces. If your custom metric name appears in the list, the adapter successfully parsed your configuration rule and validated the series in Prometheus.
+
+### Why does HPA show target average value as unknown after configuring custom metrics?
+
+HPA displays the target average value as unknown when the API server fails to retrieve metric points for target pods from the custom metrics adapter. This condition typically occurs when Prometheus lacks metric data for the targeted workload, pod label matchers are configured incorrectly in adapter rules, or pods were recently deployed. Ensure your application exposes metrics, Prometheus is actively scraping target pods, and label names in your adapter configuration match your Prometheus series labels.
+
+### Should you use rate or instant values when defining PromQL queries in Prometheus Adapter rules?
+
+You should always use rate functions like `rate()` or `irate()` over short time windows when converting Prometheus counter metrics into custom HPA scaling indicators. Counter metrics continuously increase over application lifespan, making them unsuitable for static threshold matching in HPA manifests. Applying `rate()` converts raw counter increments into per-second rates that accurately reflect current traffic intensity.
+
+### How often does the Kubernetes Horizontal Pod Autoscaler re-evaluate custom metric rules?
+
+The Kubernetes Horizontal Pod Autoscaler controller loop evaluates metric rules every fifteen seconds by default. You can customize this evaluation interval by passing the `--horizontal-pod-autoscaler-sync-period` flag to the `kube-controller-manager` component on your cluster control plane nodes. However, decreasing the period below fifteen seconds increases API server load without delivering significant scaling improvements due to application bootstrap latency.
+
+### How do you handle cold-start delays when scaling up pods based on custom metrics?
+
+You handle cold-start delays by combining custom metric HPA rules with appropriate `minReplicas` baselines, pre-warming readiness probes, and optimized container image builds. If your application takes sixty seconds to boot and initialize caches, newly spawned pods won't absorb traffic immediately. Setting aggressive scale-up step policies while ensuring container startup times remain under ten seconds prevents scaling feedback loops during heavy traffic arrivals.

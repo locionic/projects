@@ -1,0 +1,371 @@
+---
+title: 'GitHub Actions Self-Hosted Runner Security Hardening'
+images: ['/static/images/github-actions-self-hosted-runner-security.jpg']
+date: '2026-07-29'
+tags: ['github-actions', 'security', 'devops', 'kubernetes', 'ci-cd']
+draft: true
+summary: 'Harden self-hosted GitHub Actions runners using ARC autoscaling, network isolation, rootless containers, and short-lived OIDC tokens.'
+images:
+  - '/static/images/github-actions-self-hosted-runner-security-featured.jpg'
+  - '/static/images/github-actions-self-hosted-runner-security-threat-model.jpg'
+  - '/static/images/github-actions-self-hosted-runner-security-arc-ephemeral.jpg'
+  - '/static/images/github-actions-self-hosted-runner-security-network-isolation.jpg'
+  - '/static/images/github-actions-self-hosted-runner-security-rootless-container.jpg'
+  - '/static/images/github-actions-self-hosted-runner-security-oidc-tokens.jpg'
+authors: ['default']
+category: 'DevOps'
+---
+
+
+Self-hosted GitHub Actions runners provide engineering teams with custom compute specs, specialized hardware accelerators, and direct access to private VPC resources. However, deploying persistent self-hosted runner infrastructure without strict security controls exposes internal corporate networks to remote code execution, credential exfiltration, and supply chain attacks. When untrusted pull requests execute workflow code inside an unhardened runner instance, malicious actors can compromise host instances, access adjacent internal microservices, and steal sensitive environment credentials. By enforcing ephemeral pod execution, container sandbox isolation, strict network egress rules, and short-lived OIDC authentication, you eliminate persistent attack surfaces while retaining self-hosted runner flexibility.
+
+## What Are the Primary Security Vulnerabilities of Self-Hosted Runners?
+
+The primary security vulnerabilities of self-hosted runners stem from persistent execution state, excessive network reachability, and root privilege retention across consecutive workflow runs. When multiple CI/CD workflows share a single persistent virtual machine or bare metal server, malicious build scripts can leave behind backdoor processes, modify cached binary dependencies, or read ambient environment variables created by previous pipeline executions. If an attacker submits a pull request containing malicious build commands, the runner executes the payload under its default process privileges, allowing the script to compromise the host operating system.
+
+![Self-Hosted Runner Threat Model](/static/images/github-actions-self-hosted-runner-security-threat-model.jpg)
+
+The official GitHub documentation explicitly warns against using self-hosted runners for public repositories because pull requests from external forks can run arbitrary workflow code. Even in private or internal enterprise repositories, any developer with read access who opens a pull request can execute modified workflow files on target self-hosted runners. Attack vectors like supply chain poisoning (seen in high-profile incidents like the Shai-Hulud campaign and tj-actions action vulnerabilities) exploit weak runner isolation to extract repository secrets and move laterally into internal AWS or Kubernetes infrastructure.
+
+Another major threat vector is credential persistence on runner disk storage. Traditional runner setups store static AWS access keys, GitHub personal access tokens, or private SSH keys inside environment files or disk volume mounts. When a compromised workflow run executes commands with elevated privileges, it can dump disk contents, access ambient Docker daemon sockets, or communicate with cloud metadata services like `169.254.169.254` to steal instance IAM role credentials.
+
+Here's an overview of the attack vectors affecting unhardened self-hosted runner nodes:
+
+```
++
+----
+----
+----
+----
+----
+----+           1. Malicious PR           +
+----
+----
+----
+----
+----
+---+
+| External Attacker /    | 
+----
+----
+----
+----
+----
+----
+----
+------> | GitHub Repository     |
+| Forked Repository      |                                     | (Workflow Trigger)    |
++
+----
+----
+----
+----
+----
+----+                                     +
+----
+----
+----
+----
+----
+---+
+                                                                           |
+                                                                           | 2. Schedules Work
+                                                                           v
++
+----
+----
+----
+----
+----
+----+           4. Exfiltrate Secrets     +
+----
+----
+----
+----
+----
+---+
+| Attacker Command Server| <
+----
+----
+----
+----
+----
+----
+----
+------ | Self-Hosted Runner    |
+| (Exfiltration Vector)  |                                     | (Persistent Instance) |
++
+----
+----
+----
+----
+----
+----+                                     +
+----
+----
+----
+----
+----
+---+
+                                                                           |
+                                                                           | 3. Lateral Movement
+                                                                           v
+                                                               +
+----
+----
+----
+----
+----
+---+
+                                                               | Internal VPC Services |
+                                                               | (Databases / Metadata)|
+                                                               +
+----
+----
+----
+----
+----
+---+
+```
+
+## How Does Actions Runner Controller Implement Ephemeral Runner Isolation?
+
+Actions Runner Controller implements ephemeral runner isolation by dynamically spawning single-use Kubernetes pods that self-destruct immediately after processing a single workflow job. Built as a Kubernetes operator using custom resource definitions, ARC monitors GitHub workflow queues via webhooks and automatically provisions dedicated runner pods on demand. Because each runner pod process terminates completely upon job completion, malicious code cannot persist on disk or infect subsequent build jobs.
+
+![ARC Ephemeral Pod Autoscaling](/static/images/github-actions-self-hosted-runner-security-arc-ephemeral.jpg)
+
+Configuring ARC with `ephemeral: true` mandates that every runner container process executes exactly one job before the controller tears down the pod volume and underlying network interface. Any temporary files written to `/tmp`, modified system binaries, or ambient memory artifacts are wiped automatically when Kubernetes deletes the pod namespace. This stateless execution model converts your self-hosted infrastructure into a clean-slate compute environment identical to GitHub-hosted runners.
+
+Let me show you a production-grade Helm configuration for deploying Actions Runner Controller with ephemeral autoscaling sets:
+
+```yaml
+githubWebhookServer:
+  enabled: true
+
+autoscalingRunnerSets:
+  - name: hardened-k8s-runner
+    githubConfigUrl: "https://github.com/company-org"
+    minReplicas: 2
+    maxReplicas: 50
+    ephemeral: true
+    template:
+      spec:
+        containers:
+          - name: runner
+            image: ghcr.io/actions/actions-runner:latest
+            command: ["/home/runner/run.sh"]
+            resources:
+              limits:
+                cpu: "4"
+                memory: "8Gi"
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 1001
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: false
+              capabilities:
+                drop:
+                  - ALL
+```
+
+In this ARC configuration, `minReplicas: 2` maintains a small warm pool of ready pods to eliminate cold-start delays, while `maxReplicas: 50` allows sudden build spikes to scale out safely. Because `ephemeral: true` is enforced at the custom resource definition level, the GitHub runner application passes the `--ephemeral` flag during registration. Once the active workflow finishes its final step, the runner agent Deregisters itself from GitHub and terminates the container, prompting the ARC operator to spawn a fresh replacement pod.
+
+## How Do You Apply Network Egress Filtering and Firewalling to Runner Nodes?
+
+You apply network egress filtering to runner nodes by deploying Kubernetes NetworkPolicies, configuring host level firewalld rules, and routing outward runner traffic through restrictive egress proxy servers. By default, pods in Kubernetes clusters can communicate freely with any IP address inside the cluster VPC, including internal database endpoints, Redis caches, and cloud provider metadata interfaces. Implementing zero-trust network boundaries restricts self-hosted runners so they can only connect to authorized external APIs and required GitHub endpoints.
+
+![Network Egress Filtering and Firewalling](/static/images/github-actions-self-hosted-runner-security-network-isolation.jpg)
+
+The first step in network hardening is blocking access to cloud metadata services. Cloud instance metadata services (IMDSv1) running at `169.254.169.254` allow any local process to fetch node IAM role credentials without authentication. If a malicious build script executes inside your runner pod, it can query IMDS to obtain temporary cloud credentials with permissions attached to the underlying worker node. Network policies must explicitly drop all traffic directed to non-routable link-local metadata IP addresses.
+
+Here's a production Kubernetes NetworkPolicy manifest that isolates self-hosted runner pods:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-runner-egress
+  namespace: actions-runners
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hardened-k8s-runner
+  policyTypes:
+    - Egress
+  egress:
+    # 1. Allow CoreDNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+    # 2. Allow outbound HTTPS to GitHub API and package registries
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+```
+
+Notice how `ipBlock.except` blocks all private IPv4 address spaces (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) alongside `169.254.169.254/32`. This policy prevents compromised runner pods from scanning internal corporate networks or connecting to internal staging databases. If your build workflow requires accessing a specific internal container registry or artifact repository, explicitly add the target service's IP CIDR block to the allowed egress rules array.
+
+For enterprise environments requiring strict domain level auditing, deploy an outbound Squid proxy or Cilium Network Policy with FQDN filtering. Configuring `HTTPS_PROXY` environment variables inside runner pod specifications forces all web traffic through the proxy layer, where domain whitelist rules permit connections only to `github.com`, `api.github.com`, `npm.pkg.github.com`, and approved dependency mirrors.
+
+## How Do You Enforce Rootless Sandbox Isolation for Docker-in-Docker Workflows?
+
+You enforce rootless sandbox isolation for Docker-in-Docker workflows by running container daemons in user namespaces, deploying gVisor container runtimes, or replacing Docker socket mounts with Kaniko and Buildah for container image builds. Traditional Docker-in-Docker (DinD) setups require mounting `/var/run/docker.sock` from the host VM into runner containers or running pods with `privileged: true`. Granting root privileges or exposing the host Docker socket gives containerized workflows full root access over the host machine, enabling complete container breakout exploits.
+
+![Rootless Container Sandbox Isolation](/static/images/github-actions-self-hosted-runner-security-rootless-container.jpg)
+
+Exposing `/var/run/docker.sock` allows any process inside the runner container to execute `docker run -v /:/host alpine` and gain root read-write access to the host root filesystem. To eliminate this security hazard, you should migrate build pipelines to rootless container engines like Podman, Buildah, or Docker Rootless mode. Rootless container engines run completely within unprivileged user namespaces, ensuring that even if an attacker gains root inside the build container, they remain an unprivileged user (UID 10001) on the host operating system.
+
+For workloads that strictly require building OCI container images inside CI pipelines, use Kaniko instead of Docker daemons. Kaniko executes container image builds in user space without requiring Docker daemons or privileged security contexts.
+
+Here's an example GitHub Actions workflow step executing rootless container builds using Kaniko:
+
+```yaml
+name: Build Hardened Container Image
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: self-hosted-ephemeral
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build and Push Image with Kaniko
+        run: |
+          /kaniko/executor             --context=dir://.             --dockerfile=Dockerfile             --destination=ghcr.io/company-org/api-service:${{ github.sha }}             --cache=true             --single-snapshot
+```
+
+When high-security isolation is mandatory, configure your Kubernetes worker nodes to run runner pods under gVisor (`runsc`). gVisor acts as an application kernel that intercepts container system calls, creating a strong virtualization boundary between the build script and the host Linux kernel. If a malicious dependency attempts to exploit a kernel vulnerability (like a dirty COW or use-after-free bug), the gVisor sandbox intercepts the syscall, preventing host kernel compromise.
+
+## How Do You Manage Short-Lived Credentials Using GitHub OIDC Tokens?
+
+You manage short-lived credentials by configuring GitHub OpenID Connect (OIDC) identity federation with cloud providers to exchange JSON Web Tokens (JWT) for short-lived IAM session credentials. Storing long-lived cloud credentials like `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in GitHub secrets creates perpetual risk if secret values are leaked or printed to workflow logs. OIDC federation allows self-hosted runners to authenticate dynamically without storing static secret strings.
+
+![Short-Lived OIDC Credential Management](/static/images/github-actions-self-hosted-runner-security-oidc-tokens.jpg)
+
+When a workflow step requests OIDC authentication, the GitHub Actions runner agent fetches an OIDC JWT token directly from the GitHub token service. This token contains signed claims verifying repository identity, workflow trigger event, target branch, and job execution context. The runner passes this JWT token to cloud provider STS endpoints (like AWS STS `AssumeRoleWithWebIdentity`), which validate the signature against GitHub's public OIDC keys and issue a temporary cloud credential valid for one hour.
+
+Here is a hardened AWS IAM Role trust policy that restricts OIDC role assumption to specific repositories and branches:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:company-org/production-service:ref:refs/heads/main"
+        }
+      }
+    }
+  ]
+}
+```
+
+Notice the strict `token.actions.githubusercontent.com:sub` condition check. This condition ensures that only workflows running from the `main` branch of the `company-org/production-service` repository can assume the IAM role. If a developer opens a pull request from a feature branch or external fork, AWS STS rejects the role assumption request because the token `sub` claim doesn't match the required branch pattern.
+
+Configure your GitHub Actions workflow file to request minimal permissions using the `permissions` block:
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: self-hosted-ephemeral
+    steps:
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-actions-runner-role
+          aws-region: us-east-1
+```
+
+Setting `id-token: write` grants the job permission to fetch the OIDC JWT token, while setting `contents: read` restricts repository access to read-only mode. Setting strict explicit permissions on every workflow prevents default broad token scope assignments.
+
+## How Do You Audit and Monitor Self-Hosted Runner Execution Activity?
+
+You audit self-hosted runner activity by enabling GitHub Organization Audit Logs, capturing container runtime telemetry via eBPF sensors like Falco, and centralizing runner pod stdout logs into SIEM platforms. Continuous security monitoring ensures that suspicious process execution, unexpected network outbound connections, or privilege escalation attempts are detected and alerted in real time.
+
+eBPF monitoring tools like Sysdig Falco install directly on Kubernetes worker nodes to observe system calls made by runner processes. Falco rules detect anomalous behavior such as spawning unauthorized interactive shell sessions inside runner pods, executing binary compilation tools inside unexpected directories, or reading sensitive host configuration files.
+
+Here is a production Falco security rule designed to detect unauthorized shell execution inside self-hosted runner containers:
+
+```yaml
+- rule: Unauthorized Shell Spawn in Runner Pod
+  desc: Detect unexpected interactive shell processes spawned inside Actions Runner containers
+  condition: >
+    container.image.repository contains "actions-runner" and
+    evt.type = execve and
+    proc.name in (bash, sh, zsh, ksh) and
+    not proc.pname in (run.sh, Runner.Listener)
+  output: >
+    Unexpected shell execution detected inside runner container
+    (user=%user.name command=%proc.cmdline pod=%container.name image=%container.image.repository)
+  priority: WARNING
+  tags: [ci_cd, container, security]
+```
+
+In addition to runtime eBPF monitoring, configure webhooks in GitHub to track runner registration and execution lifecycle events. Subscribing to `workflow_job` webhook events logs when jobs start, which runner pool processed the execution, and how long execution took. Correlating GitHub webhook audit logs with Kubernetes pod creation timestamps provides full traceability for incident response investigations.
+
+Finally, restrict organization runner scope by using Runner Groups. In GitHub organization settings, assign self-hosted runner pools to dedicated Runner Groups with explicit repository access lists. Restricting sensitive production runners so they can only be targeted by approved infrastructure repositories prevents unauthorized applications from scheduling workloads on specialized runner hardware.
+
+## What Are the Frequently Asked Questions About Self-Hosted Runner Security?
+
+### Is it ever safe to use self-hosted runners for public open-source GitHub repositories?
+
+No, using self-hosted runners for public repositories is extremely dangerous and explicitly discouraged by GitHub. Public repositories accept pull requests from anyone on the internet, allowing malicious actors to submit pull request workflows that execute arbitrary code on your runner infrastructure. If you must use self-hosted hardware for public projects, use ephemeral Kubernetes runners combined with strict manual pull request approval requirements for all external contributors.
+
+### How does the GitHub Actions Runner Controller handle cleanup if a runner pod crashes mid-job?
+
+When a runner pod crashes or loses node connectivity mid-job, the ARC operator detects pod status failure through Kubernetes API watches and marks the runner instance as offline. The controller sends a cleanup request to the GitHub API to deregister the offline runner, deletes the crashed pod resource, and spawns a fresh replacement pod to maintain configured `minReplicas` counts. This automated self-healing loop prevents stale, damaged pods from remaining in service pools.
+
+### What is the difference between Actions Runner Controller (ARC) scale sets and legacy runner deployments?
+
+ARC scale sets represent the modern architecture for managing self-hosted runners in Kubernetes, replacing legacy RunnerDeployment and RunnerReplicaSet custom resources. Scale sets communicate with GitHub via WebSockets instead of continuous polling, resulting in faster job dispatch latency and lower API rate limit consumption. Scale sets also provide native support for `ephemeral` runner mode and autoscaling based on real-time GitHub job queue depth.
+
+### How do you prevent self-hosted runners from accessing the host Kubernetes API server?
+
+You prevent self-hosted runners from accessing the host Kubernetes API server by setting `automountServiceAccountToken: false` in the runner pod spec and enforcing egress network policies that block traffic to port 443 on the Kubernetes API service IP. By default, Kubernetes mounts service account tokens into every pod at `/var/run/secrets/kubernetes.io/serviceaccount`. Disabling token automounting ensures that compromised runner processes cannot query cluster resources or escalate privileges within the host Kubernetes cluster.
+
+### What permissions should be granted to the GitHub PAT or App used by Actions Runner Controller?
+
+The GitHub App used by Actions Runner Controller should be granted minimum required organization permissions, specifically `Organization Self-hosted runners: Read and Write` and `Actions: Read-only`. If deploying runners at the repository level instead of organization level, grant `Repository Self-hosted runners: Read and Write`. Avoid using Personal Access Tokens (PATs) attached to individual developer accounts because PATs grant broad account permissions and lack granular permission scoping.
+
+### How do you cache build dependencies securely across ephemeral self-hosted runner pods?
+
+You cache build dependencies securely across ephemeral runner pods by mounting read-only shared network volumes (like AWS EFS or NFS) or using remote cache storage backends like MinIO or AWS S3. Avoid using read-write shared volume mounts across multiple pods because a compromised runner pod could inject malicious code into shared cache archives used by other build pipelines. Always hash dependency lockfiles to build deterministic cache key prefixes.
+
+### Should you run self-hosted runners on dedicated cloud instances or shared Kubernetes nodes?
+
+You should run self-hosted runners on dedicated worker node pools isolated from core production application workloads using Kubernetes node taints and tolerations. Running untrusted build code on shared nodes alongside customer-facing microservices creates severe risk if a container breakout vulnerability occurs. Provisioning dedicated, isolated worker node groups for runner workloads ensures that any node level compromise remains contained within the CI build tier.
