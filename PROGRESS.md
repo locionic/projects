@@ -1,0 +1,1 @@
+[PROGRESS.md](../PROGRESS.md#bottom) /docs/blog_dev/software-testing/machine-learning
