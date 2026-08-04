@@ -2,7 +2,8 @@
 title: "The Ultimate Guide to AI Coding Assistants in 2026"
 date: "2026-08-01"
 description: "How autonomous agents and AI companions are reshaping the way we build software."
-tags: ["AI", "Software Engineering", "Productivity"]
+lastUpdated: '2026-08-04'
+tags: ["ai", "software-engineering", "productivity"]
 ---
 
 # The Ultimate Guide to AI Coding Assistants in 2026
