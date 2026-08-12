@@ -1,30 +1,157 @@
 ---
-title: "How the React Compiler Actually Works"
+title: "How the React Compiler Actually Works: A Deep Dive into React Forget"
 date: "2026-11-20"
 draft: false
-summary: "An under-the-hood look at React Forget and the React Compiler, understanding its AST transformations and optimizations."
+summary: "An under-the-hood look at React Forget and the React Compiler, understanding its AST transformations, data-flow analysis, and why you can finally delete useMemo."
 image: "/static/images/react_compiler_internals_1786471417067.jpg"
+tags: ["react", "javascript", "compiler", "performance"]
 ---
 
-# The End of useMemo
+# The End of Manual Memoization
 
-The React Compiler analyzes your code and automatically memoizes values, rendering `useMemo` and `useCallback` largely obsolete.
+For years, React developers have shared a collective pain point: manual memoization. If you've spent any time working on a medium-to-large React application, you are intimately familiar with `useMemo`, `useCallback`, and `React.memo`. They are the necessary evils of the React rendering model—tools we use to wrap our values, functions, and components to prevent the framework from recalculating expensive operations or over-rendering the DOM on every single state change.
 
-## Abstract Syntax Trees
+It leads to what many call "memoization hell":
 
-The compiler operates by parsing JSX into an AST, running data-flow analysis, and injecting memoization hooks implicitly.
+```jsx
+// The old way: Manual dependency arrays and cognitive overhead
+function DataDashboard({ user, metrics }) {
+  const processedMetrics = useMemo(() => {
+    return heavyDataProcessing(metrics);
+  }, [metrics]);
 
-## How it transforms code
+  const handleExport = useCallback(() => {
+    exportToCsv(processedMetrics, user.id);
+  }, [processedMetrics, user.id]);
 
-A simple component:
-```javascript
-function MyComponent({ data }) {
-    const processed = heavyProcessing(data);
-    return <div>{processed}</div>;
+  return <DashboardChart data={processedMetrics} onExport={handleExport} />;
 }
 ```
-Is transformed to cache `processed` if `data` hasn't changed.
+
+The React Compiler (originally codenamed *React Forget*) was built with a singular, ambitious goal: **make React fast by default**. By shifting the burden of memoization from the developer to the build tool, the React Compiler allows us to write plain JavaScript without losing the performance benefits of referential equality.
+
+Let's look under the hood to see exactly how this magic works.
+
+## It's All About the AST (Abstract Syntax Tree)
+
+The React Compiler is not a runtime library; it is a build-time Babel plugin (and increasingly, a Rust-based toolchain) that analyzes your React components before they ever reach the browser. 
+
+The first step in this process is parsing your JSX and JavaScript into an **Abstract Syntax Tree (AST)**. An AST is a hierarchical tree representation of your code. Instead of seeing `const x = 5;`, the compiler sees a `VariableDeclaration` containing an `Identifier` ("x") and a `NumericLiteral` (5).
+
+Once the compiler has this tree, it can perform **Static Data-Flow Analysis**.
+
+### Data-Flow Analysis and Type Inference
+
+Unlike standard minifiers or bundlers, the React Compiler must understand the *intent* of your code. It needs to know which variables depend on state, which variables are mutated, and which values are passed down as props to child components.
+
+The compiler traverses your AST and maps out the data dependencies. It asks questions like:
+1. Is this variable derived from a React prop?
+2. Does this object get mutated later in the render function?
+3. Does this function call an external API or a React Hook?
+
+If the compiler determines that a value is deterministic (it relies only on its inputs and doesn't rely on global state mutations), it marks it as a candidate for memoization.
+
+## The Transformation: How Code Changes Under the Hood
+
+Let's look at how the React Compiler actually transforms your code. 
+
+Take a look at this standard, un-memoized React component:
+
+```javascript
+function UserProfile({ user }) {
+    // 1. Object allocation
+    const userTheme = { color: user.preferences.themeColor };
+    
+    // 2. Heavy computation
+    const formattedData = processUserHistory(user.history);
+    
+    // 3. JSX allocation
+    return (
+        <div style={userTheme}>
+            <HistoryGraph data={formattedData} />
+        </div>
+    );
+}
+```
+
+Without the compiler, every time `UserProfile` renders (even if `user` hasn't changed), React will allocate a new `userTheme` object in memory. Because it's a new object reference, if we passed it to a child component, that child would re-render.
+
+Here is an approximation of what the React Compiler outputs after transforming the AST:
+
+```javascript
+import { c as _useMemoCache } from "react/compiler-runtime";
+
+function UserProfile({ user }) {
+    // Allocate a cache array for this component
+    const $ = _useMemoCache(4);
+    
+    // Cache the userTheme object
+    let userTheme;
+    if ($[0] !== user.preferences.themeColor) {
+        userTheme = { color: user.preferences.themeColor };
+        $[0] = user.preferences.themeColor;
+        $[1] = userTheme;
+    } else {
+        userTheme = $[1];
+    }
+    
+    // Cache the formatted data
+    let formattedData;
+    if ($[2] !== user.history) {
+        formattedData = processUserHistory(user.history);
+        $[2] = user.history;
+        $[3] = formattedData;
+    } else {
+        formattedData = $[3];
+    }
+    
+    // Return the JSX (which can also be cached!)
+    return (
+        <div style={userTheme}>
+            <HistoryGraph data={formattedData} />
+        </div>
+    );
+}
+```
+
+### Breaking Down the Transformation
+
+1. **`_useMemoCache(n)`**: The compiler injects a special internal hook that allocates an array of `n` slots for caching values. This is incredibly fast and memory-efficient compared to invoking multiple `useMemo` hooks.
+2. **Fine-Grained Dependency Tracking**: Notice how the compiler checks `$[0] !== user.preferences.themeColor`. It doesn't just watch the whole `user` object; it tracks the exact nested property that the variable depends on!
+3. **Implicit Object Caching**: The `userTheme` object is now cached. Its referential identity remains exactly the same across renders unless `themeColor` changes. 
+
+## The Rules of React Just Got Stricter
+
+Because the compiler relies on static analysis, it assumes you are writing idiomatic, rule-abiding React. If you break the Rules of React, the compiler cannot safely optimize your code.
+
+Specifically, the compiler expects that **your render functions are pure**. 
+
+If you mutate an object during render:
+
+```javascript
+function BadComponent({ data }) {
+    // 🚨 Mutating variables during render!
+    data.lastViewed = Date.now(); 
+    return <div>{data.name}</div>;
+}
+```
+
+The compiler will detect this mutation. Currently, if the React Compiler detects a violation of the Rules of React that it cannot safely work around, it will simply **bail out** of optimizing that specific component and leave it un-memoized. It will not break your app, but you will lose the performance benefits.
+
+To ensure your codebase is ready for the compiler, you should strictly enforce `eslint-plugin-react-hooks` and the new `eslint-plugin-react-compiler`.
+
+## Why Not Just Use Signals?
+
+A common question in the modern frontend ecosystem is: *If Vue, Solid, and Preact are using Signals for fine-grained reactivity, why did React spend years building a compiler instead?*
+
+The answer lies in React's core philosophy: **UI is a function of state**. 
+
+Signals introduce a completely different mental model. They require you to wrap your values in special observable objects (e.g., `signal.value`). When a signal updates, it surgically updates the DOM without re-running the component function.
+
+React's team believes that the "re-run the function" model is simpler to reason about. It feels like standard JavaScript. By building a compiler, React gives us the performance characteristics of fine-grained reactivity (like Signals) while allowing us to write plain, immutable JavaScript variables. You get the best of both worlds.
 
 ## Conclusion
 
-The compiler represents a massive shift in React DX, bringing it closer to compiled frameworks like Svelte while retaining the React model.
+The React Compiler represents the most significant shift in React developer experience since the introduction of Hooks in 2018. By moving the burden of referential equality and expensive computations from the developer to the build step, React is returning to its original promise: simply describe how your UI should look for a given state, and the framework will handle the rest efficiently.
+
+You can finally delete `useMemo`.
