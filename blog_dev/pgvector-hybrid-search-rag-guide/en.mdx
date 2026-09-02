@@ -1,0 +1,152 @@
+---
+title: "Building Production RAG with pgvector & Hybrid Search"
+date: '2026-09-02'
+summary: "Learn how to build a robust Retrieval-Augmented Generation (RAG) architecture using pgvector for hybrid search. We'll combine full-text vector search and BM25 to achieve better retrieval accuracy."
+tags: ['ai', 'postgresql', 'backend', 'database']
+draft: false
+images: ['/static/images/pgvector-hybrid-search-rag-guide.png']
+---
+
+When building a Retrieval-Augmented Generation (RAG) system, retrieval accuracy is everything. If the retrieved documents aren't relevant, your LLM's response won't be either. This is where **pgvector hybrid search** shines. By combining traditional full-text search with vector embeddings, you get the best of both worlds.
+
+In this guide, we'll explore how to build a production-ready RAG architecture using PostgreSQL, the `pgvector` extension, and Reciprocal Rank Fusion (RRF). 
+
+If you are exploring other AI stack components, be sure to check out our overview of [AI Tools](/en/blog/ai-tools).
+
+## The RAG Architecture
+
+Let's look at how a hybrid search RAG architecture operates under the hood. The system performs two parallel searches: a dense vector search for semantic meaning and a sparse keyword search (BM25) for exact matches. Then, it merges the results using Reciprocal Rank Fusion (RRF).
+
+<Mermaid>
+graph TD
+    UserQuery["User Query"] --> EmbedModel["Embedding Model"]
+    UserQuery --> KeywordSearch["PostgreSQL Full-Text Search (BM25)"]
+    EmbedModel --> DenseVector["Dense Vector Embedding"]
+    DenseVector --> VectorSearch["pgvector HNSW Index"]
+    
+    KeywordSearch -.->|Sparse Results| RRF["Reciprocal Rank Fusion (RRF)"]
+    VectorSearch -.->|Dense Results| RRF
+    
+    RRF --> TopK["Top-K Documents"]
+    TopK --> LLM["LLM Synthesis"]
+    LLM --> FinalResponse["Final Response"]
+    
+    classDef main fill:#3b82f6,stroke:#1e40af,stroke-width:2px,color:white;
+    classDef search fill:#10b981,stroke:#047857,stroke-width:2px,color:white;
+    classDef fusion fill:#8b5cf6,stroke:#6d28d9,stroke-width:2px,color:white;
+    
+    class UserQuery,LLM,FinalResponse main;
+    class KeywordSearch,VectorSearch,EmbedModel search;
+    class RRF fusion;
+</Mermaid>
+
+## Dense vs. Sparse Search
+
+Why do we need a hybrid approach? Let's break down the differences between semantic vector searches and traditional keyword matching.
+
+<ConceptCompare 
+  concept1={{
+    title: "Dense Vectors (Semantic)",
+    description: "Captures the underlying meaning and context of words, enabling conceptual matching even when exact words differ.",
+    features: ["Context-aware", "Handles synonyms well", "Cross-lingual capabilities"]
+  }}
+  concept2={{
+    title: "Sparse Search (BM25)",
+    description: "Matches exact keywords and calculates relevance based on term frequency and inverse document frequency.",
+    features: ["Exact keyword matching", "Great for specific IDs or names", "Low latency"]
+  }}
+/>
+
+While semantic search is powerful, it sometimes fails when a user searches for specific serial numbers, acronyms, or exact names. Combining it with PostgreSQL full text vector search ensures you catch both exact terms and conceptual matches.
+
+## Setting Up pgvector
+
+Let's walk through how to set up your PostgreSQL vector index for optimal performance. We'll use HNSW (Hierarchical Navigable Small World), which is currently the gold standard for high-performance approximate nearest neighbor (ANN) search.
+
+<Stepper>
+  <Step title="Enable Extensions">
+    First, you need to install and enable `pgvector` in your database.
+    ```sql
+    CREATE EXTENSION IF NOT EXISTS vector;
+    ```
+  </Step>
+  <Step title="Create the Table">
+    Create a table that stores your documents, their text search vectors (for BM25), and their embeddings.
+    ```sql
+    CREATE TABLE documents (
+        id bigserial PRIMARY KEY,
+        content text,
+        embedding vector(1536), -- e.g., OpenAI embeddings
+        fts tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
+    );
+    ```
+  </Step>
+  <Step title="Create the HNSW Index">
+    Create an HNSW index on the embedding column. HNSW provides faster query times and better recall compared to ivfflat.
+    ```sql
+    CREATE INDEX ON documents 
+    USING hnsw (embedding vector_cosine_ops);
+    ```
+  </Step>
+  <Step title="Create the Full-Text Index">
+    Add a GIN index to speed up the text search queries.
+    ```sql
+    CREATE INDEX fts_idx ON documents USING GIN (fts);
+    ```
+  </Step>
+</Stepper>
+
+## Implementing Hybrid Search with RRF
+
+To actually perform the hybrid search, you'll query both indexes and merge them. Typically, this is done via a common table expression (CTE) using Reciprocal Rank Fusion (RRF). 
+
+Here is a simplified example of how you might structure the query:
+
+```sql
+WITH vector_search AS (
+  SELECT id, content, 
+         RANK() OVER (ORDER BY embedding <=> '[0.1, 0.2, ...]') AS rank
+  FROM documents
+  ORDER BY embedding <=> '[0.1, 0.2, ...]'
+  LIMIT 50
+),
+keyword_search AS (
+  SELECT id, content,
+         RANK() OVER (ORDER BY ts_rank_cd(fts, plainto_tsquery('english', 'search terms')) DESC) AS rank
+  FROM documents
+  WHERE fts @@ plainto_tsquery('english', 'search terms')
+  ORDER BY ts_rank_cd(fts, plainto_tsquery('english', 'search terms')) DESC
+  LIMIT 50
+)
+SELECT 
+  COALESCE(v.id, k.id) as id,
+  COALESCE(v.content, k.content) as content,
+  (COALESCE(1.0 / (60 + v.rank), 0.0) + COALESCE(1.0 / (60 + k.rank), 0.0)) as rrf_score
+FROM vector_search v
+FULL OUTER JOIN keyword_search k ON v.id = k.id
+ORDER BY rrf_score DESC
+LIMIT 10;
+```
+
+This ensures that documents ranking high in both semantic and keyword search are boosted to the top!
+
+## FAQ
+
+<FAQ
+  items={[
+    {
+      question: "Why use HNSW over IVFFlat in pgvector?",
+      answer: "HNSW builds a multi-layered graph that allows for significantly faster search times and higher recall compared to IVFFlat, which relies on clustering. While HNSW uses more memory and takes longer to build, it's generally preferred for production RAG systems."
+    },
+    {
+      question: "What is Reciprocal Rank Fusion (RRF)?",
+      answer: "RRF is a sorting algorithm used to combine results from multiple retrieval methods (like vector search and text search). It assigns a score based on the document's rank in each result set rather than raw similarity scores, making it robust when merging different scoring scales."
+    },
+    {
+      question: "Can I use other embedding dimensions?",
+      answer: "Yes, you can define `vector(N)` where N is your embedding dimension. For example, Cohere embeddings might be `vector(1024)`, while open-source models might use `vector(384)` or `vector(768)`."
+    }
+  ]}
+/>
+
+By combining these methods into a cohesive PostgreSQL hybrid search RAG pipeline, you dramatically improve the precision of your AI application!
