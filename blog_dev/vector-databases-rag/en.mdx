@@ -70,6 +70,7 @@ Each engine is built around a distinct engineering philosophy. Here is how they 
 | **Deployment Mode** | Fully Managed SaaS | Open-Source / Cloud / Docker | Distributed K8s / Cloud | Single Postgres / RDS / Supabase |
 | **Index Algorithms** | Proprietary Segment Graph | HNSW, Quantized HNSW | HNSW, IVF, SCaNN, DiskANN | HNSW, IVFFlat, HNSW SQ |
 | **Metadata Filtering** | Single-stage serverless filter | Single-stage filtered HNSW | Pre/Post-filtering engine | Native SQL WHERE integration |
+| **Reindexing Under Load** | Background serverless build (zero app impact) | LSM segment merges (zero query lock) | Decoupled IndexNodes via object storage | `CREATE INDEX CONCURRENTLY` (competes for CPU/RAM) |
 | **Multi-Tenancy** | Namespaces / Metadata | Payload partitions / Keys | Partition keys / Collections | Row-Level Security (RLS) |
 | **RAM Footprint** | Decoupled (S3 + NVMe tier) | Optimized (Rust + mmap) | Medium-High (Go/C++ tiers) | Shared Postgres Buffer Pool |
 | **Best For** | Zero-ops serverless scale | High-throughput Rust microservices | Massive distributed datasets (100M+) | Teams already running PostgreSQL |
@@ -116,6 +117,15 @@ Pinecone’s Serverless architecture decouples vector indexing from raw compute.
 - No capacity planning, shard management, or disk provisioning required.
 - Pay-as-you-go pricing model that scales down to near-zero when idle, making it attractive for early-stage products with bursty or unpredictable traffic patterns.
 
+### Operational Reality: Reindexing While Serving
+
+A critical operational property often omitted from vector DB comparisons is behavior during **live index mutations and background rebuilds**:
+
+1. **Qdrant (LSM-Style Segment Merging)**: Qdrant writes new vectors into mutable in-memory segments. When a segment reaches threshold capacity, it freezes and converts into an immutable HNSW segment via background workers. Query workers continue searching active and historical segments without global locks, eliminating query latency jitter during high-throughput ingestion.
+2. **Milvus (Stateless IndexNodes)**: Milvus separates query execution from index construction into decoupled microservices. Worker nodes designated as `IndexNodes` pull vector segments from object storage (S3/MinIO) and build HNSW or DiskANN structures independently. `QueryNodes` serve live traffic completely insulated from CPU and memory pressure during index rebuilds.
+3. **PostgreSQL + pgvector (Resource Competition)**: In PostgreSQL, rebuilding an index concurrently (`CREATE INDEX CONCURRENTLY ... USING hnsw`) avoids exclusive table write locks, but HNSW graph construction is intensely CPU- and I/O-heavy. It consumes `maintenance_work_mem` and saturates CPU cores, which directly contends with PostgreSQL's shared buffer pool and active transaction workers unless delegated to an isolated read replica.
+4. **Pinecone (Managed Serverless Isolation)**: In Pinecone's serverless architecture, index construction runs entirely within Pinecone's cloud control plane. The client application incurs zero compute or memory overhead, though newly ingested vectors exhibit a short propagation latency before appearing in read queries.
+
 ---
 
 ## 4. Production Benchmarks: Latency, Recall, and QPS
@@ -139,6 +149,14 @@ We benchmarked a standard 1,536-dimensional embedding dataset (1,000,000 vectors
 - **Raw Engine Speed**: Native compiled engines (Qdrant and Milvus) achieve lowest p95 latency and highest raw queries-per-second thanks to dedicated C++/Rust SIMD parallelism.
 - **Relational Overhead**: `pgvector` incurs slight overhead due to PostgreSQL connection handling and MVCC tuple visibility checks, but its ~14ms latency remains well within the acceptable budget for interactive chatbot and agent workflows.
 - **Serverless Network Hops**: Pinecone Serverless introduces higher tail latency (~25-30ms) due to TLS network transit and blob storage tier lookups, but eliminates all infrastructure management overhead.
+
+> ⚠️ **Methodology Disclosure: The Pre-filter vs. Post-filter Reality**
+>
+> The benchmark figures above report raw nearest-neighbor retrieval on an unfiltered index or broad partition splits. In production RAG, how metadata filtering (`tenant_id = 'org_42'`, `status = 'active'`) is implemented fundamentally shifts recall and latency:
+>
+> 1. **Post-filtering (Filter After Search)**: The engine searches the global HNSW graph for top-$k$ vectors, then discards records that fail the metadata predicate. When filters are selective (e.g. only 1% of documents match), post-filtering silently returns fewer than $k$ results—or empty sets—leading to **silent recall collapse** while latency charts appear artificially fast.
+> 2. **Pre-filtering / Single-Stage Filtering**: The engine prunes candidate nodes during graph traversal. While native engines like Qdrant navigate payload bitsets inside the HNSW exploration step, naive pre-filtering across sparse subgraphs can trap traversals in disconnected clusters.
+> 3. **The Dual-Write Operational Trade-off**: While dedicated engines achieve 2-3x the raw QPS of `pgvector`, benchmarks rarely capture the operational cost of dual-writes. When vectors live directly in PostgreSQL, ACID transactions guarantee source records and embeddings never drift out of sync, saving teams from running complex out-of-band reconciliation pipelines.
 
 ---
 
@@ -290,6 +308,9 @@ The complete code, benchmarks, and interactive demo queries are open-sourced on 
 
   <Question>What embedding dimension should I choose for production RAG?</Question>
   <Answer>Common standards in 2026 include 1,536 dimensions (OpenAI text-embedding-3-small), 3,072 dimensions (text-embedding-3-large), and 768 or 1,024 dimensions (open-source BGE and Cohere models). Smaller dimensions reduce memory footprint and latency while retaining strong semantic recall.</Answer>
+
+  <Question>What happens during a reindex while the database is actively serving queries?</Question>
+  <Answer>Dedicated engines isolate reindexing significantly better than monolithic stores. Milvus offloads index construction to stateless IndexNodes without touching QueryNodes, and Qdrant merges immutable segments in the background without query locks. In PostgreSQL with pgvector, running CREATE INDEX CONCURRENTLY prevents write locks but heavily consumes CPU and buffer pool memory, which can introduce tail latency jitter for active queries unless isolated on a replica.</Answer>
 </FAQ>
 
 ---
