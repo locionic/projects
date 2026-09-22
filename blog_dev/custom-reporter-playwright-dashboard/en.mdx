@@ -3,121 +3,325 @@ draft: false
 title: "How to Build a Custom Playwright Reporter for Next.js Dashboards"
 category: Tech
 date: "2026-07-28"
-lastUpdated: '2026-08-04'
+lastUpdated: '2026-09-22'
 tags: ["playwright", "testing", "automation", "nextjs"]
-summary: 'A step-by-step tutorial on writing a custom JSON Playwright reporter and streaming real-time end-to-end test execution results to a Next.js dashboard.'
+summary: 'A step-by-step tutorial on writing a custom JSON Playwright reporter and streaming real-time end-to-end test execution results to a Next.js dashboard with flakiness analytics, CI sharding support, and PostgreSQL persistence.'
 images: ['https://imgbed.locionic.com/file/1785258991842_custom_reporter_playwright_1785258937235.jpg']
 ---
 
-Building a custom reporter for Playwright is the most effective way to stream live test automation results into your own Next.js dashboard. Instead of relying on static HTML reports or paying for third-party services, you can write a dedicated reporter that captures exact test metrics and posts them directly to your backend.
+Building a custom reporter for Playwright is the most effective way to stream live test automation results into your own Next.js dashboard. Instead of relying on static HTML reports or paying for third-party services, you can write a dedicated reporter that captures exact test metrics and posts them directly to your backend, giving your team a private, self-hosted analytics platform with zero vendor lock-in.
 
-In this guide, you will learn exactly how to implement a custom JSON reporter in Playwright and build the receiving API route in Next.js. We cover the entire pipeline, from the `Reporter` interface to the database insertion.
+In this guide, you will learn exactly how to implement a custom JSON reporter in Playwright, build a receiving API route in Next.js, add flakiness tracking, support CI sharding across multiple runners, and persist results to PostgreSQL via Prisma.
 
-## Why Should You Build a Custom Dashboard?
+## Why Standard HTML Reports Fall Short
 
-![Custom Dashboard Analytics](/static/images/why-build-custom-dashboard.avif)
+Standard Playwright HTML reports serve a single purpose: show pass/fail for a single test run. They provide no historical tracking, no flakiness detection across runs, no team-wide dashboard, and no integration with your alerting systems.
 
-You should build a custom dashboard because standard HTML reporters lack historical tracking and team-wide visibility. When you have a team of developers running thousands of tests every day, you need a centralized, live view of your automation health.
+When you have a team running thousands of tests daily across multiple CI pipelines, you need:
 
-A custom Playwright reporter allows you to capture specific data points—like test duration, retry counts, and precise error messages—and send them to a database. A Next.js application can then visualize this data in real time. This keeps your testing data private, avoids vendor lock-in, and gives you total control over how you analyze test stability over time.
+- **Historical trend data** — Is test stability improving after a refactor?
+- **Flakiness leaderboard** — Which tests pass only on retry?
+- **Per-branch visibility** — Did this PR introduce new failures?
+- **Real-time streaming** — Can developers see results as they run, not after?
 
-## How Do You Write the Playwright Reporter?
+A custom Playwright reporter solves all of this by implementing Playwright's built-in `Reporter` interface and posting structured data to your own API.
 
-![Playwright Reporter Code Editor](/static/images/how-to-write-playwright-reporter.avif)
+## Implementing the Playwright Reporter Interface
 
-You write the Playwright reporter by extending the built-in `Reporter` interface and implementing the lifecycle methods. Playwright exposes hooks like `onTestEnd` and `onEnd`, which allow you to intercept test results as they happen.
+Playwright exposes a `Reporter` interface with lifecycle hooks that fire at precise moments during a test run. The key hooks are:
 
-Create a file named `dashboard-reporter.ts` in your Playwright project. Here is the implementation that collects the results and posts them to your Next.js application:
+- `onBegin(config, suite)` — called once when the test run starts
+- `onTestBegin(test, result)` — called before each individual test
+- `onTestEnd(test, result)` — called after each test completes (pass, fail, or skip)
+- `onEnd(result)` — called once when the entire run finishes
+
+Create `dashboard-reporter.ts` in your Playwright project root:
 
 ```typescript
-import { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter';
+import type {
+  Reporter,
+  TestCase,
+  TestResult,
+  FullResult,
+  Suite,
+  FullConfig,
+} from '@playwright/test/reporter';
+
+interface TestPayload {
+  testId: string;
+  title: string;
+  fullTitle: string;
+  filePath: string;
+  status: 'passed' | 'failed' | 'flaky' | 'skipped' | 'timedOut';
+  retryCount: number;
+  durationMs: number;
+  workerIndex: number;
+  errorMessage: string | null;
+  errorStack: string | null;
+  attachmentUrls: string[];
+}
+
+interface RunPayload {
+  runId: string;
+  branch: string;
+  commitSha: string;
+  status: FullResult['status'];
+  startedAt: string;
+  finishedAt: string;
+  totalTests: number;
+  passedTests: number;
+  failedTests: number;
+  flakyTests: number;
+  skippedTests: number;
+  tests: TestPayload[];
+}
 
 class NextjsDashboardReporter implements Reporter {
-  private results: any[] = [];
+  private results: TestPayload[] = [];
+  private startedAt: string = '';
+  private runId: string;
+  private dashboardUrl: string;
+
+  constructor(options: { dashboardUrl?: string } = {}) {
+    this.runId = process.env.CI_RUN_ID ?? crypto.randomUUID();
+    this.dashboardUrl =
+      options.dashboardUrl ??
+      process.env.DASHBOARD_URL ??
+      'http://localhost:3000';
+  }
+
+  onBegin(_config: FullConfig, _suite: Suite) {
+    this.startedAt = new Date().toISOString();
+    console.log(`[Reporter] Run ${this.runId} started at ${this.startedAt}`);
+  }
 
   onTestEnd(test: TestCase, result: TestResult) {
+    // A test that passed but only after retries is flaky
+    const isFlaky = result.status === 'passed' && result.retry > 0;
+
     this.results.push({
+      testId: test.id,
       title: test.title,
-      status: result.status,
-      duration: result.duration,
-      errors: result.errors,
+      fullTitle: test.titlePath().join(' > '),
+      filePath: test.location.file,
+      status: isFlaky ? 'flaky' : result.status,
+      retryCount: result.retry,
+      durationMs: result.duration,
+      workerIndex: result.workerIndex ?? -1,
+      errorMessage: result.errors[0]?.message?.slice(0, 2000) ?? null,
+      errorStack: result.errors[0]?.stack?.slice(0, 4000) ?? null,
+      // Attachments are uploaded to S3/R2 separately; we store only URLs
+      attachmentUrls: result.attachments
+        .filter((a) => a.path)
+        .map((a) => `${this.dashboardUrl}/artifacts/${this.runId}/${a.name}`),
     });
   }
 
   async onEnd(result: FullResult) {
-    console.log(`Test run finished with status: ${result.status}`);
-    
-    await fetch('https://your-nextjs-dashboard.com/api/reports', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        status: result.status,
-        tests: this.results,
-        timestamp: new Date().toISOString(),
-      }),
-    });
+    const payload: RunPayload = {
+      runId: this.runId,
+      branch: process.env.GITHUB_REF_NAME ?? 'local',
+      commitSha: process.env.GITHUB_SHA ?? 'unknown',
+      status: result.status,
+      startedAt: this.startedAt,
+      finishedAt: new Date().toISOString(),
+      totalTests: this.results.length,
+      passedTests: this.results.filter((t) => t.status === 'passed').length,
+      failedTests: this.results.filter((t) => t.status === 'failed').length,
+      flakyTests: this.results.filter((t) => t.status === 'flaky').length,
+      skippedTests: this.results.filter((t) => t.status === 'skipped').length,
+      tests: this.results,
+    };
+
+    try {
+      const response = await fetch(`${this.dashboardUrl}/api/reports`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-reporter-secret': process.env.REPORTER_SECRET ?? '',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        console.error(`[Reporter] Upload failed: ${response.status} ${await response.text()}`);
+      } else {
+        console.log(`[Reporter] Run ${this.runId} uploaded successfully.`);
+      }
+    } catch (err) {
+      // Never let reporter errors crash the CI process
+      console.error('[Reporter] Network error during upload:', err);
+    }
   }
 }
 
 export default NextjsDashboardReporter;
 ```
 
-Once you have written this class, update your `playwright.config.ts` to use it. You simply add `['./dashboard-reporter.ts']` to your `reporter` array.
+Register the reporter in `playwright.config.ts`:
 
-## How Do You Create the Next.js Receiver?
+```typescript
+import { defineConfig } from '@playwright/test';
 
-![Next.js API Route Architecture](/static/images/how-to-create-nextjs-receiver.avif)
+export default defineConfig({
+  reporter: [
+    ['list'],                                    // Console output during run
+    ['./dashboard-reporter.ts', {               // Custom dashboard reporter
+      dashboardUrl: process.env.DASHBOARD_URL,
+    }],
+  ],
+});
+```
 
-You create the Next.js receiver by defining an API route that accepts POST requests and processes the incoming JSON payload. This endpoint acts as the bridge between your test runs and your database.
+## Building the Next.js API Receiver
 
-If you are using the Next.js App Router, create a file at `app/api/reports/route.ts`. The implementation looks like this:
+The API route validates the incoming payload, writes to PostgreSQL, and returns immediately. Using the App Router at `app/api/reports/route.ts`:
 
 ```typescript
 import { NextResponse } from 'next/server';
+import { prisma } from '@/lib/prisma';
+
+const REPORTER_SECRET = process.env.REPORTER_SECRET;
 
 export async function POST(request: Request) {
+  // Validate the shared secret
+  if (REPORTER_SECRET) {
+    const secret = request.headers.get('x-reporter-secret');
+    if (secret !== REPORTER_SECRET) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+  }
+
   const data = await request.json();
-  
-  console.log(`Received test report with status: ${data.status}`);
-  // Insert into your database (e.g., PostgreSQL via Prisma)
-  // await prisma.report.create({ data: { ... } })
-  
-  return NextResponse.json({ success: true, message: 'Report saved' });
+
+  // Upsert the run record (idempotent for CI sharding where multiple workers post)
+  const run = await prisma.testRun.upsert({
+    where: { runId: data.runId },
+    create: {
+      runId: data.runId,
+      branch: data.branch,
+      commitSha: data.commitSha,
+      status: data.status,
+      startedAt: new Date(data.startedAt),
+      finishedAt: new Date(data.finishedAt),
+      totalTests: data.totalTests,
+      passedTests: data.passedTests,
+      failedTests: data.failedTests,
+      flakyTests: data.flakyTests,
+      skippedTests: data.skippedTests,
+    },
+    update: {
+      // Merge shard results: aggregate counts
+      totalTests: { increment: data.totalTests },
+      passedTests: { increment: data.passedTests },
+      failedTests: { increment: data.failedTests },
+      flakyTests: { increment: data.flakyTests },
+      skippedTests: { increment: data.skippedTests },
+      status: data.status === 'failed' ? 'failed' : undefined,
+      finishedAt: new Date(data.finishedAt),
+    },
+  });
+
+  // Batch-insert all individual test results
+  await prisma.testResult.createMany({
+    data: data.tests.map((t: any) => ({
+      runId: run.id,
+      testId: t.testId,
+      title: t.title,
+      fullTitle: t.fullTitle,
+      filePath: t.filePath,
+      status: t.status,
+      retryCount: t.retryCount,
+      durationMs: t.durationMs,
+      workerIndex: t.workerIndex,
+      errorMessage: t.errorMessage,
+    })),
+    skipDuplicates: true,
+  });
+
+  return NextResponse.json({ success: true, runId: run.runId });
 }
 ```
 
+## Prisma Schema for Test Persistence
 
-## Streaming Flakiness Analytics & Retry Tracking
+```prisma
+model TestRun {
+  id          Int          @id @default(autoincrement())
+  runId       String       @unique
+  branch      String
+  commitSha   String
+  status      String
+  startedAt   DateTime
+  finishedAt  DateTime
+  totalTests  Int          @default(0)
+  passedTests Int          @default(0)
+  failedTests Int          @default(0)
+  flakyTests  Int          @default(0)
+  skippedTests Int         @default(0)
+  results     TestResult[]
+  createdAt   DateTime     @default(now())
 
-In production CI pipelines, individual tests often pass only on retry. Detecting flaky tests before they merge to `main` is critical for team velocity.
+  @@index([branch])
+  @@index([commitSha])
+}
 
-Update `onTestEnd` to track `result.retry` counters and classify tests by stability score:
+model TestResult {
+  id           Int     @id @default(autoincrement())
+  run          TestRun @relation(fields: [runId], references: [id])
+  runId        Int
+  testId       String
+  title        String
+  fullTitle    String
+  filePath     String
+  status       String
+  retryCount   Int     @default(0)
+  durationMs   Int
+  workerIndex  Int
+  errorMessage String?
+
+  @@index([testId])
+  @@index([status])
+  @@index([filePath])
+}
+```
+
+## Flakiness Dashboard Query
+
+With results persisted, you can compute per-test flakiness rates across branches with a single query:
 
 ```typescript
-// Tracking test retry state and worker concurrency
-onTestEnd(test: TestCase, result: TestResult) {
-  const isFlaky = result.status === 'passed' && result.retry > 0;
-  
-  this.results.push({
-    testId: test.id,
-    title: test.title,
-    filePath: test.location.file,
-    status: isFlaky ? 'flaky' : result.status,
-    retryCount: result.retry,
-    durationMs: result.duration,
-    workerIndex: result.workerIndex,
-    errorMessage: result.errors?.[0]?.message || null,
-  });
-}
+// Top 10 flaky tests in the last 30 days
+const flakyLeaderboard = await prisma.testResult.groupBy({
+  by: ['testId', 'fullTitle', 'filePath'],
+  where: {
+    run: { startedAt: { gte: new Date(Date.now() - 30 * 86400_000) } },
+  },
+  _count: { testId: true },
+  _sum: { retryCount: true },
+  having: { retryCount: { _sum: { gt: 0 } } },
+  orderBy: { _sum: { retryCount: 'desc' } },
+  take: 10,
+});
 ```
 
-By storing `isFlaky` records in PostgreSQL, your Next.js dashboard can display a real-time "Flaky Test Leaderboard" that highlights tests needing refactoring.
+## CI Sharding Support
 
----
+Playwright CI sharding splits your test suite across multiple runners for speed. Each shard runs independently and posts its results to the same endpoint. Because the API route uses `upsert` keyed on `runId` (set via `CI_RUN_ID`), all shards merge into a single unified run record:
 
-## What Are the Next Steps for Your Pipeline?
+```yaml
+# .github/workflows/e2e.yml
+strategy:
+  matrix:
+    shardIndex: [1, 2, 3, 4]
+    shardTotal: [4]
+env:
+  CI_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+  DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
+  REPORTER_SECRET: ${{ secrets.REPORTER_SECRET }}
+```
 
-You now have a private, fully customizable analytics platform for your test automation that bypasses costly commercial dashboard subscriptions.
+Each of the 4 shards posts its `CI_RUN_ID`, and the aggregate counts accumulate correctly in the database via the `upsert` increment logic.
 
 ---
 
@@ -128,13 +332,16 @@ You now have a private, fully customizable analytics platform for your test auto
   <Answer>Running a custom dashboard costs very little. If you deploy your receiver to Vercel and store telemetry in Supabase or serverless Neon PostgreSQL, operational costs are virtually zero for small to medium engineering teams.</Answer>
 
   <Question>Can I send attachments like screenshots and trace zip files to Next.js?</Question>
-  <Answer>Yes. Instead of sending large binary files inside the JSON payload, upload artifacts directly to Cloudflare R2 or Amazon S3 during test execution, and include signed artifact URLs in the reporter payload.</Answer>
+  <Answer>Yes. Instead of sending large binary files inside the JSON payload, upload artifacts directly to Cloudflare R2 or Amazon S3 using presigned URLs during test execution, and include only the signed artifact URLs in the reporter payload. This keeps the JSON payload small and avoids timeout issues.</Answer>
 
   <Question>Does a custom reporter slow down Playwright test execution?</Question>
-  <Answer>No. Playwright executes test lifecycle hooks asynchronously. In-memory data aggregation happens in the background, and the network payload is dispatched in the onEnd hook after tests complete.</Answer>
+  <Answer>No. Playwright executes test lifecycle hooks asynchronously. In-memory data aggregation happens in the background, and the network payload is dispatched in the onEnd hook after all tests complete. The only overhead is the final HTTP POST, which is typically under 500ms.</Answer>
 
   <Question>Is this custom reporter compatible with Playwright CI sharding?</Question>
-  <Answer>Yes. Pass a shared CI_RUN_ID environment variable to all runner shards. Each worker shard posts its batch to Next.js with the shared run ID, and your database aggregates them into a unified test run view.</Answer>
+  <Answer>Yes. Pass a shared CI_RUN_ID environment variable to all runner shards. Each worker shard posts its batch to the Next.js API with the same run ID, and the upsert logic in the database aggregates them into a unified test run view with correct aggregate counts.</Answer>
+
+  <Question>How do I alert on new test failures in Slack or PagerDuty?</Question>
+  <Answer>In the API route's onEnd handler, after persisting the results, check if `data.failedTests > 0` and `data.branch === 'main'`. If so, make an additional fetch call to a Slack webhook or PagerDuty Events API v2. This gives you real-time alerting without a separate CI step.</Answer>
 </FAQ>
 
 ---
@@ -145,5 +352,3 @@ You now have a private, fully customizable analytics platform for your test auto
 - [Playwright Visual Regression Testing: The Complete Enterprise Guide](/en/blog/playwright-visual-regression-testing-guide)
 - [Next.js Middleware: Building Robust Authentication and Authorization](/en/blog/nextjs-middleware-authentication)
 - [Vitest in Large Monorepos: Performance Optimization Guide](/en/blog/vitest-monorepo-unit-testing-performance)
-
-

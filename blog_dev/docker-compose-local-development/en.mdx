@@ -1,7 +1,8 @@
 ---
 title: 'Docker Compose for Local Development: A Complete Setup Guide'
 date: '2026-08-16'
-summary: 'A comprehensive guide to configuring Docker Compose for local development, managing multi-container architectures, and boosting productivity.'
+lastUpdated: '2026-09-22'
+summary: 'A comprehensive guide to configuring Docker Compose for local development: multi-container architecture, multi-stage Dockerfiles, healthcheck-driven startup ordering, environment secrets management, BuildKit cache mounts, and production-mirrored networking.'
 tags: ["docker", "devops", "backend"]
 draft: false
 featured: true
@@ -10,147 +11,291 @@ images:
   - '/static/images/docker-compose-local-development.png'
 ---
 
-Modern web applications are rarely just a frontend and a single backend server anymore. A typical stack today might include a Node.js API, a PostgreSQL database, a Redis cache for sessions, and perhaps a Celery worker for background jobs. Managing all these dependencies locally on your machine—installing specific versions of Postgres, configuring Redis ports—is a recipe for the classic "it works on my machine" problem.
+Modern web applications are rarely a single service. A typical 2026 stack includes a Node.js or Python API, a PostgreSQL database, a Redis cache, a Celery or BullMQ worker, and perhaps a local S3-compatible store like MinIO. Managing these dependencies manually — installing specific Postgres versions, configuring ports, juggling terminal tabs — is a recipe for environment drift and the classic "it works on my machine" failure.
 
-Enter **Docker Compose**. In 2026, Docker Compose remains the undisputed champion for orchestrating multi-container local development environments. It allows you to define your entire infrastructure in a single YAML file and spin it up with one command.
+Docker Compose solves this by expressing your entire local infrastructure as a single declarative YAML file. In 2026, Docker Compose v2 ships with Docker Desktop and Docker Engine, integrates BuildKit natively, and supports GPU profiles, healthchecks, and secrets — making it production-capable for local workflows.
 
-In this guide, we will build a complete, production-mirrored local development setup using Docker Compose.
+## Why Your `docker compose up` Should Mirror Production
 
-## The Problem Docker Compose Solves
+The goal is not just convenience. A Compose file that mirrors production catches environment-specific bugs before they reach staging. Concrete parity points to enforce:
 
-Without Docker Compose, onboarding a new developer looks like this:
-1. Install Node.js v20.
-2. Install PostgreSQL v15.
-3. Run this massive SQL script to seed the database.
-4. Install Redis.
-5. Create a `.env` file and make sure the ports match the local installations.
-6. Open three terminal tabs and run the API, frontend, and worker separately.
-
-With Docker Compose, the onboarding process is:
-1. Install Docker.
-2. Run `docker-compose up`.
+- Same PostgreSQL version, same encoding (`UTF8`), same locale (`en_US.UTF-8`)
+- Same Redis version and eviction policy (`volatile-lru` for session caches)
+- Same environment variable names (sourced from `.env`, never hardcoded)
+- Same network topology (services discover each other by service name, not `localhost`)
+- Same user permissions (API container runs as non-root, mirrors K8s `runAsNonRoot`)
 
 ## Step 1: The `docker-compose.yml` File
 
-The heart of your setup is the `docker-compose.yml` file, usually located at the root of your project. Let's define a standard stack: a Node.js API and a PostgreSQL database.
+Here is a production-mirrored Compose file for a Node.js API with PostgreSQL, Redis, and a background worker:
 
 ```yaml
-version: '3.8'
+# docker-compose.yml (Docker Compose v2 — no "version:" key needed)
+name: myapp
 
 services:
   api:
     build:
       context: ./api
       target: development
+      cache_from:
+        - type=local,src=/tmp/.buildx-cache
     ports:
       - "3000:3000"
     volumes:
       - ./api:/usr/src/app
-      - /usr/src/app/node_modules
+      - node_modules:/usr/src/app/node_modules  # Prevent host node_modules leak
+    env_file:
+      - .env
     environment:
-      - NODE_ENV=development
-      - DATABASE_URL=postgres://user:password@db:5432/myappdb
+      NODE_ENV: development
+      DATABASE_URL: postgres://app:${POSTGRES_PASSWORD}@db:5432/myappdb
+      REDIS_URL: redis://redis:6379/0
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     command: npm run dev
+    user: "1001:1001"   # Match your host UID to avoid root-owned volume files
+
+  worker:
+    build:
+      context: ./api
+      target: development
+    volumes:
+      - ./api:/usr/src/app
+      - node_modules:/usr/src/app/node_modules
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://app:${POSTGRES_PASSWORD}@db:5432/myappdb
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: npm run worker
+    user: "1001:1001"
 
   db:
-    image: postgres:15-alpine
-    restart: always
+    image: postgres:16-alpine
+    restart: unless-stopped
     ports:
       - "5432:5432"
     environment:
-      - POSTGRES_USER=user
-      - POSTGRES_PASSWORD=password
-      - POSTGRES_DB=myappdb
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: myappdb
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+      - ./db/seed.sql:/docker-entrypoint-initdb.d/20-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d myappdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy volatile-lru
+      --save ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"   # MinIO Console UI
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
 volumes:
   pgdata:
+  node_modules:
+  minio_data:
 ```
 
-### Breaking Down the Configuration
+### Why `depends_on` with `condition: service_healthy` Matters
 
-#### 1. Volumes for Hot Reloading
-The `volumes` section under the `api` service is crucial for local development.
-*   `- ./api:/usr/src/app`: This maps your local `./api` directory to the container's working directory. Any changes you make locally are instantly reflected inside the container, allowing tools like `nodemon` or Next.js's dev server to trigger hot reloads.
-*   `- /usr/src/app/node_modules`: This is a "volume trick." It prevents your local `node_modules` (which might be compiled for Mac/Windows) from overwriting the container's Linux-compiled `node_modules`.
+The naive `depends_on: [db]` only waits for the container to *start*, not for PostgreSQL to accept connections. Your API's first database query hits "connection refused" and crashes on startup. Using `condition: service_healthy` with a proper `healthcheck` ensures Postgres is actually ready before the API boots.
 
-#### 2. Environment Variables
-Instead of relying on complex `.env` file management, we can hardcode development credentials directly in the compose file or reference an `.env` file seamlessly. Notice how `DATABASE_URL` connects to `db:5432`? Docker Compose automatically resolves the service name `db` to its internal IP address.
+### The `node_modules` Volume Trick
 
-#### 3. Database Initialization
-Under the `db` service, we map `./init.sql:/docker-entrypoint-initdb.d/init.sql`. The official Postgres image automatically runs any SQL files placed in this directory upon creation. This guarantees that your local database is seeded with the correct schemas every time you destroy and recreate the volume.
+The `node_modules:/usr/src/app/node_modules` named volume prevents your host `node_modules` (compiled for macOS or Windows) from overwriting the container's Linux-compiled binaries. Without this, native addons like `bcrypt` or `sharp` fail inside the container.
 
-#### 4. Persistent Data
-The `pgdata:/var/lib/postgresql/data` volume ensures that if you stop the containers (`docker-compose down`), your database data isn't wiped out. It's stored in a named volume managed by Docker.
+## Step 2: Multi-Stage Dockerfile with BuildKit Cache Mounts
 
-## Step 2: Optimizing the Dockerfile for Dev and Prod
-
-To make this work seamlessly, your `Dockerfile` should utilize Multi-Stage builds.
+BuildKit cache mounts dramatically accelerate rebuilds by persisting the npm cache across builds:
 
 ```dockerfile
-# Base stage
+# api/Dockerfile
 FROM node:20-alpine AS base
 WORKDIR /usr/src/app
-COPY package*.json ./
+RUN addgroup -g 1001 appgroup && adduser -u 1001 -G appgroup -s /bin/sh -D appuser
 
-# Development stage
+# Development stage — includes devDependencies, live reload
 FROM base AS development
-RUN npm install
+COPY package*.json ./
+# BuildKit cache mount: npm cache persists across `docker compose build` runs
+RUN --mount=type=cache,target=/root/.npm \
+    npm install
 COPY . .
-# We don't define a CMD here; we override it in docker-compose.yml
+# CMD is overridden by docker-compose.yml
 
-# Production build stage
+# Build stage — compiles TypeScript, runs tests
 FROM base AS build
-RUN npm ci
+COPY package*.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
 COPY . .
-RUN npm run build
+RUN npm run build && npm run test:ci
 
-# Production runtime stage
+# Production runtime — minimal image, no devDependencies
 FROM node:20-alpine AS production
 WORKDIR /usr/src/app
+RUN addgroup -g 1001 appgroup && adduser -u 1001 -G appgroup -s /bin/sh -D appuser
 COPY package*.json ./
-RUN npm ci --only=production
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev
 COPY --from=build /usr/src/app/dist ./dist
+USER appuser
+EXPOSE 3000
 CMD ["node", "dist/main.js"]
 ```
 
-In our `docker-compose.yml`, we specified `target: development`. This tells Docker to stop building after the `development` stage, saving time and keeping dev-dependencies (like `eslint` or `nodemon`) available for the local server.
+The `--mount=type=cache` directive is a BuildKit feature. The first build downloads dependencies; subsequent builds read from the cache layer, cutting build time from minutes to seconds for most iterative changes.
 
-## Step 3: Useful Commands for Daily Workflow
+## Step 3: Environment Secrets Management
 
-Once configured, your daily workflow revolves around a few commands:
+Never commit credentials to version control. Use `.env` with a committed `.env.example`:
 
-*   **Start the stack:** `docker-compose up` (add `-d` to run in the background).
-*   **Stop the stack:** `docker-compose down`.
-*   **View logs:** `docker-compose logs -f api` (tail the logs of just the API).
-*   **Run a command inside a container:** `docker-compose exec api npm run script:seed`.
-*   **Nuke everything (including database data):** `docker-compose down -v`.
-
-## Networking and Adding Services
-
-Adding a Redis cache is as simple as adding 10 lines to the YAML file.
-
-```yaml
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
+```bash
+# .env.example — committed to git
+POSTGRES_PASSWORD=change_me_in_env
+MINIO_USER=minioadmin
+MINIO_PASSWORD=change_me_in_env
+REPORTER_SECRET=change_me_in_env
 ```
 
-Because of Docker Compose's internal networking, your Node.js API can immediately connect to this via `redis://redis:6379`. You don't need to worry about localhost port conflicts on your host machine.
+```bash
+# .env — gitignored, copied from .env.example
+POSTGRES_PASSWORD=dev_local_secret_32chars
+MINIO_USER=minioadmin
+MINIO_PASSWORD=dev_local_minio_secret
+REPORTER_SECRET=dev_reporter_secret
+```
+
+For production-like secrets in local testing, Docker Compose Secrets provide a more secure alternative that mounts secrets as files rather than environment variables:
+
+```yaml
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+
+services:
+  api:
+    secrets:
+      - db_password
+    environment:
+      DATABASE_PASSWORD_FILE: /run/secrets/db_password
+```
+
+## Step 4: Daily Workflow Commands
+
+```bash
+# Start the entire stack (foreground — see all logs)
+docker compose up
+
+# Start detached, tail only API logs
+docker compose up -d && docker compose logs -f api
+
+# Rebuild only the api image after Dockerfile changes
+docker compose up --build api
+
+# Run a one-off command inside the running api container
+docker compose exec api npm run migrate:latest
+
+# Run a new ephemeral container (doesn't affect the running api)
+docker compose run --rm api npm run db:seed
+
+# Stop containers, preserve volumes
+docker compose down
+
+# Nuclear reset: stop, remove containers, networks, AND volumes
+docker compose down -v
+
+# View resource usage
+docker compose stats
+```
+
+## Networking and Service Discovery
+
+Docker Compose creates a private network named `myapp_default` (prefixed with the `name:` value). Every service is reachable at `http://<service-name>:<internal-port>`:
+
+| Access From | Target | URL |
+|---|---|---|
+| `api` container | PostgreSQL | `postgres://app:…@db:5432/myappdb` |
+| `api` container | Redis | `redis://redis:6379/0` |
+| `api` container | MinIO API | `http://minio:9000` |
+| Your browser | API | `http://localhost:3000` |
+| Your browser | MinIO Console | `http://localhost:9001` |
+
+Port mappings (`ports:`) expose container ports to your host machine. Without a mapping, a service is reachable from other containers but not from your browser — useful for isolating internal services.
+
+## Profiles for Optional Services
+
+Use profiles to start optional services (like a Jaeger trace collector) only when needed:
+
+```yaml
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+    profiles: ["observability"]
+```
+
+```bash
+# Start with optional observability stack
+docker compose --profile observability up
+
+# Start without (default)
+docker compose up
+```
 
 ## Conclusion
 
-Docker Compose provides a unified, deterministic environment that eliminates the friction of local setup. By defining your infrastructure alongside your code, you ensure that every developer—and your CI/CD pipeline—is operating in the exact same context. Investing an hour into creating a solid `docker-compose.yml` will save your team hundreds of hours of debugging environment-specific issues.
+A well-crafted `docker-compose.yml` eliminates environment drift, cuts onboarding from hours to minutes, and gives your CI pipeline the same deterministic environment as every developer's machine. The investment is an hour of setup; the return is months of saved debugging time across your team.
 
 ## You Might Also Like
 
 - [Dev Containers Guide: Docker Environments in VS Code](/en/blog/devcontainers-for-consistent-environments)
+- [Docker BuildKit Cache Mount Optimization for Fast CI Builds](/en/blog/docker-buildkit-cache-mount-optimization)
 - [IaaS, PaaS, SaaS: A Mental Model That Actually Sticks](/en/blog/iaas_paas_saas)
 - [Edge Computing for Web Developers: What It Actually Is and When to Use It](/en/blog/edge-computing-for-web-developers)
-- [Serverless vs Edge computing](/en/blog/serverless-vs-edge)
-
