@@ -1,153 +1,267 @@
 ---
 draft: false
 title: 'FastAPI Docker Multistage Builds: Cut Your Image Size by 70%'
-category: Tech
+category: devops
 date: '2026-07-29'
-tags: ["docker", "python", "fastapi", "devops"]
-summary: 'Stop shipping compilers to production. How to use Docker multistage builds for Python and FastAPI to create tiny, secure, rootless containers.'
+lastUpdated: '2026-09-22'
+tags: ["docker", "python", "fastapi", "devops", "uv"]
+summary: 'Stop shipping compilers to production. How to use Docker multistage builds with uv and BuildKit caching for FastAPI — from 1.2 GB to under 100 MB, with fast CI rebuilds.'
 images: ['/static/images/fastapi-docker-multistage-build.jpg']
 authors: ['default']
 ---
 
-Most Python developers start with a straightforward `Dockerfile`. You pull `python:3.12`, install your requirements, copy your FastAPI app, and ship it. 
+Most Python developers start with a straightforward `Dockerfile`. You pull `python:3.12`, install your requirements, copy your FastAPI app, and ship it.
 
-The problem? Your image is now 1.2GB. It contains build tools, C compilers, and development headers that your production server never uses. It takes forever to pull during deployments and expands your attack surface.
+The problem? Your image is now 1.2 GB. It contains build tools, C compilers, and development headers your production server never uses. It takes forever to pull during deployments and expands your attack surface.
 
-If you deploy Python applications, multistage Docker builds are mandatory. 
+If you deploy Python applications, multistage Docker builds are mandatory.
 
-In this guide, we will build a highly optimized, production-ready multistage Dockerfile for a FastAPI application. We will separate the build environment from the runtime, resulting in a tiny, secure, rootless container.
+This guide covers three versions of the same Dockerfile, each building on the previous:
+1. **Classic multistage** — the baseline fix
+2. **BuildKit cache mounts** — fast rebuilds in CI
+3. **uv-based** — the fastest modern approach
 
 ![FastAPI Docker Multistage Builds](/static/images/fastapi-docker-multistage-build.jpg)
 
-## Why single-stage Python builds fail
+## Why Single-Stage Python Builds Fail
 
-Python needs a compiler to build C-extensions for popular libraries like `psycopg2` or `cryptography`. 
+Python needs a compiler to build C-extensions for popular libraries like `psycopg2`, `cryptography`, or `lxml`.
 
-When you run `pip install`, it often downloads source code and compiles it. To make this work, your base Docker image needs `build-essential` and `python3-dev`. If you ship that same stage to production, you are shipping the compiler. 
+When you run `pip install`, it often downloads source code and compiles it. To make this work, your base Docker image needs `build-essential` and `python3-dev`. If you ship that same stage to production, you are shipping the compiler.
 
-Hackers love finding compilers on production web servers. It makes compiling exploits incredibly easy.
+Hackers love finding compilers on production web servers. It makes compiling exploits trivially easy.
 
 ![Why single-stage Python builds fail](/static/images/why-single-stage-python-builds-fail.jpg)
 
-## The Multistage Solution
+## Version 1: The Classic Multistage Build
 
-A multistage build splits your `Dockerfile` into discrete steps. 
+A multistage build splits your `Dockerfile` into discrete stages:
 
-1. **The Builder Stage**: Uses a heavy base image. Installs compilers, dependencies, and builds the Python virtual environment.
-2. **The Runtime Stage**: Uses a lightweight base image (like `python:3.12-slim`). Copies *only* the compiled virtual environment and the application code from the builder stage. 
+1. **Builder Stage**: Heavy base image. Installs compilers, builds the virtual environment.
+2. **Runtime Stage**: Lightweight slim image. Copies *only* the compiled venv and application code.
 
-The compilers are left behind.
+The compilers never reach production.
 
 ![The Multistage Solution](/static/images/the-multistage-solution.jpg)
 
-## The Production-Ready FastAPI Dockerfile
-
-Here is the exact `Dockerfile` you can use for your FastAPI projects.
-
 ```dockerfile
-# ---------------------------------------------
----
----
 # Stage 1: Builder
-# ---------------------------------------------
----
----
 FROM python:3.12-slim AS builder
 
-# Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Create a virtual environment
+# Create a self-contained virtual environment
 RUN python -m venv /opt/venv
-
-# Make sure we use the virtualenv
 ENV PATH="/opt/venv/bin:$PATH"
 
 COPY requirements.txt .
-
-# Install dependencies into the virtualenv
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ---------------------------------------------
----
----
 # Stage 2: Runtime
-# ---------------------------------------------
----
----
 FROM python:3.12-slim
 
-# Create a non-root user for security
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 
-# Set working directory
 WORKDIR /app
 
-# Install runtime dependencies (e.g., libpq for PostgreSQL)
-# We don't need build-essential here!
+# Runtime-only native lib (no compiler)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the virtualenv from the builder stage
+# Transfer the fully-built venv — no build tools come with it
 COPY --from=builder /opt/venv /opt/venv
-
-# Set PATH to use the virtualenv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy application code
 COPY . .
-
-# Change ownership to non-root user
 RUN chown -R appuser:appuser /app
-
-# Switch to non-root user
 USER appuser
 
-# Expose the FastAPI port
 EXPOSE 8000
-
-# Run the application using Uvicorn
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-## How this works
+**Result**: ~150 MB image instead of ~1.2 GB.
 
-Let's break down the critical parts of this workflow.
+### Alpine vs. Slim — Don't Use Alpine for Python
 
-### 1. The Virtual Environment Trick
-Python virtual environments (`venv`) are entirely self-contained. The builder stage creates a `/opt/venv` directory and installs all pip packages directly into it. 
+Alpine uses `musl libc` instead of `glibc`. Many Python packages (`numpy`, `pandas`, `cryptography`) ship pre-compiled wheels for `glibc` only. With Alpine, `pip` must compile everything from source — drastically slower builds and frequent obscure C errors.
 
-In the runtime stage, we use `COPY --from=builder /opt/venv /opt/venv`. We move the fully built dependencies without moving the build tools that created them. By updating the `PATH` environment variable, Python automatically uses this virtual environment.
+Always use `python:X.Y-slim`. It's Debian-based, uses `glibc`, and is small enough for production.
 
-### 2. Alpine vs. Slim
-Do not use `alpine` for Python applications. 
+### Why Non-Root Matters
 
-Alpine uses `musl libc` instead of `glibc`. Many Python packages (like `numpy`, `pandas`, or `cryptography`) provide pre-compiled wheels for `glibc`. If you use Alpine, pip has to compile these packages from source, drastically increasing your build times and often failing with obscure C errors.
+Docker runs containers as `root` by default. A compromised FastAPI process with root access inside the container can write to any file, install tools, and pivot to other containers via shared volumes. The `USER appuser` line drops to a low-privilege user before the process starts. This is required for Kubernetes environments with PodSecurityAdmission enforcement.
 
-Always use `python:X.Y-slim`. It is based on Debian, uses `glibc`, and is small enough for production.
+## Version 2: BuildKit Cache Mounts (Fast CI Rebuilds)
 
-### 3. Running as Non-Root
-By default, Docker runs processes as `root`. If your FastAPI application is compromised, the attacker gains root access inside the container. 
+The classic multistage build re-downloads every pip package on every build if `requirements.txt` changes even slightly. BuildKit cache mounts fix this.
 
-We create a dedicated `appuser` and switch to it using `USER appuser` before starting the server. This restricts permissions and is a requirement for deploying to strict environments like Kubernetes.
+```dockerfile
+# syntax=docker/dockerfile:1.4
+FROM python:3.12-slim AS builder
 
-## The Results
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-By implementing this multistage build, you achieve:
-- **Smaller Image Size**: Dropping from ~1GB to ~150MB. Faster CI/CD pipelines and cheaper container registry storage.
-- **Enhanced Security**: No compilers in production, and the application runs as a non-root user.
-- **Predictable Builds**: The virtual environment is isolated and cleanly transferred.
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-Stop shipping `build-essential`. Implement multistage builds and keep your production images lean. For a detailed breakdown of container memory footprints and serialization speeds, see our [FastAPI vs Litestar (2026) benchmark guide](/en/blog/fastapi-vs-litestar-comparison).
+COPY requirements.txt .
+
+# --mount=type=cache persists pip's HTTP cache across builds
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+
+FROM python:3.12-slim
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+COPY . .
+RUN chown -R appuser:appuser /app
+USER appuser
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+BuildKit is enabled by default in Docker 23+. For older versions, set `DOCKER_BUILDKIT=1` before building.
+
+**CI impact**: On GitHub Actions with a warm cache, a full rebuild that previously took 4m30s drops to ~45s because pip reads compiled wheels directly from the cache mount instead of downloading and compiling them.
+
+## Version 3: uv — The Fastest Modern Approach
+
+[`uv`](https://github.com/astral-sh/uv) is a Rust-based pip replacement that is 10–100x faster. Astral ships a Docker image (`ghcr.io/astral-sh/uv`) that makes integrating it trivial:
+
+```dockerfile
+# syntax=docker/dockerfile:1.4
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
+
+WORKDIR /app
+
+# Install dependencies with uv — uses BuildKit cache automatically
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    uv sync --frozen --no-install-project --no-dev
+
+# Copy application code and install the project itself
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+# Runtime stage — no uv needed here
+FROM python:3.12-slim
+
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+WORKDIR /app
+
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app /app
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+ENV PATH="/app/.venv/bin:$PATH"
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+This uses `pyproject.toml` + `uv.lock` instead of `requirements.txt`, which gives you reproducible, pinned builds across environments.
+
+**Migration**: If you're still on `requirements.txt`, run `uv init` and `uv add $(cat requirements.txt)` to generate `pyproject.toml` and `uv.lock`.
+
+## Image Size Comparison
+
+| Approach | Base Image | Image Size | Cold Build | Warm Rebuild |
+|---|---|---|---|---|
+| Single-stage | python:3.12 | ~1.2 GB | 4m 30s | 4m 30s |
+| Multistage (classic) | python:3.12-slim | ~150 MB | 2m 15s | 2m 15s |
+| Multistage + BuildKit cache | python:3.12-slim | ~150 MB | 2m 15s | ~45s |
+| uv multistage + BuildKit | uv:python3.12 | ~95 MB | ~60s | ~12s |
+
+The uv approach achieves both the smallest image and the fastest rebuild — the two metrics that matter most for CI/CD iteration speed and deploy time.
+
+## Uvicorn Workers in Production
+
+The `CMD` in the examples above starts a single Uvicorn worker. For production with multiple CPU cores, use Gunicorn as a process manager:
+
+```dockerfile
+CMD ["gunicorn", "main:app", \
+     "--workers", "4", \
+     "--worker-class", "uvicorn.workers.UvicornWorker", \
+     "--bind", "0.0.0.0:8000", \
+     "--timeout", "120", \
+     "--access-logfile", "-"]
+```
+
+Or use Uvicorn's built-in `--workers` flag (simpler, but Gunicorn handles graceful restarts better):
+
+```dockerfile
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+```
+
+General rule: `--workers = 2 × CPU cores + 1` for I/O-bound FastAPI apps. For CPU-bound workloads, match workers to CPU count exactly.
+
+## GitHub Actions CI Integration
+
+```yaml
+# .github/workflows/build.yml
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          # GitHub Actions cache backend — persists BuildKit layers between runs
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+The `cache-from: type=gha` / `cache-to: type=gha,mode=max` pair is the GitHub Actions native BuildKit cache. Combined with uv's cache mounts, it makes CI rebuilds near-instant when only application code changes (no dependency changes).
+
+## What to Use When
+
+| Scenario | Recommendation |
+|---|---|
+| New project with pyproject.toml | uv multistage + BuildKit |
+| Legacy project with requirements.txt | Classic multistage, add BuildKit cache |
+| Kubernetes with strict security policy | Either, ensure non-root USER |
+| Multi-arch builds (ARM + x86) | Add `--platform linux/amd64,linux/arm64` to buildx |
+
+Stop shipping `build-essential` to production. Even the classic multistage approach cuts your image by 87% and removes your attack surface. Switching to uv gets you there faster.
 
 ## You Might Also Like
 
-- [Why My Docker Images Were 1GB (And How I Shrank Them to 50MB)](/en/blog/docker-image-optimization)
+- [Docker BuildKit Cache Mount and Multi-Stage Optimization](/en/blog/docker-buildkit-cache-mount-optimization)
 - [Docker Compose for Local Development: A Complete Setup Guide](/en/blog/docker-compose-local-development)
-- [Dev Containers Guide: Docker Environments in VS Code](/en/blog/devcontainers-for-consistent-environments)
-- [IaaS, PaaS, SaaS: A Mental Model That Actually Sticks](/en/blog/iaas_paas_saas)
-
+- [Astral uv in Docker: Multi-Stage Builds, BuildKit Caching & Fast CI](/en/blog/python-uv-package-manager-guide)
+- [FastAPI vs Litestar 2026: Performance Benchmark and Feature Comparison](/en/blog/fastapi-vs-litestar-comparison)
