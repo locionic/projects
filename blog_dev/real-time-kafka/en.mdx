@@ -1,27 +1,328 @@
 ---
-title: "Real-time data streaming with Apache Kafka"
+title: "Real-Time Data Streaming with Apache Kafka: A Production Guide"
 date: "2026-09-11"
-summary: "Build enterprise real-time streaming architectures with Apache Kafka: log compaction, consumer backpressure handling, and zero-downtime cluster scaling."
-tags: ["kafka", "data-streaming", "data-engineering", "architecture"]
+lastmod: "2026-09-22"
+summary: "Build enterprise real-time streaming architectures with Apache Kafka: producers, consumers, log compaction, consumer backpressure handling, Kafka Streams, exactly-once semantics, and zero-downtime cluster scaling."
+tags: ["kafka", "data-streaming", "data-engineering", "architecture", "python"]
 images: ["/static/images/real-time-kafka.png"]
-draft: true
+draft: false
 ---
 
+In a world where data loses value by the millisecond, batch processing is no longer sufficient. Real-time data streaming has become the backbone of modern data architectures, and Apache Kafka is the undisputed industry standard for distributed event streaming — processing trillions of events per day across companies like LinkedIn (where it was born), Netflix, Uber, and Airbnb.
 
-In a world where data loses value by the millisecond, batch processing is no longer sufficient. Real-time data streaming has become the backbone of modern data architectures, and Apache Kafka is the undisputed industry standard for distributed event streaming.
+This guide covers everything you need to build, operate, and scale a production Kafka system: architecture, Python producers/consumers, partitioning strategy, exactly-once semantics, backpressure handling, and zero-downtime scaling.
 
 ## The Kafka Architecture
-Kafka works as a distributed commit log. Producers publish events (messages) to topics. Consumers subscribe to these topics and process the events. Unlike traditional message queues, Kafka retains the events for a configured period, allowing multiple consumers to read the same data at their own pace.
 
-The architecture relies heavily on partitions. A topic is divided into partitions, which are distributed across the Kafka cluster. This partitioning allows Kafka to scale horizontally to handle millions of messages per second.
+Kafka works as a **distributed commit log**. Producers publish events (messages) to named **topics**. Consumers subscribe to those topics and process events at their own pace. Unlike traditional message queues (RabbitMQ, SQS) that delete messages after consumption, Kafka **retains events for a configured period** — enabling multiple consumer groups to read the same data independently, and enabling replay from any offset.
 
-## Event-Driven Architectures
-Kafka is the enabler for event-driven microservices. Instead of services calling each other synchronously via HTTP, they react to events published to Kafka. This decouples the services, improves fault tolerance, and makes the system much more resilient to traffic spikes. Integrating Kafka with stream processing frameworks like Apache Flink or Kafka Streams unlocks the ability to perform complex stateful operations on data in motion.
+The core architectural components:
+
+| Component | Role |
+|---|---|
+| **Broker** | A single Kafka server. Stores topic partitions on disk. |
+| **Topic** | A named stream of events. Divided into partitions. |
+| **Partition** | The unit of parallelism. An ordered, immutable log. |
+| **Producer** | Writes events to a topic. |
+| **Consumer** | Reads events from a topic. |
+| **Consumer Group** | A set of consumers that collaboratively process a topic (each partition consumed by exactly one member). |
+| **ZooKeeper / KRaft** | Metadata coordination. KRaft (Kafka Raft) replaces ZooKeeper in Kafka 3.3+ for simplified operations. |
+
+## Topics, Partitions, and Ordering
+
+**Partitioning** is Kafka's horizontal scaling mechanism. A topic can have 1 to thousands of partitions. Each partition is an ordered, append-only log stored on a specific broker.
+
+**Ordering is guaranteed within a partition, not across partitions.** This is a critical design constraint. If you need all events for a specific user to be processed in order, you must route all of that user's events to the same partition using a consistent partition key:
+
+```python
+# Producer: route by user_id to guarantee per-user ordering
+producer.produce(
+    topic="user-events",
+    key=str(user_id).encode(),   # same key → same partition
+    value=json.dumps(event).encode()
+)
+```
+
+Kafka's default partitioner uses `murmur2(key) % num_partitions` to determine the target partition.
+
+**How many partitions?** A common rule of thumb: target ~10 MB/s throughput per partition. For a topic handling 1 GB/s total, you'd want ~100 partitions. More partitions = more parallelism but higher coordinator overhead (more file handles, longer leader election on failures).
+
+## Building a Python Producer
+
+```python
+from confluent_kafka import Producer
+import json
+import time
+
+conf = {
+    "bootstrap.servers": "kafka1:9092,kafka2:9092,kafka3:9092",
+    "acks": "all",                    # wait for all in-sync replicas to acknowledge
+    "retries": 5,
+    "retry.backoff.ms": 200,
+    "compression.type": "lz4",        # compress batches — massive throughput boost
+    "linger.ms": 5,                    # batch for up to 5ms before sending
+    "batch.size": 65536,               # 64 KB batch size
+    "enable.idempotence": True,        # exactly-once producer semantics
+}
+
+producer = Producer(conf)
+
+def delivery_report(err, msg):
+    if err is not None:
+        print(f"Delivery failed for {msg.key()}: {err}")
+    else:
+        print(f"Delivered to {msg.topic()} [{msg.partition()}] @ offset {msg.offset()}")
+
+# Produce a batch of events
+for i in range(1000):
+    event = {"user_id": i % 100, "action": "page_view", "ts": time.time()}
+    producer.produce(
+        topic="user-events",
+        key=str(event["user_id"]),
+        value=json.dumps(event),
+        callback=delivery_report
+    )
+    producer.poll(0)    # trigger callbacks for previously sent messages
+
+producer.flush()        # wait for all in-flight messages to be delivered
+```
+
+Key producer settings explained:
+- **`acks=all`** — The strongest durability guarantee. The leader waits for all in-sync replicas (ISR) to acknowledge before responding to the producer.
+- **`enable.idempotence=True`** — Prevents duplicate messages on producer retries (requires `acks=all`).
+- **`linger.ms` + `batch.size`** — Trade a small latency for significantly higher throughput by batching multiple records into a single request.
+- **`compression.type=lz4`** — LZ4 is the best all-around Kafka compression: fast CPU-wise and high ratio for JSON payloads.
+
+## Building a Python Consumer
+
+```python
+from confluent_kafka import Consumer, KafkaException
+import json
+
+conf = {
+    "bootstrap.servers": "kafka1:9092,kafka2:9092,kafka3:9092",
+    "group.id": "user-event-processor-v1",
+    "auto.offset.reset": "earliest",     # start from the beginning if no committed offset
+    "enable.auto.commit": False,          # manual commit for exactly-once processing
+    "max.poll.interval.ms": 300000,       # 5 min max processing time per batch
+    "session.timeout.ms": 30000,
+}
+
+consumer = Consumer(conf)
+consumer.subscribe(["user-events"])
+
+try:
+    while True:
+        msg = consumer.poll(timeout=1.0)
+
+        if msg is None:
+            continue
+        if msg.error():
+            raise KafkaException(msg.error())
+
+        event = json.loads(msg.value().decode("utf-8"))
+
+        # Process the event
+        process_event(event)
+
+        # Commit offset only AFTER successful processing
+        consumer.commit(asynchronous=False)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    consumer.close()
+```
+
+**`enable.auto.commit=False`** is critical for at-least-once (or exactly-once) processing. With auto-commit enabled, Kafka commits the offset periodically regardless of whether your processing succeeded — a crash between auto-commit and processing completion means you lose the event.
+
+## Handling Consumer Backpressure
+
+Backpressure occurs when your consumer processes events slower than the producer writes them. Without handling this, you get unbounded consumer lag, memory pressure, and eventual OOM crashes.
+
+**Patterns for handling backpressure:**
+
+### 1. Slow consumer: increase parallelism
+
+Add more partitions and more consumers (up to `num_partitions` consumers per group):
+
+```bash
+kafka-topics.sh --alter --topic user-events --partitions 24 \
+  --bootstrap-server kafka1:9092
+```
+
+Then scale your consumer group: each consumer handles `24 / num_consumers` partitions.
+
+### 2. Async processing with bounded queues
+
+```python
+import asyncio
+from asyncio import Queue
+
+async def consume(consumer: Consumer, queue: Queue):
+    while True:
+        msg = consumer.poll(timeout=0.1)
+        if msg and not msg.error():
+            await queue.put(msg)       # blocks if queue is full — natural backpressure
+            
+async def process(queue: Queue):
+    while True:
+        msg = await queue.get()
+        event = json.loads(msg.value())
+        await process_event_async(event)
+        queue.task_done()
+
+# Bounded queue: max 500 in-flight events
+queue = Queue(maxsize=500)
+await asyncio.gather(consume(consumer, queue), process(queue))
+```
+
+### 3. Dead Letter Queue (DLQ)
+
+For events that repeatedly fail processing, route them to a DLQ rather than blocking the main topic:
+
+```python
+def process_with_dlq(msg):
+    for attempt in range(3):
+        try:
+            process_event(json.loads(msg.value()))
+            return
+        except Exception as e:
+            if attempt == 2:
+                # Send to DLQ with original headers + error metadata
+                producer.produce("user-events.DLQ", value=msg.value(),
+                                 headers={"error": str(e), "original-topic": "user-events"})
+```
+
+## Log Compaction
+
+Kafka supports two retention policies:
+
+- **Time/size-based retention** — Delete segments older than N days or larger than N bytes. Default behavior.
+- **Log compaction** — Retain only the **most recent event per key**. Ideal for changelog topics and materialized views.
+
+Enable log compaction on a topic:
+
+```bash
+kafka-configs.sh --bootstrap-server kafka1:9092 \
+  --entity-type topics \
+  --entity-name user-profiles \
+  --alter \
+  --add-config "cleanup.policy=compact,min.cleanable.dirty.ratio=0.1,delete.retention.ms=86400000"
+```
+
+A compacted `user-profiles` topic always contains the latest profile for each `user_id` key — perfect for bootstrapping a cache or rebuilding a read model.
+
+## Exactly-Once Semantics (EOS)
+
+Kafka 3.0+ supports end-to-end exactly-once processing when using Kafka Streams or manually coordinating transactional producers and consumers:
+
+```python
+from confluent_kafka import Producer
+
+conf = {
+    "bootstrap.servers": "kafka1:9092",
+    "transactional.id": "my-producer-instance-1",   # unique per producer instance
+    "enable.idempotence": True,
+}
+
+producer = Producer(conf)
+producer.init_transactions()
+
+try:
+    producer.begin_transaction()
+    
+    # Read from consumer, process, write result — all in one transaction
+    for msg in batch:
+        result = transform(json.loads(msg.value()))
+        producer.produce("processed-events", value=json.dumps(result))
+    
+    # Commit consumer offsets and producer messages atomically
+    producer.send_offsets_to_transaction(consumer_offsets, consumer.consumer_group_metadata())
+    producer.commit_transaction()
+    
+except Exception:
+    producer.abort_transaction()
+    raise
+```
+
+EOS has a throughput overhead (~20-30%) compared to at-least-once. Use it when duplicate processing causes correctness problems (financial transactions, inventory updates) rather than for all event streams.
+
+## Zero-Downtime Cluster Scaling
+
+Scaling a Kafka cluster without downtime involves:
+
+**Adding brokers:**
+```bash
+# 1. Add new broker to cluster — it joins automatically
+# 2. Reassign partitions to include new broker
+kafka-reassign-partitions.sh \
+  --bootstrap-server kafka1:9092 \
+  --topics-to-move-json-file topics.json \
+  --broker-list "1,2,3,4" \          # include new broker 4
+  --generate
+
+# 3. Execute the reassignment plan
+kafka-reassign-partitions.sh \
+  --bootstrap-server kafka1:9092 \
+  --reassignment-json-file reassignment.json \
+  --execute \
+  --throttle 50000000                 # 50 MB/s replication throttle — don't saturate network
+```
+
+The throttle (`--throttle`) is critical. Without it, partition reassignment can saturate your network and starve producers/consumers.
+
+**Rolling restart (for config changes or upgrades):**
+1. Set `min.insync.replicas=2` and `replication.factor=3` before starting
+2. Restart one broker at a time
+3. Wait for partition leaders to reassign away from the restarting broker before proceeding
+4. Monitor ISR size — proceed only when it returns to full replication factor
+
+## Monitoring: Key Metrics to Watch
+
+| Metric | Tool | Alert threshold |
+|---|---|---|
+| `kafka.consumer.lag` | JMX / Burrow | > 10k messages for sustained period |
+| `kafka.broker.underReplicatedPartitions` | JMX | > 0 (indicates broker failure or network issue) |
+| `kafka.broker.requestHandlerAvgIdlePercent` | JMX | < 30% (broker CPU saturation) |
+| `kafka.producer.record-error-rate` | JMX | > 0 (producer failures) |
+| Disk usage per broker | Prometheus/node_exporter | > 80% |
+
+Use [Kafka UI](https://github.com/provectus/kafka-ui) or [AKHQ](https://akhq.io/) for a web dashboard over your cluster.
+
+## When to Use Kafka vs. Alternatives
+
+| Use case | Best choice | Why |
+|---|---|---|
+| High-throughput event log | **Kafka** | Horizontal scale, retention, replay |
+| Low-latency task queues | **RabbitMQ / Redis Streams** | Lower overhead, simpler ops |
+| Simple pub/sub | **Redis Pub/Sub** | No persistence needed |
+| Cloud-native serverless | **AWS Kinesis / Google Pub/Sub** | Managed, no ops burden |
+| ML feature pipelines | **Kafka + Flink** | Stateful stream processing at scale |
+
+## Frequently Asked Questions
+
+**How do I choose the right number of partitions?**
+Start with `max(target_throughput_MB_s / 10, num_consumers)`. You can always increase partitions later (run `kafka-topics.sh --alter`), but you cannot decrease them without recreating the topic. Over-partitioning increases file handle count and leader election time on failures.
+
+**What's the difference between a consumer group and a consumer?**
+A consumer group is a logical subscriber to a topic. Kafka guarantees each partition is consumed by exactly one consumer **within a group**. Multiple groups can consume the same topic independently — this is how you fan out to analytics, ML pipelines, and audit logging from one event stream.
+
+**Should I use Kafka Connect or write my own consumer?**
+For standard source/sink patterns (database → Kafka, Kafka → S3, Kafka → Elasticsearch), use [Kafka Connect](https://kafka.apache.org/documentation/#connect) with an existing connector. Write your own consumer only for custom business logic.
+
+**How long should I retain events?**
+For audit/compliance: 90–365 days. For real-time processing pipelines: 7 days is usually sufficient. For compacted topics (changelog/state): indefinitely (compaction keeps size manageable).
+
+## Wrapping Up
+
+Apache Kafka is powerful precisely because it decouples data production from data consumption at massive scale. The key patterns — smart partitioning for ordering, idempotent producers for durability, manual offset commit for correctness, and log compaction for state — are what separate production Kafka deployments from toy examples.
+
+Start simple: one topic, one producer, one consumer group. Add partitions when you hit throughput limits. Add consumer groups when you need the same data in multiple systems. Layer on EOS only when your business logic demands it.
 
 ## You Might Also Like
 
 - [System Design: Building a Distributed Rate Limiter](/en/blog/system-design-rate-limiting)
-- [How to Harden Firefox on Linux (Beginner's Guide)](/en/blog/firefox)
-- [VPN vs Proxy: Differences, Fingerprinting, Leaks, and Privacy Testing](/en/blog/anonymous)
+- [Python Async Memory Leak Profiling](/en/blog/python-async-memory-leak-profiling)
+- [FastAPI vs Litestar: Full Comparison](/en/blog/fastapi-vs-litestar-comparison)
 - [The 5 Best Playwright Alternatives for E2E Testing in 2026](/en/blog/top-playwright-alternatives-2026)
-

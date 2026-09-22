@@ -1,27 +1,408 @@
 ---
-title: "Advanced GraphQL federation"
+title: "Advanced GraphQL Federation: Building a Distributed Supergraph"
 date: "2026-09-06"
-summary: 'Architect enterprise distributed GraphQL APIs using Apollo Federation v2: subgraph entity resolution, schema composition, caching, and gateway routing.'
-tags: ["graphql", "federation", "api"]
+lastmod: "2026-09-22"
+summary: "Architect enterprise distributed GraphQL APIs using Apollo Federation v2: subgraph entity resolution, schema composition, the @key directive, caching strategies, and gateway routing with performance optimization."
+tags: ["graphql", "federation", "api", "architecture", "typescript"]
 images: ["/static/images/advanced-graphql-federation.png"]
-draft: true
+draft: false
 ---
 
+GraphQL federation is the natural evolution for organizations that have outgrown a single, monolithic GraphQL schema. As engineering teams scale, maintaining a unified schema becomes an organizational bottleneck — every new field requires coordination with the schema owners, every breaking change ripples across all consumers.
 
-GraphQL federation is the natural evolution for organizations that have outgrown a single, monolithic GraphQL schema. As engineering teams grow, maintaining a unified schema becomes a bottleneck. Federation allows multiple teams to maintain their own independent GraphQL subgraphs, which are then composed into a single, unified supergraph by a gateway.
+Federation solves this with a **distributed supergraph**: multiple teams maintain independent GraphQL **subgraphs**, which are composed into a single unified API by a **gateway**. Clients query one endpoint and see a coherent schema; behind the scenes, the gateway routes query fragments to the appropriate subgraphs and stitches the results together.
 
-## The Power of the Supergraph
-With federation, the client still queries a single endpoint and experiences the API as a cohesive whole. Behind the scenes, the federated gateway intelligently routes portions of the query to the appropriate subgraphs. This declarative composition is incredibly powerful.
+This guide covers Apollo Federation v2 (the current standard), subgraph design patterns, entity resolution, N+1 mitigation with DataLoaders, caching, and production performance considerations.
 
-## Resolving Entities Across Subgraphs
-One of the most complex aspects of federation is entity resolution. An entity (like a `User` or `Product`) might have its fields spread across multiple subgraphs. For example, the `Users` subgraph might own the user's name and email, while the `Reviews` subgraph owns the reviews written by that user. The gateway must resolve these cross-graph relationships efficiently without overwhelming the underlying services with N+1 query problems.
+## The Supergraph Architecture
 
-Advanced federation techniques involve careful schema design, robust caching strategies, and sophisticated query planning at the gateway level to ensure optimal performance and reliability in distributed architectures.
+```
+                    ┌─────────────────────────────────┐
+Client ────────────▶│        Apollo Router (Gateway)   │
+                    └─────┬─────────┬────────┬─────────┘
+                          │         │        │
+                    ┌─────▼──┐ ┌────▼──┐ ┌──▼──────┐
+                    │ Users  │ │Orders │ │ Products │
+                    │Subgraph│ │Subgraph│ │ Subgraph │
+                    └────────┘ └────────┘ └──────────┘
+                          │         │        │
+                    Postgres    MongoDB    Postgres
+```
+
+The client issues a single query:
+```graphql
+query GetOrderWithDetails {
+  order(id: "ord_123") {
+    id
+    total
+    user {
+      name
+      email
+    }
+    items {
+      product {
+        name
+        price
+      }
+      quantity
+    }
+  }
+}
+```
+
+The router's **query planner** splits this into sub-operations, fetches data from the Orders, Users, and Products subgraphs in parallel where possible, and merges the result. The client receives one response with no knowledge of the underlying distribution.
+
+## Defining Subgraph Schemas
+
+Each subgraph uses Federation-specific directives to declare what it owns and what it can contribute to other subgraphs.
+
+### The `@key` Directive: Entity Declaration
+
+The `@key` directive declares an entity — a type that can be referenced and extended across subgraphs. The key specifies the field(s) that uniquely identify an instance:
+
+**Users subgraph:**
+```graphql
+# users-subgraph/schema.graphql
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key", "@shareable"])
+
+type User @key(fields: "id") {
+  id: ID!
+  name: String!
+  email: String!
+  createdAt: String!
+}
+
+type Query {
+  user(id: ID!): User
+  me: User
+}
+```
+
+**Orders subgraph:**
+```graphql
+# orders-subgraph/schema.graphql
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key", "@external", "@requires"])
+
+# Reference the User entity defined in the Users subgraph
+type User @key(fields: "id") {
+  id: ID!
+  orders: [Order!]!
+}
+
+type Order @key(fields: "id") {
+  id: ID!
+  total: Float!
+  status: OrderStatus!
+  userId: ID!
+  user: User!
+  items: [OrderItem!]!
+}
+
+enum OrderStatus { PENDING, FULFILLED, CANCELLED }
+
+type OrderItem {
+  productId: ID!
+  quantity: Int!
+  unitPrice: Float!
+}
+
+type Query {
+  order(id: ID!): Order
+  orders(userId: ID!): [Order!]!
+}
+```
+
+Notice that the Orders subgraph declares `User @key(fields: "id")` with only the `id` field — it **references** the User entity without owning it. The gateway knows that to resolve `order.user.name`, it must first fetch the `userId` from Orders, then query Users with `{ _entities(representations: [{__typename: "User", id: $userId}]) }`.
+
+## Entity Resolution: The `__resolveReference` Function
+
+Every entity must implement a `__resolveReference` resolver. The gateway calls this when it needs to resolve cross-subgraph references:
+
+```typescript
+// users-subgraph/resolvers.ts
+import { UserService } from "./services/UserService";
+
+const resolvers = {
+  User: {
+    // Called by the gateway with the entity "representation" (partial object containing @key fields)
+    __resolveReference: async (reference: { id: string }, context: Context) => {
+      return context.dataSources.userService.findById(reference.id);
+    },
+  },
+  Query: {
+    user: (_: unknown, { id }: { id: string }, context: Context) => {
+      return context.dataSources.userService.findById(id);
+    },
+    me: (_: unknown, __: unknown, context: Context) => {
+      return context.dataSources.userService.findById(context.userId);
+    },
+  },
+};
+```
+
+The gateway may call `__resolveReference` with a **batch** of representations in a single request (via the `_entities` query). This is where N+1 problems appear if you're not careful.
+
+## The N+1 Problem in Federation
+
+Consider an order list query that returns 50 orders, each with a `user` field. Without optimization, the gateway would:
+
+1. Fetch 50 orders from the Orders subgraph (1 query)
+2. For each order's user, call `_entities` 50 times to the Users subgraph (50 queries)
+
+Total: **51 subgraph calls** to render one page.
+
+### Solution: DataLoader in `__resolveReference`
+
+The Apollo Router automatically **batches** entity resolution requests. It collects all `User` references from an operation and sends them in a single `_entities` query. But your `__resolveReference` must still handle this efficiently:
+
+```typescript
+import DataLoader from "dataloader";
+
+// Create a DataLoader per request (in context factory)
+export function createUserLoader(db: Database): DataLoader<string, User> {
+  return new DataLoader(
+    async (userIds: readonly string[]) => {
+      // Single DB query fetches all users at once
+      const users = await db.query(
+        "SELECT * FROM users WHERE id = ANY($1)",
+        [userIds]
+      );
+      
+      // DataLoader requires results in the same order as input keys
+      const userMap = new Map(users.map((u) => [u.id, u]));
+      return userIds.map((id) => userMap.get(id) ?? new Error(`User ${id} not found`));
+    },
+    { cache: true }   // cache within request — same user requested twice = one DB hit
+  );
+}
+
+// In context factory:
+const context = {
+  loaders: { user: createUserLoader(db) }
+};
+
+// In resolver:
+const resolvers = {
+  User: {
+    __resolveReference: async (reference: { id: string }, context: Context) => {
+      return context.loaders.user.load(reference.id);
+    },
+  },
+};
+```
+
+With this pattern: 50 orders → 1 batch call to Users subgraph → 1 SQL query. Total: **2 subgraph calls**.
+
+## The `@requires` Directive: Computed Fields
+
+Sometimes a subgraph needs fields from another subgraph to compute its own fields. The `@requires` directive declares this dependency:
+
+```graphql
+# shipping-subgraph/schema.graphql
+type User @key(fields: "id") {
+  id: ID!
+  address: String! @external       # owned by Users subgraph
+  shippingZone: ShippingZone!      # computed from address by Shipping subgraph
+    @requires(fields: "address")
+}
+```
+
+```typescript
+const resolvers = {
+  User: {
+    __resolveReference: async (reference: { id: string; address: string }) => {
+      // `address` is provided by the gateway from the Users subgraph
+      return {
+        id: reference.id,
+        shippingZone: computeShippingZone(reference.address),
+      };
+    },
+  },
+};
+```
+
+The gateway's query planner automatically fetches `address` from Users before calling the Shipping subgraph. You declare the dependency; the router figures out execution order.
+
+## Schema Composition with Rover CLI
+
+Apollo Rover is the CLI for managing your supergraph schema:
+
+```bash
+# Install Rover
+curl -sSL https://rover.apollo.dev/nix/latest | sh
+
+# Check subgraph schema for Federation compatibility
+rover subgraph check my-graph@production \
+  --schema ./users-subgraph/schema.graphql \
+  --name users
+
+# Publish subgraph schema to Apollo Studio
+rover subgraph publish my-graph@production \
+  --schema ./users-subgraph/schema.graphql \
+  --name users \
+  --routing-url https://users.internal.example.com/graphql
+
+# Compose supergraph schema locally (for CI validation)
+rover supergraph compose --config ./supergraph.yaml > supergraph-schema.graphql
+```
+
+**`supergraph.yaml`:**
+```yaml
+federation_version: =2.3.5
+subgraphs:
+  users:
+    routing_url: https://users.internal.example.com/graphql
+    schema:
+      file: ./users-subgraph/schema.graphql
+  orders:
+    routing_url: https://orders.internal.example.com/graphql
+    schema:
+      file: ./orders-subgraph/schema.graphql
+  products:
+    routing_url: https://products.internal.example.com/graphql
+    schema:
+      file: ./products-subgraph/schema.graphql
+```
+
+**Always run `rover supergraph compose` in CI** before deploying any subgraph schema change. Composition errors (like conflicting type definitions or invalid `@requires` chains) fail fast here rather than at runtime.
+
+## Caching Strategy
+
+Federation introduces multiple cache boundaries. A well-designed caching strategy is essential for performance:
+
+### 1. Subgraph-level response caching
+
+Use `@cacheControl` directives to annotate per-field TTLs:
+
+```graphql
+type Product @key(fields: "id") @cacheControl(maxAge: 300) {
+  id: ID!
+  name: String! @cacheControl(maxAge: 3600)    # rarely changes
+  price: Float! @cacheControl(maxAge: 60)       # changes more often
+  stockCount: Int! @cacheControl(maxAge: 0)     # never cache
+}
+```
+
+Apollo Router respects `Cache-Control` headers from subgraphs and can serve cached supergraph responses for public/authenticated queries separately.
+
+### 2. DataLoader caching (request-scoped)
+
+As shown above, DataLoader caches within a single request. Never reuse DataLoader instances across requests — they'd serve stale data.
+
+### 3. Redis for hot entities
+
+For heavily read entities (e.g., product catalog that changes rarely):
+
+```typescript
+async function findProductById(id: string): Promise<Product> {
+  const cached = await redis.get(`product:${id}`);
+  if (cached) return JSON.parse(cached);
+  
+  const product = await db.products.findById(id);
+  await redis.setex(`product:${id}`, 300, JSON.stringify(product)); // 5-min TTL
+  return product;
+}
+```
+
+## Deploying Apollo Router
+
+Apollo Router is the production-grade gateway written in Rust, replacing the Node.js Apollo Gateway:
+
+```yaml
+# router.yaml
+supergraph:
+  path: /graphql
+
+cors:
+  origins:
+    - https://app.example.com
+  
+headers:
+  all:
+    request:
+      - propagate:
+          matching: ^x-.*   # forward all x-* headers to subgraphs
+
+traffic_shaping:
+  all:
+    deduplicate_variables: true
+  router:
+    timeout: 30s
+  subgraphs:
+    users:
+      timeout: 5s
+    orders:
+      timeout: 10s
+
+telemetry:
+  exporters:
+    tracing:
+      otlp:
+        endpoint: http://otel-collector:4317
+```
+
+Run it:
+```bash
+docker run -p 4000:4000 \
+  -v $(pwd)/supergraph-schema.graphql:/app/supergraph.graphql \
+  -v $(pwd)/router.yaml:/app/router.yaml \
+  ghcr.io/apollographql/router:v1.46.0 \
+  --supergraph /app/supergraph.graphql \
+  --config /app/router.yaml
+```
+
+Apollo Router processes ~8M requests/second on a single core for simple queries — orders of magnitude faster than the Node.js gateway.
+
+## Query Planning and Performance
+
+Apollo Router's query planner generates an **execution plan** for every incoming operation. You can inspect plans with:
+
+```bash
+curl -X POST http://localhost:4000/graphql \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ order(id: \"123\") { user { name } items { product { name } } } }"}' \
+  -H "Apollo-Query-Plan-Experimental: true"
+```
+
+Optimize query plans by:
+- **Reducing entity jumps**: Design schemas so common queries need fewer cross-subgraph hops
+- **Co-locating frequently joined data**: If `order.user` is always fetched together, consider adding `User` fields directly to the Orders subgraph instead
+- **Using `@interfaceObject`**: For polymorphic types that span subgraphs (Federation v2.3+)
+
+## Schema Governance at Scale
+
+With multiple teams owning subgraphs, schema governance prevents drift and breaking changes:
+
+1. **Breaking change detection** — Apollo Studio's schema checks block deployments that break existing operations
+2. **Schema proposals** — Use Apollo Schema Proposals for cross-team RFC-style review of large changes
+3. **Demand-driven schema** — Each team owns types matching their service domain; no cross-team mutations
+4. **Contracts** — Define filtered schema views per client (mobile, web, partner API) using Apollo Contracts
+
+## Frequently Asked Questions
+
+**Federation v1 vs v2 — should I migrate?**
+Yes, if possible. Federation v2 adds `@interfaceObject`, `@authenticated`, `@requiresScopes`, improved `@override` for gradual migrations, and better composition error messages. Apollo Gateway (v1 runtime) is in maintenance mode; Apollo Router is the current standard.
+
+**Can I use Federation without Apollo Studio?**
+Yes. Rover CLI composes schemas locally. Apollo Router runs without Apollo Studio connectivity. Studio adds managed federation (push subgraph schemas, automatic router updates) which is very useful at scale but not required.
+
+**How do I handle authentication across subgraphs?**
+Propagate the `Authorization` header from the router to all subgraphs (configure `headers.all.request.propagate`). Each subgraph validates the token independently, or you can use a shared auth library. Never trust `userId` claims in the request body — always validate the JWT.
+
+**What's the performance overhead of federation vs a monolith?**
+Expect 5–15ms additional latency per subgraph hop for simple queries (network RTT inside your cluster). For complex multi-subgraph queries, parallel execution minimizes this. Apollo Router's Rust query planner adds <1ms overhead. At scale, the organizational benefits (team autonomy, independent deployments) far outweigh the latency cost.
+
+## Wrapping Up
+
+GraphQL Federation is not just a technical pattern — it's an organizational scaling strategy. Teams that master it can deploy subgraph changes independently, iterate on their schemas without coordination overhead, and evolve their portion of the API at their own pace.
+
+The key principles: own your entities cleanly, implement `__resolveReference` with DataLoaders, declare `@requires` dependencies explicitly, and let the router handle the stitching. Composition validation in CI prevents the most common cross-team breakage.
 
 ## You Might Also Like
 
 - [Advanced TypeScript Patterns for Enterprise Applications](/en/blog/ts-advanced-patterns)
 - [TypeScript Generics: Advanced Patterns for Type-Safe APIs](/en/blog/typescript-generics-advanced-patterns)
 - [Building a Modern TypeScript Monorepo](/en/blog/typescript-monorepo-guide)
-- [Vitest Monorepo Unit Testing performance Optimization](/en/blog/vitest-monorepo-unit-testing-performance)
-
+- [Vitest Monorepo Unit Testing Performance Optimization](/en/blog/vitest-monorepo-unit-testing-performance)

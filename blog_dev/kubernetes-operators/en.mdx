@@ -1,24 +1,359 @@
 ---
-title: "Kubernetes Operators and custom resources"
+title: "Kubernetes Operators and Custom Resources: Automate Everything"
 date: "2026-09-13"
-summary: 'Extend the Kubernetes control plane with Operators and Custom Resource Definitions (CRDs) to automate lifecycle management for complex stateful applications.'
-tags: ["kubernetes", "operators", "devops", "cloud-native"]
+lastmod: "2026-09-22"
+summary: 'Extend the Kubernetes control plane with Operators and Custom Resource Definitions (CRDs) to automate lifecycle management for complex stateful applications. Learn reconciliation loops, RBAC, testing, and production patterns.'
+tags: ["kubernetes", "operators", "devops", "cloud-native", "golang"]
 images: ["/static/images/kubernetes-operators.png"]
-draft: true
+draft: false
 ---
 
+Kubernetes is excellent at managing stateless applications. If a stateless pod dies, a ReplicaSet spins up a new one — no human required. But managing complex stateful applications like databases, message queues, or distributed caches requires **domain-specific operational knowledge** that Kubernetes doesn't possess by default.
 
-Kubernetes is excellent at managing stateless applications. If a stateless pod dies, a ReplicaSet can simply spin up a new one. However, managing complex stateful applications—like databases, message queues, or specialized monitoring systems—requires domain-specific knowledge that Kubernetes doesn't possess out of the box.
+Enter the Operator pattern.
 
-This is where the Operator pattern shines.
+## What Is a Kubernetes Operator?
 
-## What is an Operator?
-An Operator is a method of packaging, deploying, and managing a Kubernetes application. It takes human operational knowledge (e.g., how to back up a database, how to upgrade a cluster without downtime, how to handle failover) and encodes it into software that runs natively within the Kubernetes control plane.
+A Kubernetes Operator is a method of packaging, deploying, and managing a Kubernetes application. It takes human operational knowledge — *how to back up a Postgres cluster*, *how to upgrade Kafka without downtime*, *how to handle replica failover* — and encodes it into software that runs natively inside the Kubernetes control plane.
+
+Operationally speaking, an Operator is just a **controller** that watches one or more **Custom Resources** and reacts to changes. It runs as a standard Pod inside your cluster and communicates with the Kubernetes API server like any other component.
+
+The concept was introduced by CoreOS in 2016 and has since become a foundational pattern. Today, [OperatorHub.io](https://operatorhub.io/) lists hundreds of community and vendor Operators for everything from cert-manager to Prometheus to CockroachDB.
 
 ## Custom Resource Definitions (CRDs)
-Operators rely heavily on Custom Resource Definitions (CRDs). A CRD extends the Kubernetes API, allowing developers to define new resource types. Instead of just managing `Pods` and `Services`, an operator might manage a `PostgresCluster` or a `KafkaTopic` resource.
 
-The Operator continuously watches these custom resources. When a user submits a declarative configuration for a `PostgresCluster`, the Operator's control loop acts to reconcile the current state of the cluster with the desired state specified in the CRD. This brings the declarative power of Kubernetes to any complex, stateful workload.
+Operators rely on **Custom Resource Definitions** (CRDs) to extend the Kubernetes API surface. A CRD registers a new resource type in your cluster. Instead of only managing `Pods`, `Deployments`, and `Services`, you can define entirely new resource types like `PostgresCluster`, `KafkaTopic`, or `RedisFailover`.
+
+Here's a minimal CRD definition:
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: postgresclusters.db.example.com
+spec:
+  group: db.example.com
+  scope: Namespaced
+  names:
+    plural: postgresclusters
+    singular: postgrescluster
+    kind: PostgresCluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                replicas:
+                  type: integer
+                  minimum: 1
+                version:
+                  type: string
+```
+
+Once this CRD is applied, users can create `PostgresCluster` objects using standard `kubectl` commands:
+
+```yaml
+apiVersion: db.example.com/v1alpha1
+kind: PostgresCluster
+metadata:
+  name: my-db
+  namespace: production
+spec:
+  replicas: 3
+  version: "16.2"
+```
+
+The Operator watches for these objects and acts — provisioning PVCs, starting Postgres pods, configuring replication, and managing the full lifecycle.
+
+## The Reconciliation Loop
+
+The heart of every Kubernetes Operator is the **reconciliation loop** (also called the control loop or the reconciler). The loop follows a simple pattern:
+
+1. **Observe** — Watch for changes to the Custom Resource (or any related resource like Pods or ConfigMaps).
+2. **Diff** — Compare the *desired state* (declared in the CR spec) with the *current state* (what's actually running).
+3. **Act** — Take the minimum set of actions needed to converge current state toward desired state.
+4. **Repeat** — The loop is idempotent and runs again on any relevant change or after a periodic resync.
+
+This is the same loop Kubernetes itself uses internally for built-in controllers (the Deployment controller, the ReplicaSet controller, etc.). Your Operator is just adding new entries to this loop for your custom resources.
+
+```go
+func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    log := log.FromContext(ctx)
+
+    // 1. Fetch the PostgresCluster resource
+    var cluster dbv1.PostgresCluster
+    if err := r.Get(ctx, req.NamespacedName, &cluster); err != nil {
+        if errors.IsNotFound(err) {
+            // Resource was deleted — clean up external resources
+            return ctrl.Result{}, nil
+        }
+        return ctrl.Result{}, err
+    }
+
+    // 2. Reconcile StatefulSet
+    if err := r.reconcileStatefulSet(ctx, &cluster); err != nil {
+        log.Error(err, "Failed to reconcile StatefulSet")
+        return ctrl.Result{RequeueAfter: time.Second * 30}, err
+    }
+
+    // 3. Reconcile Service
+    if err := r.reconcileService(ctx, &cluster); err != nil {
+        log.Error(err, "Failed to reconcile Service")
+        return ctrl.Result{RequeueAfter: time.Second * 30}, err
+    }
+
+    // 4. Update status
+    cluster.Status.ReadyReplicas = r.countReadyReplicas(ctx, &cluster)
+    if err := r.Status().Update(ctx, &cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
+}
+```
+
+Key points in the reconciler above:
+- **Return `ctrl.Result{}`** with no error when the resource is not found — it was deleted.
+- **Return `ctrl.Result{RequeueAfter: ...}`** to schedule the next reconciliation without failing.
+- **Always update the status subresource** to reflect what's actually running.
+- The reconciler must be **idempotent** — calling it 10 times in a row must produce the same result as calling it once.
+
+## Building an Operator: Operator SDK vs controller-runtime
+
+You have two main approaches to building Operators:
+
+### 1. Operator SDK (recommended for most cases)
+
+The [Operator SDK](https://sdk.operatorframework.io/) provides scaffolding, code generation, and lifecycle management for Operators. It supports three build approaches:
+
+- **Go** — Full control, best performance, the standard for production Operators.
+- **Helm** — Wraps an existing Helm chart into an Operator. Good for simple apps.
+- **Ansible** — Uses Ansible playbooks as the reconciliation logic. Good for ops-heavy teams.
+
+Initialize a new Go Operator:
+
+```bash
+operator-sdk init --domain=example.com --repo=github.com/example/postgres-operator
+operator-sdk create api --group=db --version=v1alpha1 --kind=PostgresCluster --resource --controller
+```
+
+This scaffolds:
+- `api/v1alpha1/postgrescluster_types.go` — Your CRD Go types
+- `controllers/postgrescluster_controller.go` — Your Reconciler
+- `config/crd/` — Generated CRD YAML
+- `config/rbac/` — Generated RBAC rules
+
+### 2. controller-runtime directly
+
+For maximum control, you can use [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime) directly without the SDK scaffolding. This is what the Operator SDK uses under the hood:
+
+```go
+mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+    Scheme: scheme,
+    Metrics: server.Options{BindAddress: ":8080"},
+    HealthProbeBindAddress: ":8081",
+    LeaderElection: true,
+    LeaderElectionID: "postgres-operator.example.com",
+})
+
+if err := (&controllers.PostgresClusterReconciler{
+    Client: mgr.GetClient(),
+    Scheme: mgr.GetScheme(),
+}).SetupWithManager(mgr); err != nil {
+    setupLog.Error(err, "unable to create controller")
+    os.Exit(1)
+}
+```
+
+**Leader election** (`LeaderElection: true`) is critical in production — it ensures only one replica of your Operator is actively reconciling at any time, preventing split-brain scenarios.
+
+## RBAC and Security
+
+Operators need RBAC permissions to watch and modify resources. The Operator SDK generates these automatically, but you should understand what they grant:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: postgres-operator-role
+rules:
+  # Watch and manage PostgresCluster CRs
+  - apiGroups: ["db.example.com"]
+    resources: ["postgresclusters", "postgresclusters/status", "postgresclusters/finalizers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Manage underlying resources
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps", "secrets", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read Pod status for health checks
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+```
+
+**Principle of least privilege**: Only grant verbs and resources your Operator actually needs. Avoid `cluster-admin` bindings.
+
+## Finalizers: Clean Up When Resources Are Deleted
+
+When a user deletes a `PostgresCluster` CR, Kubernetes will remove the CR from etcd — but external resources like cloud storage buckets, load balancers, or external DNS records won't be cleaned up automatically.
+
+**Finalizers** solve this. They're string markers in the resource's `metadata.finalizers` field. Kubernetes won't permanently delete a resource until all its finalizers are removed:
+
+```go
+const finalizerName = "db.example.com/cleanup"
+
+func (r *PostgresClusterReconciler) handleFinalizer(ctx context.Context, cluster *dbv1.PostgresCluster) error {
+    if cluster.DeletionTimestamp.IsZero() {
+        // Resource is NOT being deleted — ensure finalizer is registered
+        if !controllerutil.ContainsFinalizer(cluster, finalizerName) {
+            controllerutil.AddFinalizer(cluster, finalizerName)
+            return r.Update(ctx, cluster)
+        }
+    } else {
+        // Resource IS being deleted — run cleanup
+        if controllerutil.ContainsFinalizer(cluster, finalizerName) {
+            if err := r.cleanupExternalResources(ctx, cluster); err != nil {
+                return err
+            }
+            // Remove finalizer — allows Kubernetes to complete deletion
+            controllerutil.RemoveFinalizer(cluster, finalizerName)
+            return r.Update(ctx, cluster)
+        }
+    }
+    return nil
+}
+```
+
+Always implement finalizers if your Operator creates resources outside the Kubernetes cluster (S3 buckets, Route53 records, Datadog monitors, etc.).
+
+## Status Conditions: Communicating Operator State
+
+Rather than using opaque status fields, follow the Kubernetes convention of **status conditions** — structured, machine-readable status messages:
+
+```go
+meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+    Type:               "Ready",
+    Status:             metav1.ConditionTrue,
+    ObservedGeneration: cluster.Generation,
+    Reason:             "ReconciliationSucceeded",
+    Message:            fmt.Sprintf("PostgresCluster with %d replicas is ready", cluster.Spec.Replicas),
+})
+```
+
+This produces a `kubectl describe` output that operators (human ones) can quickly scan:
+
+```
+Conditions:
+  Type    Status  Reason                    Message
+  ----    ------  ------                    -------
+  Ready   True    ReconciliationSucceeded   PostgresCluster with 3 replicas is ready
+```
+
+## Testing Your Operator
+
+### Unit Testing Reconcilers
+
+Use `controller-runtime`'s `fake.NewClientBuilder()` to test reconciliation logic without a live cluster:
+
+```go
+func TestReconcile_CreatesStatefulSet(t *testing.T) {
+    cluster := &dbv1.PostgresCluster{
+        ObjectMeta: metav1.ObjectMeta{Name: "test-db", Namespace: "default"},
+        Spec:       dbv1.PostgresClusterSpec{Replicas: 3, Version: "16.2"},
+    }
+
+    r := &PostgresClusterReconciler{
+        Client: fake.NewClientBuilder().
+            WithScheme(scheme).
+            WithObjects(cluster).
+            Build(),
+        Scheme: scheme,
+    }
+
+    result, err := r.Reconcile(context.Background(), ctrl.Request{
+        NamespacedName: types.NamespacedName{Name: "test-db", Namespace: "default"},
+    })
+
+    assert.NoError(t, err)
+    assert.Equal(t, time.Minute*5, result.RequeueAfter)
+
+    // Verify StatefulSet was created
+    var sts appsv1.StatefulSet
+    err = r.Get(context.Background(), types.NamespacedName{Name: "test-db", Namespace: "default"}, &sts)
+    assert.NoError(t, err)
+    assert.Equal(t, int32(3), *sts.Spec.Replicas)
+}
+```
+
+### Integration Testing with envtest
+
+The `envtest` package runs a real API server and etcd locally, allowing you to test the full reconciliation flow:
+
+```go
+var testEnv *envtest.Environment
+
+func TestMain(m *testing.M) {
+    testEnv = &envtest.Environment{
+        CRDDirectoryPaths: []string{filepath.Join("..", "config", "crd", "bases")},
+    }
+    cfg, _ := testEnv.Start()
+    // ... setup manager and run tests
+    testEnv.Stop()
+}
+```
+
+## Production Deployment Checklist
+
+Before shipping an Operator to production:
+
+- [ ] **Leader election enabled** — prevents split-brain in multi-replica deployments
+- [ ] **Health probes configured** — `/healthz` liveness, `/readyz` readiness
+- [ ] **Metrics exposed** — Prometheus metrics at `/metrics` (controller-runtime does this automatically)
+- [ ] **Finalizers implemented** — for any external resource cleanup
+- [ ] **Status conditions** — structured, machine-readable status fields
+- [ ] **RBAC least-privilege** — no `cluster-admin`, no wildcard verbs
+- [ ] **CRD validation** — OpenAPI v3 schema with required fields and defaults
+- [ ] **Rate limiting** — configure `RateLimiter` on the controller to prevent API server flooding
+- [ ] **`envtest` integration tests** passing
+- [ ] **OLM bundle** — if distributing via OperatorHub
+
+## Real-World Operators Worth Studying
+
+| Operator | What it manages | Why study it |
+|---|---|---|
+| [Prometheus Operator](https://github.com/prometheus-operator/prometheus-operator) | Prometheus + Alertmanager | Excellent CRD design, status patterns |
+| [Cert-Manager](https://github.com/cert-manager/cert-manager) | TLS certificates | Complex finalizer patterns, ACME integration |
+| [Strimzi](https://strimzi.io/) | Apache Kafka on Kubernetes | Full stateful lifecycle management |
+| [CloudNativePG](https://cloudnative-pg.io/) | PostgreSQL clusters | Production-grade Postgres Operator |
+
+## Frequently Asked Questions
+
+**Should I write an Operator or just use Helm?**
+Helm is great for simple, stateless deployments. Use an Operator when your application has operational logic that needs to run continuously — failover decisions, schema migrations, backup scheduling, cluster scaling policies. If it would require a cron job or a human to manage it, it's a candidate for an Operator.
+
+**Can I write an Operator without Go?**
+Yes. The Operator SDK supports Helm and Ansible as backend languages. For Python, [kopf](https://kopf.readthedocs.io/) is a popular framework. However, Go gives you the best performance, tooling, and alignment with the rest of the Kubernetes ecosystem.
+
+**How many CRDs should one Operator manage?**
+Keep it focused. An Operator that manages one well-defined domain (e.g., a specific database) is easier to maintain and test than a God-Operator that manages everything. The [single responsibility principle](https://en.wikipedia.org/wiki/Single-responsibility_principle) applies here.
+
+**What's the difference between an Operator and a controller?**
+Technically, every Operator is a controller, but not every controller is an Operator. The "Operator" term specifically refers to controllers that encode **operational domain knowledge** about a specific application. A controller that manages generic infrastructure is usually just called a controller.
+
+## Wrapping Up
+
+Kubernetes Operators transform your cluster from a container scheduler into a fully self-healing platform for complex workloads. The pattern scales from simple Helm-based Operators to sophisticated Go controllers that manage database failover, certificate rotation, and multi-cluster replication automatically.
+
+The investment in writing an Operator pays off when you're managing 10+ instances of a stateful application and human operational work becomes the bottleneck. At that scale, encoded operational knowledge running 24/7 inside the cluster is infinitely more reliable than runbooks and on-call engineers.
 
 ## You Might Also Like
 
@@ -26,4 +361,3 @@ The Operator continuously watches these custom resources. When a user submits a 
 - [Kubernetes Custom Resource Definitions](/en/blog/kubernetes-custom-resources)
 - [Kubernetes Cost Optimization Strategies in 2026](/en/blog/k8s-cost-optimization)
 - [GitOps with Flux: Declarative Infrastructure for Kubernetes](/en/blog/devops-2026-08-07)
-
