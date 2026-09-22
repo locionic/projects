@@ -3,18 +3,23 @@ draft: false
 title: "How I Set Up CI/CD with GitHub Actions"
 images: ['https://imgbed.locionic.com/file/1784441547357_how-to-set-up-cicd-with-github-actions.jpg']
 date: '2026-03-14'
-lastUpdated: '2026-07-10'
+lastUpdated: '2026-09-22'
 tags: ["developer-tools", "ci-cd", "automation", "devops", "github-actions"]
 category: Tech
-summary: "A practical walkthrough of setting up GitHub Actions workflows for a typical web project — running tests, caching dependencies, and deploying to Vercel."
+summary: "A practical walkthrough of setting up GitHub Actions workflows for a typical web project — running tests, caching dependencies, deploying to Vercel, handling secrets, and avoiding the common mistakes that make CI slow or unreliable."
 ---
-
-
-
 
 I was late to CI/CD. For years I'd run tests locally, cross my fingers, and push. It worked fine until the day I pushed a commit that broke the build and spent an hour figuring out which dependency change caused it.
 
-GitHub Actions is free for public repositories and the cheapest option I've found for private ones. Here's the setup I use across projects.
+GitHub Actions is free for public repositories and the cheapest option I've found for private ones. This is the setup I've landed on after running it across a dozen different projects — from Next.js apps to Python APIs to Go services.
+
+## Why GitHub Actions Over the Alternatives?
+
+Before picking a CI tool: GitHub Actions runs directly on your repository, no third-party service to connect. Jenkins requires a server. CircleCI has better free tiers for some use cases. Travis CI went paid-only. GitLab CI is excellent if you're already on GitLab.
+
+For GitHub-hosted projects, Actions wins on convenience: no webhook setup, no token management, triggers defined next to your code.
+
+---
 
 ## Your First Workflow
 
@@ -46,27 +51,83 @@ jobs:
 
 Push this and your next commit triggers the workflow. Every PR gets a green checkmark or a red X, and you'll never merge broken code again.
 
+<Callout type="info" title="npm ci vs npm install">
+Use `npm ci` in CI, not `npm install`. `npm ci` is stricter: it installs exactly what's in `package-lock.json`, fails if there's a mismatch, and never updates the lockfile. This means your CI environment matches what you tested locally.
+</Callout>
+
+---
+
 ## Caching Makes It Fast
 
-The `cache: 'npm'` line above caches `node_modules` between runs. Without it, every workflow run reinstalls all dependencies from scratch, which takes 1-2 minutes per run.
+The `cache: 'npm'` line above caches `node_modules` between runs based on the hash of your `package-lock.json`. Without it, every workflow run reinstalls all dependencies from scratch — 60–120 seconds per run depending on your dependency count.
 
-For other ecosystems, the cache setup is similar:
+With caching, cache hits reduce that to 5–10 seconds.
+
+For other ecosystems:
 
 ```yaml
-# Python
+# Python (pip)
 - uses: actions/setup-python@v5
   with:
+    python-version: '3.12'
     cache: 'pip'
+
+# Python (uv)
+- uses: astral-sh/setup-uv@v3
+  with:
+    enable-cache: true
 
 # Go
 - uses: actions/setup-go@v5
   with:
+    go-version: '1.22'
     cache: true
+
+# Rust
+- uses: actions/cache@v4
+  with:
+    path: |
+      ~/.cargo/registry
+      ~/.cargo/git
+      target/
+    key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 ```
+
+The cache is keyed on your lockfile hash. When dependencies change, the cache misses and rebuilds. When they don't, the cache hits and CI is fast.
+
+---
+
+## Testing in Parallel
+
+For larger test suites, split tests across multiple runners:
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: [1, 2, 3, 4]
+    
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm test -- --shard=${{ matrix.shard }}/4
+```
+
+This runs 4 jobs simultaneously, each handling a quarter of your tests. Total test time drops from 4× to ~1×.
+
+Playwright supports this natively with `--shard`. For Jest, use `--testPathPattern` or `jest-runner-groups`. For pytest, use `pytest-split`.
+
+---
 
 ## Deploying Automatically
 
-For CD, I separate deployment into a second workflow so I can run it independently:
+Separate CI (tests) from CD (deploy). They have different failure semantics — a test failure should block a PR, but a deploy failure shouldn't block other PRs.
 
 ```yaml
 # .github/workflows/deploy.yml
@@ -86,28 +147,202 @@ jobs:
       - name: Deploy to Vercel
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: npx vercel --prod --token $VERCEL_TOKEN
 ```
 
 <Callout type="warning" title="Use Secrets, Not Hardcoded Tokens">
-Never put API keys or deployment tokens directly in your YAML files. Store them in GitHub → Settings → Secrets and variables → Actions, then reference them as `${{ secrets.MY_TOKEN }}`.
+Never put API keys or deployment tokens directly in your YAML files. Store them in GitHub → Settings → Secrets and variables → Actions, then reference them as `${{ secrets.MY_TOKEN }}`. Secrets are encrypted at rest, masked in logs, and never exposed to fork PRs.
 </Callout>
 
-## A Few Things I Learned
+### Deploying Only on Successful Tests
 
-**Run on every PR, not just main.** Catching a test failure on a PR branch is much cheaper than catching it after merge.
-
-**Keep CI and CD separate.** Your CI workflow runs every push and should be fast (under 5 minutes). Your CD workflow deploys and can be slower. Keeping them separate means a deploy failure doesn't block a PR check.
-
-**Matrix builds are useful but slow.** You can test against multiple Node versions or OSes with a matrix strategy, but it multiplies your run time. I use it only for open-source libraries where compatibility matters. For apps, one target environment is enough.
+Chain CI and CD with the `needs` keyword:
 
 ```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci && npm test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci && npm run build
+      - run: npx vercel --prod --token ${{ secrets.VERCEL_TOKEN }}
+```
+
+The `deploy` job only runs if `test` succeeds and if we're on the `main` branch.
+
+---
+
+## Environment Variables and Secrets
+
+Three tiers for handling configuration in GitHub Actions:
+
+**1. Hardcoded in YAML** — Only for non-sensitive, universal values:
+```yaml
+env:
+  NODE_ENV: production
+  PORT: 3000
+```
+
+**2. Repository secrets** — Sensitive values (API keys, tokens):
+```yaml
+env:
+  DATABASE_URL: ${{ secrets.DATABASE_URL }}
+  STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+```
+
+**3. Environment secrets** — Different values per deployment environment (staging vs production):
+```yaml
+jobs:
+  deploy:
+    environment: production  # uses the "production" environment's secrets
+    steps:
+      - run: deploy.sh
+        env:
+          API_URL: ${{ secrets.API_URL }}  # production-specific value
+```
+
+Environment secrets require approval gates: configure required reviewers in Settings → Environments → protection rules. Useful for preventing accidental production deploys.
+
+---
+
+## Things I Learned the Hard Way
+
+**Run CI on every PR, not just main.** Catching a test failure on a PR branch is much cheaper than catching it after merge. Add `pull_request: branches: [main]` to every workflow.
+
+**Keep CI and CD separate.** Your CI workflow runs every push and should complete in under 5 minutes. Your CD workflow deploys and can take longer. Mixing them means a slow deploy blocks your PR feedback loop.
+
+**Matrix builds multiply your bill.** Testing across multiple Node versions or OSes with a matrix strategy multiplies your runner time. I use it only for libraries where cross-version compatibility actually matters. For apps, one target environment is enough.
+
+```yaml
+# Only do this for libraries, not apps
 strategy:
   matrix:
     node-version: [18, 20, 22]
+    os: [ubuntu-latest, windows-latest, macos-latest]
 ```
 
-**Watch your minutes.** GitHub Actions gives free public repo minutes. For private repos, 2000 minutes/month on the free plan goes fast if you have matrix builds.
+That's 9 runners per push. At 2 minutes each, that's 18 minutes of compute.
+
+**Watch your minutes.** GitHub Actions gives 2,000 free minutes/month for private repos on the free plan. One project with matrix builds and 10 pushes/day can burn through that in a week.
+
+**Fail fast with `fail-fast: true`** (the default in matrix builds). If one matrix job fails, GitHub cancels the others. Saves minutes when you have a fundamental error.
+
+**Use `actions/cache` explicitly for Docker layers:**
+
+```yaml
+- uses: docker/setup-buildx-action@v3
+- uses: docker/build-push-action@v5
+  with:
+    context: .
+    cache-from: type=gha
+    cache-to: type=gha,mode=max
+```
+
+Without this, Docker rebuilds your entire image from scratch on every run.
+
+---
+
+## A Complete Production-Ready Workflow
+
+Here's the full workflow I use for a Next.js project:
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run type-check
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm test -- --coverage
+      - uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: .next/
+          retention-days: 1
+```
+
+Key features:
+- `concurrency` cancels in-progress runs when a new push arrives — prevents queue buildup during active development
+- `lint` and `test` run in parallel, `build` waits for both
+- Coverage reports go to Codecov on every push
+- Build artifacts upload for 1 day (useful for deploy jobs to consume without rebuilding)
+
+---
+
+## Debugging Failing Workflows
+
+When a workflow fails and the log isn't clear:
+
+**Enable debug logging** by setting a repository secret `ACTIONS_STEP_DEBUG=true`. This dumps verbose output from every step.
+
+**SSH into the runner** using [tmate](https://github.com/mxschmitt/action-tmate):
+
+```yaml
+- uses: mxschmitt/action-tmate@v3
+  if: ${{ failure() }}
+```
+
+This pauses the workflow and gives you an SSH connection to the exact runner environment when a step fails. Invaluable for debugging environment-specific issues.
+
+**Print environment details:**
+```yaml
+- run: node --version && npm --version && env | sort
+```
+
+---
 
 ## You Might Also Like
 
@@ -115,4 +350,3 @@ strategy:
 - [Implementing Zero-Trust Security in Kubernetes: The Complete Production Guide](/en/blog/zero-trust-architecture-kubernetes)
 - [Implementing Zero Trust Architecture in 2026](/en/blog/zero-trust-arch)
 - [Zero Trust Network Architecture](/en/blog/zero-trust-network)
-

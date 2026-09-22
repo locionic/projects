@@ -3,13 +3,11 @@ draft: false
 title: "Fixing a 2-Minute Login Delay on Ubuntu (Real Debugging Journey)"
 images: ['https://imgbed.locionic.com/file/1784441601756_ubuntu-login-issue-part-2.jpg']
 date: "2026-05-27"
-lastUpdated: '2026-07-09'
+lastUpdated: '2026-09-22'
 tags: ["linux", "ubuntu", "performance", "troubleshooting"]
 category: Tech
 summary: "Spent three days chasing a two-minute login freeze on Ubuntu. Turns out it wasn't one bug — it was three separate issues stacking up: NetworkManager waiting for network, gnome-keyring starting twice, and snapd adding two minutes for 18 snaps. Here's the full debugging trail."
 ---
-
-
 
 I sat staring at a frozen desktop for two full minutes after typing my password. Every single morning. For three days straight.
 
@@ -17,38 +15,103 @@ I sat staring at a frozen desktop for two full minutes after typing my password.
 Boot time and login time are completely different problems. `systemd-analyze` measures boot speed — not what happens after you type your password.
 </Callout>
 
+This is the follow-up to my [original Ubuntu login delay post](/en/blog/ubuntu-login-issue), where an NVIDIA/Xorg issue caused a similar symptom. This time the machine had no NVIDIA GPU — but the same two-minute freeze was back. Different root cause, different fix.
+
+---
+
+## The Diagnostic Toolkit
+
+Before touching anything, collect evidence. Guessing wastes time.
+
+**Boot-time analysis** (what loads before the login screen):
+```bash
+systemd-analyze blame | head -20
+systemd-analyze critical-chain
+systemd-analyze plot > boot.svg
+```
+
+**User-session analysis** (what loads after you type your password):
+```bash
+systemd-analyze --user blame | head -20
+systemd-analyze --user critical-chain
+```
+
+**Journal scanning** (find timeout and failure events):
+```bash
+# All errors since last boot
+journalctl -b -p err
+
+# Everything, with timestamps
+journalctl -b --output=short-precise | less
+
+# Filter for common culprits
+journalctl -b | grep -iE "timeout|timed out|failed|refused|killed"
+```
+
+The critical insight: `systemd-analyze blame` only shows boot-time (pre-login). For post-login freezes, you need `--user` and `journalctl -b`.
+
 ---
 
 ## The First Clue: NetworkManager
 
-Ran `systemd-analyze blame` and found `NetworkManager-wait-online.service` sitting at 5.7 seconds. 
+`systemd-analyze blame` showed `NetworkManager-wait-online.service` at 5.7 seconds. Not the login freeze culprit, but worth fixing.
 
-<Callout type="info" title="The Fix">
-This service waits for a full network connection before considering boot complete. On a desktop? Pointless.
+<Callout type="info" title="What NetworkManager-wait-online does">
+This service blocks the boot sequence until a full network connection is established. On a server, it matters — systemd services like databases need network before starting. On a desktop, it's usually pointless.
+</Callout>
+
 ```bash
 sudo systemctl disable NetworkManager-wait-online.service
 ```
-</Callout>
 
-Boot got faster. The login freeze didn't budge.
+Check it actually disabled:
+```bash
+systemctl is-enabled NetworkManager-wait-online.service
+# Should output: disabled
+```
+
+Boot got 5 seconds faster. The login freeze didn't budge.
+
+**Why this is safe on desktops:** Desktop apps don't depend on network being ready at boot time — they handle it themselves. The only services that need `NetworkManager-wait-online` to succeed are ones explicitly `After=network-online.target`, which is rare on desktops.
 
 ---
 
 ## The Second Clue: Duplicate Keyring
 
-`journalctl -b` showed a cluster of errors exactly two minutes after login:
+`journalctl -b | grep -iE "failed|error"` showed a cluster of errors at exactly the two-minute mark after login:
 
 ```
 Failed to start app-gnome-gnome-keyring-secrets.scope
+systemd[1423]: Failed to start gnome-keyring-secrets.scope
+cgroup: Failed to create /user.slice/user-1000.slice/session-2.scope/app.slice/app-gnome-keyring
 ```
 
+The timestamps were precise: these errors appeared 120 seconds after login — the exact length of the freeze.
+
 <Stepper>
-<Step title="The Problem">
-GNOME was starting the keyring twice — once via systemd, again via `.desktop` autostart files. The second attempt crashed and left systemd confused.
+<Step title="Understanding the Problem">
+GNOME was starting the keyring daemon twice — once via systemd user services, and again via `.desktop` autostart files in `/etc/xdg/autostart/`. The second attempt found the socket already in use, crashed, and left systemd waiting on the failed service before it could declare the session ready.
+</Step>
+
+<Step title="Confirm the Duplicate">
+Check whether autostart files exist:
+```bash
+ls /etc/xdg/autostart/ | grep keyring
+# gnome-keyring-pkcs11.desktop
+# gnome-keyring-secrets.desktop
+# gnome-keyring-ssh.desktop
+```
+
+Check whether the systemd user service is also active:
+```bash
+systemctl --user status gnome-keyring-daemon.service
+```
+
+If both are present and the service is active, you have the duplicate.
 </Step>
 
 <Step title="The Fix">
-Disable the duplicate autostart entries locally:
+Disable the autostart entries for your user only (don't modify system-wide files):
 ```bash
 mkdir -p ~/.config/autostart
 for f in gnome-keyring-pkcs11.desktop gnome-keyring-secrets.desktop gnome-keyring-ssh.desktop; do
@@ -56,50 +119,121 @@ for f in gnome-keyring-pkcs11.desktop gnome-keyring-secrets.desktop gnome-keyrin
     echo "X-GNOME-Autostart-enabled=false" >> ~/.config/autostart/$f
 done
 ```
+Log out and back in. The cgroup errors should disappear.
 </Step>
 </Stepper>
 
-The cgroup errors disappeared. The freeze? Still there.
+The cgroup errors disappeared. The freeze? Still two minutes, exactly.
 
 ---
 
 ## The Real Culprit: snapd's Math
 
-Digging deeper into the journal revealed the actual culprit:
+After eliminating the obvious candidates, I ran a targeted search for anything in the journal related to timing:
+
+```bash
+journalctl -b | grep -i "snap\|adjust\|timeout" | head -30
+```
+
+There it was:
 
 ```
 snapd[2242]: adjusting startup timeout by 2m0s (pessimistic estimate of 30s plus 5s per snap)
+snapd[2242]: OsRelease{...} snap name "snapd-desktop-integration" error: service not found
 ```
 
-<Callout type="warning" title="Snapd's Math Problem">
-Snapd calculates startup timeout as **30 seconds + 5 seconds per installed snap**. I had 18 snaps installed. 30 + (5 × 18) = 120 seconds exactly.
+<Callout type="warning" title="Snapd's Timeout Formula">
+snapd calculates its startup timeout as **30 seconds + 5 seconds per installed snap**. I had 18 snaps installed. 30 + (5 × 18) = **120 seconds exactly**.
+
+This is hardcoded in the snapd source. You cannot configure it shorter.
 </Callout>
 
-The `snapd-desktop-integration` snap was failing at login. Snapd waited the full two minutes before giving up.
+The `snapd-desktop-integration` snap was failing on every login. snapd waited the full calculated timeout (120 seconds) before giving up and letting the session proceed.
 
-### The Nuclear Option
+### Diagnosing Which Snap Is Failing
 
-`snapd-desktop-integration` only handles theme and font syncing. Purely cosmetic.
+```bash
+# Check snap status
+snap list
+
+# Check for failing snap services
+snap services | grep -v enabled
+
+# Watch snap logs
+journalctl -b -u snapd | grep -iE "fail|error|timeout"
+```
+
+The output showed `snapd-desktop-integration` consistently failing to connect. The snap's job is to sync GTK themes and fonts between the host and containerized snap apps. Purely cosmetic — nothing breaks if it fails, except the login wait.
+
+### The Fix
 
 ```bash
 sudo snap remove snapd-desktop-integration
 ```
 
-Desktop loaded instantly after that.
+Log out, log back in. Desktop loaded instantly.
+
+### Alternative: Keep the Snap, Remove the Service
+
+If you want to keep the snap for occasional use but stop it from running on login:
+
+```bash
+sudo snap stop snapd-desktop-integration
+sudo snap set snapd-desktop-integration daemon=false
+```
+
+This prevents the service from starting automatically while keeping the snap installed.
+
+---
+
+## The Full Picture: Three Bugs, One Symptom
+
+| Bug | Tool that caught it | Impact on login | Fix |
+|-----|--------------------|-----------------|----|
+| `NetworkManager-wait-online` | `systemd-analyze blame` | +5s on boot (not login) | `systemctl disable` |
+| Duplicate gnome-keyring | `journalctl -b -p err` | Cgroup errors, minor delay | Disable autostart duplicates |
+| snapd timeout | `journalctl -b \| grep snap` | +120s login freeze | `snap remove snapd-desktop-integration` |
+
+Each bug was real. None of them caused the two-minute freeze on its own until the snapd issue was found.
+
+---
+
+## Preventive Checks
+
+If you want to audit what's starting slowly in your user session without waiting for something to break:
+
+```bash
+# Slowest user services at startup
+systemd-analyze --user blame | head -20
+
+# All snap services and their status
+snap services
+
+# Snaps that have autostart behavior
+snap list | awk 'NR>1 {print $1}' | xargs -I{} snap info {} 2>/dev/null | grep -A2 "services:"
+```
+
+For systems with many snaps, the math above applies: every 6 additional snaps adds 30 seconds to a worst-case timeout. Keep your snap list lean.
 
 ---
 
 <Callout type="idea" title="Diagnostic Cheat Sheet">
 **Boot breakdown:** `systemd-analyze blame | head -20`  
 **User session breakdown:** `systemd-analyze --user blame | head -20`  
-**Login failures:** `journalctl -b | grep -iE "timeout|timed out|failed"`
+**Login failures:** `journalctl -b | grep -iE "timeout|timed out|failed"`  
+**Snap-specific:** `journalctl -b -u snapd | grep -iE "fail|adjust|timeout"`  
+**Snap services:** `snap services | grep -v enabled`
 </Callout>
 
 ---
 
+## TL;DR
+
 Three separate bugs. Two minutes of waiting. One `snap remove` command fixed it.
 
-Why does snapd add five seconds per snap? No idea. But removing that one integration snap bought me back two minutes every morning. Worth it.
+The real lesson: **login freeze ≠ boot slowness**. `systemd-analyze blame` won't show you what's happening after you type your password. Use `systemd-analyze --user blame` and `journalctl -b | grep -iE "failed|timeout"` to find post-login issues.
+
+snapd's 30 + 5n timeout formula is the most common cause I've seen for mysterious 1–2 minute login delays on Ubuntu machines with many snaps installed. If your machine freezes for exactly N×30 seconds after login, check snap services first.
 
 ## You Might Also Like
 
@@ -107,4 +241,3 @@ Why does snapd add five seconds per snap? No idea. But removing that one integra
 - [Ubuntu Server Security: The Pragmatic Linux Hardening Checklist](/en/blog/ubuntu-server-security-fundamentals)
 - [How to Add a Directory to PATH in Linux (Permanent Fix)](/en/blog/how-to-add-a-directory-to-your-path)
 - [Distributed Tracing with OpenTelemetry](/en/blog/opentelemetry-distributed-tracing)
-
