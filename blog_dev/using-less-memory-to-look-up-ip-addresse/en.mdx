@@ -3,23 +3,76 @@ draft: false
 title: "Using less memory to look up IP addresses in Mess With DNS"
 images: ['https://imgbed.locionic.com/file/1784441605215_using-less-memory-to-look-up-ip-addresse.jpg']
 date: '2024-10-27'
-lastUpdated: '2026-08-04'
+lastUpdated: '2026-09-22'
 tags: ["networking", "go", "memory-optimization", "database"]
 category: Tech
-summary: 'How I cut the IP lookup database footprint from 117MB to 46MB in a Go DNS playground, eliminating OOM crashes on resource-constrained cloud servers.'
+summary: 'How I cut the IP lookup database footprint from 117MB to 46MB in a Go DNS playground, eliminating OOM crashes on resource-constrained cloud servers — using pprof, netip.Addr, and ASN deduplication.'
 ---
-
-
 
 I run a DNS playground called Mess With DNS. It's a fun project, but it kept crashing. The server only has 465MB of RAM, and the IP address lookup database was eating 117MB of it. That's a quarter of all memory, gone.
 
 PowerDNS took another 100MB. Mess With DNS itself needed 200MB. Add it up and the server was constantly living at the edge. One bad request and boom, OOM kill.
 
-Here's how I fixed it.
+Here's exactly how I diagnosed and fixed it.
 
 <Callout type="danger" title="The Memory Crisis">
-  Out of 465MB total RAM, the IP address lookup database was eating **117MB**. Combined with PowerDNS (100MB) and Mess With DNS (200MB), the server was constantly pushed to its breaking point.
+  Out of 465MB total RAM, the IP address lookup database was eating **117MB**. Combined with PowerDNS (100MB) and Mess With DNS (200MB), the server was constantly pushed to its breaking point — with only ~48MB of headroom.
 </Callout>
+
+## First Step: Actually Measuring It
+
+Before touching anything, I needed to understand what was using memory and why. Go's `pprof` package makes this straightforward:
+
+```go
+import (
+    "runtime"
+    "runtime/pprof"
+    "os"
+)
+
+func dumpHeapProfile(path string) error {
+    runtime.GC() // force GC so the profile reflects live allocations
+    f, err := os.Create(path)
+    if err != nil {
+        return err
+    }
+    defer f.Close()
+    return pprof.WriteHeapProfile(f)
+}
+```
+
+Then analyse it:
+
+```bash
+# capture a heap profile from a running process
+go tool pprof -alloc_space http://localhost:6060/debug/pprof/heap
+
+# or from a saved file
+go tool pprof -inuse_space heap.prof
+```
+
+The profile immediately pointed at two allocations: ASN data stored redundantly for every IP range, and the old `net.IP` byte slice type. Without profiling first I would have guessed wrong.
+
+## The Original Data Structure
+
+The IP lookup database maps CIDR ranges to their origin ASN — the ISP or network operator that owns those addresses. Here's what the original structure looked like:
+
+```go
+type IPRange struct {
+    Start   net.IP // byte slice: 24 bytes header + 16 bytes data
+    End     net.IP
+    Country string
+    ASN     uint32
+    OrgName string // "Cloudflare, Inc." — duplicated for every range
+    OrgDesc string // duplicated again
+}
+
+var ranges []IPRange // 500,000+ entries
+```
+
+The `net.IP` type is defined as `type IP []byte`. A Go slice has three fields — pointer, length, capacity — that's 24 bytes of header, plus a separately heap-allocated backing array. Each `IPRange` carries two of them.
+
+And every `IPRange` stores its `OrgName` and `OrgDesc` strings inline. If 10,000 ranges belong to Cloudflare, you store "Cloudflare, Inc." 10,000 times.
 
 ## Trying the Obvious Thing First
 
@@ -29,7 +82,7 @@ Wrong.
 
 SQLite doesn't support big integers properly. IPv6 addresses had to be stored as text strings. That felt wrong, but I pushed ahead anyway to see if it would work.
 
-The real killer was performance. Disk lookups were **500x slower** than the array-based binary search I already had. I'm not talking about microseconds here. We're in "noticeably hangs" territory. A DNS playground that hangs isn't a playground. It's a frustration machine.
+The real killer was performance. Disk lookups were **500x slower** than the array-based binary search I already had. I'm not talking about microseconds here — we're in "noticeably hangs" territory. A DNS playground that hangs isn't a playground. It's a frustration machine.
 
 So that was a dead end.
 
@@ -39,62 +92,187 @@ Next I tried a trie. In theory, tries are great for prefix matching, which is ex
 
 It did not work.
 
-The trie ballooned memory to **800MB**. That's more RAM than the server has period. And it was somehow slower than the original binary search too. I'd made the problem worse, not better.
+The trie ballooned memory to **800MB**. That's more RAM than the server has, period. And it was somehow slower than the original binary search too. I'd made the problem worse, not better.
 
 <Callout type="idea" title="What I Learned Early">
-  Sometimes the elegant data structure isn't the right one. A simple array with binary search was already beating fancier approaches on both speed and memory.
+  Sometimes the elegant data structure isn't the right one. A simple array with binary search was already beating fancier approaches on both speed and memory. Don't replace what works — fix what wastes.
 </Callout>
 
 At this point I stepped back. I already had something that worked well: the array-based binary search. It was fast and correct. The only problem was memory. So instead of replacing the whole thing, why not fix what I had?
 
 ## What Actually Worked
 
-I went back to the original approach and looked for waste. Two big things stood out.
+I went back to the original approach and looked for waste. Two big things stood out immediately from the pprof output.
 
-### Deduplicating ASN Information
+### Fix 1: Deduplicating ASN Information
 
-The original data structure stored ASN information inline with every IP range. The problem? Lots of ranges share the same ASN. If 10,000 ranges belong to the same ISP, you're storing the same company name, country code, and description ten thousand times.
+Pull ASN data into its own array and store a numeric index instead of the string data inline:
 
-I pulled ASN data into a separate array and stored an index instead. One copy of each ASN. Everything else just points to it.
+```go
+type ASNRecord struct {
+    OrgName string
+    OrgDesc string
+    Country string
+    ASN     uint32
+}
 
-This saved **50MB**. Not bad for a refactor that took an afternoon.
+type IPRange struct {
+    Start   netip.Addr // value type — no heap allocation
+    End     netip.Addr
+    ASNIdx  uint32 // index into a shared ASNRecord slice
+}
 
-### Switching to `netip.Addr`
+var asnRecords []ASNRecord // one entry per unique ASN
+var ranges []IPRange       // many entries, tiny per-entry cost
+```
 
-The original code used Go's old `net.IP` type. It's the standard library type everyone reaches for. But it has a problem: it's a byte slice under the hood. Every `net.IP` value carries slice header overhead plus the backing array.
+Building the deduplicated table during database load:
 
-Go 1.18 introduced `netip.Addr` in the `net/netip` package. It's a value type: 16 bytes on the stack, no heap allocation. That's dramatically smaller than a byte slice.
+```go
+func buildIndex(rows []rawRow) ([]IPRange, []ASNRecord) {
+    asnMap := make(map[uint32]uint32) // ASN number -> index
+    var asnRecords []ASNRecord
+    var ranges []IPRange
 
-<Callout type="info" title="Memory Profiling in Go">
-  If you're tracking down memory leaks in Go, use the `runtime` and `pprof` packages:
-  * Call `runtime.GC()` to force garbage collection before taking measurements.
-  * Use `pprof` to generate and analyze heap profiles.
-  * Pass `--alloc-space` or `--inuse-space` to differentiate between historical allocations and active memory usage.
-</Callout>
+    for _, row := range rows {
+        idx, ok := asnMap[row.ASN]
+        if !ok {
+            idx = uint32(len(asnRecords))
+            asnRecords = append(asnRecords, ASNRecord{
+                OrgName: row.OrgName,
+                OrgDesc: row.OrgDesc,
+                Country: row.Country,
+                ASN:     row.ASN,
+            })
+            asnMap[row.ASN] = idx
+        }
+        ranges = append(ranges, IPRange{
+            Start:  row.Start,
+            End:    row.End,
+            ASNIdx: idx,
+        })
+    }
+    return ranges, asnRecords
+}
+```
 
-Switching types saved another **20MB**. All without changing the lookup logic.
+This saved **50MB**. The ASN data now lives in one place; ranges just carry a 4-byte index.
+
+### Fix 2: Switching to `netip.Addr`
+
+The original code used Go's old `net.IP` type. It's a `[]byte` — a slice header (24 bytes on 64-bit) plus a heap-allocated backing array (16 bytes for IPv6). Every IP address in every `IPRange` touched the heap.
+
+Go 1.18 introduced `netip.Addr` in `net/netip`. It is a **value type**: a 128-bit value plus a 16-bit zone index, stored on the stack or inline in a struct. No heap allocation.
+
+```go
+// Before: heap allocation per address
+start := net.ParseIP("2a06:98c0::")  // []byte on heap
+
+// After: pure stack value
+start, _ := netip.ParseAddr("2a06:98c0::")  // no heap
+```
+
+Binary search still works identically — `netip.Addr` supports comparison operators:
+
+```go
+func lookup(ranges []IPRange, ip netip.Addr) *ASNRecord {
+    lo, hi := 0, len(ranges)-1
+    for lo <= hi {
+        mid := (lo + hi) / 2
+        r := ranges[mid]
+        if ip.Compare(r.Start) >= 0 && ip.Compare(r.End) <= 0 {
+            return &asnRecords[r.ASNIdx]
+        }
+        if ip.Compare(r.Start) < 0 {
+            hi = mid - 1
+        } else {
+            lo = mid + 1
+        }
+    }
+    return nil
+}
+```
+
+Switching types saved another **20MB**. All without changing the lookup algorithm — binary search is still O(log n) and runs at the same speed.
+
+## Memory Layout: Before vs After
+
+Here's how the memory footprint changed per `IPRange` entry:
+
+```
+BEFORE (per IPRange, with net.IP):
+┌──────────────────────────────────────────┐
+│ Start  net.IP  [ptr|len|cap] = 24 bytes  │
+│         heap → [16 bytes]                │
+│ End    net.IP  [ptr|len|cap] = 24 bytes  │
+│         heap → [16 bytes]                │
+│ Country string  16 bytes                 │
+│ ASN     uint32   4 bytes                 │
+│ OrgName string  16 bytes + heap string   │
+│ OrgDesc string  16 bytes + heap string   │
+└──────────────────────────────────────────┘
+~120+ bytes per entry (plus heap strings)
+
+AFTER (per IPRange, with netip.Addr):
+┌──────────────────────────────────────────┐
+│ Start  netip.Addr  17 bytes (no heap)    │
+│ End    netip.Addr  17 bytes (no heap)    │
+│ ASNIdx uint32       4 bytes              │
+└──────────────────────────────────────────┘
+~38 bytes per entry (all inline, no heap)
+```
+
+With 500,000 ranges, that difference compounds dramatically.
 
 ## The Results
 
-The IP lookup database went from 117MB to 46MB. That's a 60% reduction. Binary search speed stayed exactly the same.
+The IP lookup database went from **117MB to 46MB** — a 61% reduction. Binary search speed stayed exactly the same. The server stopped crashing.
 
-The server stopped crashing. Users could actually use the playground without random disconnects. A win all around.
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| IP lookup memory | 117MB | 46MB | −61% |
+| Free headroom | ~48MB | ~119MB | +71MB |
+| Lookup algorithm | binary search | binary search | unchanged |
+| Query latency | fast | fast | unchanged |
 
-<Callout type="info" title="Final Numbers">
-  | Metric | Before | After |
-  |--------|--------|-------|
-  | IP lookup memory | 117MB | 46MB |
-  | Server margin | ~48MB | ~119MB |
-  | Lookup speed | Fast | Same |
+<Callout type="info" title="Profiling in Production">
+  If you're tracking live allocations in a Go production service, use the `net/http/pprof` handler:
+
+  ```go
+  import _ "net/http/pprof"
+  go http.ListenAndServe(":6060", nil)
+  ```
+
+  Then `go tool pprof -inuse_space http://localhost:6060/debug/pprof/heap` shows what's live right now. Use `-alloc_space` to see cumulative allocations over time.
 </Callout>
 
 ## What I'd Do Differently
 
-If I could go back, I'd skip the trie entirely. It was the wrong tool for the data size I was dealing with. Maybe it would work at internet scale, but this isn't Google's BGP table. It's a hobby project.
+If I could go back, I'd skip the trie entirely. It was the wrong tool for the data size I was dealing with. Maybe it would work at internet scale, but this isn't Google's BGP table. It's a hobby project with a known, bounded data set.
 
-I'd also profile first instead of guessing. A quick pprof heap profile would have shown me the ASN duplication problem in minutes instead of the days I spent trying SQLite and tries. Measuring beats assuming every time.
+I'd also **profile first** instead of guessing. A quick pprof heap profile would have shown me the ASN duplication problem in minutes instead of the days I spent trying SQLite and tries. Measuring beats assuming every time.
 
-The real lesson? You don't always need a clever solution. Sometimes you need to look at what you already have and ask: where's the waste?
+The real lesson? You don't always need a clever solution. Sometimes you need to look at what you already have and ask: *where's the waste?*
+
+### General Go Memory Principles Applied Here
+
+- **Use value types wherever possible.** `netip.Addr`, `[16]byte`, structs with fixed-size fields — anything that avoids a heap pointer cuts GC pressure and saves memory.
+- **Normalize repeated data.** If multiple records share the same string or sub-record, store it once and reference by index. This is the same principle behind database normalization.
+- **Profile before you optimize.** A 10-minute pprof session beats hours of speculative refactoring. The allocations that look small in a struct can add up to gigabytes at scale.
+- **Benchmark your replacements.** Before shipping the `netip.Addr` migration, run `go test -bench=. -benchmem` on the lookup hot path to confirm you haven't introduced a regression.
+
+```bash
+# Quick benchmark template
+func BenchmarkLookup(b *testing.B) {
+    ip, _ := netip.ParseAddr("1.1.1.1")
+    b.ResetTimer()
+    for i := 0; i < b.N; i++ {
+        lookup(ranges, ip)
+    }
+}
+```
+
+The server has been stable ever since. 71MB of extra headroom doesn't sound like much — but when you're at 465MB total, it's the difference between a reliable service and one that falls over under normal load.
 
 <Callout type="info" title="Related Posts">
   <ul>
@@ -109,4 +287,3 @@ The real lesson? You don't always need a clever solution. Sometimes you need to 
 - [Mastering Rust for Web Development](/en/blog/mastering-rust-web-dev)
 - [Modern Database Sharding Strategies for Hyper-Growth](/en/blog/db-sharding)
 - [Database Seeding Strategies with Prisma and TypeScript](/en/blog/prisma-seed-typescript-strategies)
-

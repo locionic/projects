@@ -1,7 +1,8 @@
 ---
 title: "Building Production RAG with pgvector & Hybrid Search"
 date: '2026-09-02'
-summary: "Learn how to build a robust Retrieval-Augmented Generation (RAG) architecture using pgvector for hybrid search. We'll combine full-text vector search and BM25 to achieve better retrieval accuracy."
+lastUpdated: '2026-09-22'
+summary: "Learn how to build a robust Retrieval-Augmented Generation (RAG) architecture using pgvector for hybrid search. We'll combine full-text vector search and BM25 to achieve better retrieval accuracy, tune HNSW indexes, and ship a production Python client."
 tags: ['ai', 'postgresql', 'backend', 'database']
 draft: false
 images: ['/static/images/pgvector-hybrid-search-rag-guide.png']
@@ -9,7 +10,7 @@ images: ['/static/images/pgvector-hybrid-search-rag-guide.png']
 
 When building a Retrieval-Augmented Generation (RAG) system, retrieval accuracy is everything. If the retrieved documents aren't relevant, your LLM's response won't be either. This is where **pgvector hybrid search** shines. By combining traditional full-text search with vector embeddings, you get the best of both worlds.
 
-In this guide, we'll explore how to build a production-ready RAG architecture using PostgreSQL, the `pgvector` extension, and Reciprocal Rank Fusion (RRF). 
+In this guide, we'll explore how to build a production-ready RAG architecture using PostgreSQL, the `pgvector` extension, Reciprocal Rank Fusion (RRF), and a complete Python client — including HNSW tuning, query plan analysis, and a production checklist.
 
 If you are exploring other AI stack components, be sure to check out our overview of [AI Tools](/en/blog/ai-tools).
 
@@ -24,8 +25,8 @@ graph TD
     EmbedModel --> DenseVector["Dense Vector Embedding"]
     DenseVector --> VectorSearch["pgvector HNSW Index"]
     
-    KeywordSearch -.->|Sparse Results| RRF["Reciprocal Rank Fusion (RRF)"]
-    VectorSearch -.->|Dense Results| RRF
+    KeywordSearch -..->|Sparse Results| RRF["Reciprocal Rank Fusion (RRF)"]
+    VectorSearch -..->|Dense Results| RRF
     
     RRF --> TopK["Top-K Documents"]
     TopK --> LLM["LLM Synthesis"]
@@ -57,78 +58,214 @@ Why do we need a hybrid approach? Let's break down the differences between seman
   }}
 />
 
-While semantic search is powerful, it sometimes fails when a user searches for specific serial numbers, acronyms, or exact names. Combining it with PostgreSQL full text vector search ensures you catch both exact terms and conceptual matches.
+While semantic search is powerful, it sometimes fails when a user searches for specific serial numbers, acronyms, or exact names. Combining it with PostgreSQL full-text search ensures you catch both exact terms and conceptual matches.
+
+## Choosing Your Embedding Dimension
+
+Before setting up the schema, decide on your embedding model. The dimension you pick is permanent — changing it requires re-indexing all documents.
+
+| Model | Dimensions | Notes |
+|---|---|---|
+| OpenAI `text-embedding-3-small` | 1536 | Good balance of cost and quality |
+| OpenAI `text-embedding-3-large` | 3072 | Highest quality, 2× storage |
+| Cohere `embed-english-v3.0` | 1024 | Strong multilingual option |
+| `BAAI/bge-m3` (open source) | 1024 | Best open-source, self-hosted |
+| `all-MiniLM-L6-v2` | 384 | Fast, low memory, good for on-device |
+
+Larger dimensions improve recall on nuanced semantic queries but cost more in both storage and search latency. For most production RAG systems, 1024 or 1536 is the sweet spot.
 
 ## Setting Up pgvector
 
-Let's walk through how to set up your PostgreSQL vector index for optimal performance. We'll use HNSW (Hierarchical Navigable Small World), which is currently the gold standard for high-performance approximate nearest neighbor (ANN) search.
-
 <Stepper>
   <Step title="Enable Extensions">
-    First, you need to install and enable `pgvector` in your database.
+    First, enable `pgvector` in your database. On RDS or Supabase, this is available by default.
     ```sql
     CREATE EXTENSION IF NOT EXISTS vector;
     ```
   </Step>
   <Step title="Create the Table">
-    Create a table that stores your documents, their text search vectors (for BM25), and their embeddings.
+    Create a table that stores your documents, their full-text search vectors (for BM25), and their embeddings.
     ```sql
     CREATE TABLE documents (
-        id bigserial PRIMARY KEY,
-        content text,
-        embedding vector(1536), -- e.g., OpenAI embeddings
-        fts tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
+        id          bigserial PRIMARY KEY,
+        content     text      NOT NULL,
+        metadata    jsonb     DEFAULT '{}',
+        embedding   vector(1536),  -- match your model's dimension
+        fts         tsvector  GENERATED ALWAYS AS
+                      (to_tsvector('english', content)) STORED,
+        created_at  timestamptz DEFAULT now()
     );
     ```
   </Step>
   <Step title="Create the HNSW Index">
-    Create an HNSW index on the embedding column. HNSW provides faster query times and better recall compared to ivfflat.
+    HNSW provides faster query times and better recall than IVFFlat. Tune `m` (graph connectivity) and `ef_construction` (build-time search depth) to match your workload.
     ```sql
-    CREATE INDEX ON documents 
-    USING hnsw (embedding vector_cosine_ops);
+    CREATE INDEX documents_embedding_hnsw_idx
+        ON documents
+        USING hnsw (embedding vector_cosine_ops)
+        WITH (m = 16, ef_construction = 64);
     ```
+    - **`m = 16`**: connections per node — higher improves recall but uses more memory
+    - **`ef_construction = 64`**: search depth at build time — higher improves index quality, slower to build
   </Step>
   <Step title="Create the Full-Text Index">
-    Add a GIN index to speed up the text search queries.
+    Add a GIN index to accelerate BM25-style keyword queries.
     ```sql
-    CREATE INDEX fts_idx ON documents USING GIN (fts);
+    CREATE INDEX documents_fts_gin_idx ON documents USING GIN (fts);
     ```
+  </Step>
+  <Step title="Set Query-Time HNSW Parameters">
+    At query time, control the recall vs. latency tradeoff with `hnsw.ef_search`. Higher values improve recall at the cost of latency.
+    ```sql
+    SET hnsw.ef_search = 100; -- default is 40; 100 is good for production
+    ```
+    Set this per-session or in your connection pool configuration.
   </Step>
 </Stepper>
 
 ## Implementing Hybrid Search with RRF
 
-To actually perform the hybrid search, you'll query both indexes and merge them. Typically, this is done via a common table expression (CTE) using Reciprocal Rank Fusion (RRF). 
-
-Here is a simplified example of how you might structure the query:
+Reciprocal Rank Fusion combines the ranked results from both searches. A document that ranks #2 in vector search and #3 in keyword search gets a higher fused score than one that ranks #1 in only one of them.
 
 ```sql
 WITH vector_search AS (
-  SELECT id, content, 
-         RANK() OVER (ORDER BY embedding <=> '[0.1, 0.2, ...]') AS rank
+  SELECT id, content, metadata,
+         RANK() OVER (ORDER BY embedding <=> $1) AS rank
   FROM documents
-  ORDER BY embedding <=> '[0.1, 0.2, ...]'
+  ORDER BY embedding <=> $1
   LIMIT 50
 ),
 keyword_search AS (
-  SELECT id, content,
-         RANK() OVER (ORDER BY ts_rank_cd(fts, plainto_tsquery('english', 'search terms')) DESC) AS rank
+  SELECT id, content, metadata,
+         RANK() OVER (
+           ORDER BY ts_rank_cd(fts, plainto_tsquery('english', $2)) DESC
+         ) AS rank
   FROM documents
-  WHERE fts @@ plainto_tsquery('english', 'search terms')
-  ORDER BY ts_rank_cd(fts, plainto_tsquery('english', 'search terms')) DESC
+  WHERE fts @@ plainto_tsquery('english', $2)
+  ORDER BY ts_rank_cd(fts, plainto_tsquery('english', $2)) DESC
   LIMIT 50
 )
-SELECT 
-  COALESCE(v.id, k.id) as id,
-  COALESCE(v.content, k.content) as content,
-  (COALESCE(1.0 / (60 + v.rank), 0.0) + COALESCE(1.0 / (60 + k.rank), 0.0)) as rrf_score
+SELECT
+  COALESCE(v.id, k.id)               AS id,
+  COALESCE(v.content, k.content)     AS content,
+  COALESCE(v.metadata, k.metadata)   AS metadata,
+  (
+    COALESCE(1.0 / (60 + v.rank), 0.0) +
+    COALESCE(1.0 / (60 + k.rank), 0.0)
+  )                                   AS rrf_score
 FROM vector_search v
 FULL OUTER JOIN keyword_search k ON v.id = k.id
 ORDER BY rrf_score DESC
 LIMIT 10;
+-- $1: embedding vector, $2: query text string
 ```
 
-This ensures that documents ranking high in both semantic and keyword search are boosted to the top!
+The constant `60` in the denominator is the RRF constant `k` — it reduces the weight of the top-ranked documents and prevents any single list from dominating. A value of 60 is the standard used in the original RRF paper.
+
+## Verifying Your Query Plan
+
+Before shipping to production, run `EXPLAIN ANALYZE` to confirm the HNSW index is being used and check actual vs. estimated row counts:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT id, content, embedding <=> '[0.1, 0.2, ...]' AS dist
+FROM documents
+ORDER BY embedding <=> '[0.1, 0.2, ...]'
+LIMIT 10;
+```
+
+Look for `Index Scan using documents_embedding_hnsw_idx` in the output. If you see a sequential scan instead, your `ef_search` may be too high or statistics need updating (`ANALYZE documents;`).
+
+## Python Client with asyncpg
+
+Here's a production-grade Python implementation using `asyncpg` and OpenAI embeddings:
+
+```python
+import asyncpg
+import openai
+from typing import Any
+
+async def embed(text: str) -> list[float]:
+    resp = await openai.AsyncOpenAI().embeddings.create(
+        model="text-embedding-3-small",
+        input=text,
+    )
+    return resp.data[0].embedding
+
+async def hybrid_search(
+    pool: asyncpg.Pool,
+    query: str,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    embedding = await embed(query)
+    # asyncpg expects vectors as lists of floats
+    vector_str = "[" + ",".join(str(x) for x in embedding) + "]"
+
+    rows = await pool.fetch(
+        """
+        WITH vector_search AS (
+          SELECT id, content, metadata,
+                 RANK() OVER (ORDER BY embedding <=> $1::vector) AS rank
+          FROM documents ORDER BY embedding <=> $1::vector LIMIT 50
+        ),
+        keyword_search AS (
+          SELECT id, content, metadata,
+                 RANK() OVER (
+                   ORDER BY ts_rank_cd(fts, plainto_tsquery('english', $2)) DESC
+                 ) AS rank
+          FROM documents
+          WHERE fts @@ plainto_tsquery('english', $2)
+          LIMIT 50
+        )
+        SELECT
+          COALESCE(v.id, k.id)             AS id,
+          COALESCE(v.content, k.content)   AS content,
+          COALESCE(v.metadata, k.metadata) AS metadata,
+          (COALESCE(1.0/(60+v.rank),0) + COALESCE(1.0/(60+k.rank),0)) AS score
+        FROM vector_search v
+        FULL OUTER JOIN keyword_search k ON v.id = k.id
+        ORDER BY score DESC LIMIT $3
+        """,
+        vector_str,
+        query,
+        limit,
+    )
+    return [dict(r) for r in rows]
+```
+
+## Chunking Strategy
+
+How you split your documents before embedding is as important as the index configuration. Poor chunking causes two failure modes:
+
+- **Chunks too small**: The embedding captures only part of a concept, semantic search misses context.  
+- **Chunks too large**: A single chunk dilutes relevance — one relevant sentence buried in 2,000 tokens.
+
+| Strategy | Chunk Size | Overlap | Best For |
+|---|---|---|---|
+| Fixed token | 512 tokens | 50 tokens | General purpose, simple to implement |
+| Sentence boundary | 3-5 sentences | 1 sentence | Conversational docs, QA systems |
+| Paragraph boundary | 1 paragraph | — | Blog posts, articles |
+| Semantic chunking | Variable | — | Long technical docs with logical sections |
+
+For most RAG applications, **512 tokens with 50-token overlap** is a solid starting point. Overlap ensures a concept split across a chunk boundary still appears in at least one chunk's context window.
+
+## Optional: Re-Ranking with a Cross-Encoder
+
+RRF is a good fuser, but it doesn't understand the query-document relationship — it only combines rankings. For high-stakes RAG (medical, legal, financial), add a cross-encoder re-ranking step after retrieval:
+
+```python
+from sentence_transformers import CrossEncoder
+
+reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+
+def rerank(query: str, docs: list[dict]) -> list[dict]:
+    pairs = [(query, d['content']) for d in docs]
+    scores = reranker.predict(pairs)
+    ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
+    return [d for d, _ in ranked]
+```
+
+Cross-encoders are slower than bi-encoders (they process each query-document pair jointly), so only re-rank the top 20-50 results from hybrid search, then pass the top 5-10 to the LLM.
 
 ## FAQ
 
@@ -136,20 +273,37 @@ This ensures that documents ranking high in both semantic and keyword search are
   items={[
     {
       question: "Why use HNSW over IVFFlat in pgvector?",
-      answer: "HNSW builds a multi-layered graph that allows for significantly faster search times and higher recall compared to IVFFlat, which relies on clustering. While HNSW uses more memory and takes longer to build, it's generally preferred for production RAG systems."
+      answer: "HNSW builds a multi-layered graph that allows for significantly faster search times and higher recall compared to IVFFlat, which relies on clustering. While HNSW uses more memory and takes longer to build, it delivers consistent latency and better recall for production RAG systems. IVFFlat can be faster to build but requires tuning the number of lists and probes, and recall degrades if your cluster count is wrong."
     },
     {
       question: "What is Reciprocal Rank Fusion (RRF)?",
-      answer: "RRF is a sorting algorithm used to combine results from multiple retrieval methods (like vector search and text search). It assigns a score based on the document's rank in each result set rather than raw similarity scores, making it robust when merging different scoring scales."
+      answer: "RRF is a rank-combination algorithm used to merge results from multiple retrieval methods. It assigns a score based on a document's rank in each result set using the formula 1/(k+rank), where k=60 is the standard constant. Unlike score-based fusion, RRF is robust to differences in scoring scales between vector similarity and BM25 relevance."
+    },
+    {
+      question: "How do I handle multilingual documents?",
+      answer: "For multilingual content, use a multilingual embedding model (e.g. BAAI/bge-m3 or Cohere embed-multilingual-v3.0) and create a language-aware tsvector using the appropriate dictionary (e.g. to_tsvector('french', content)). Consider storing the detected language per document and routing keyword search to the correct dictionary."
     },
     {
       question: "Can I use other embedding dimensions?",
-      answer: "Yes, you can define `vector(N)` where N is your embedding dimension. For example, Cohere embeddings might be `vector(1024)`, while open-source models might use `vector(384)` or `vector(768)`."
+      answer: "Yes, you can define vector(N) where N is your embedding dimension. For example, Cohere embeddings might be vector(1024), while open-source models might use vector(384) or vector(768). The dimension is fixed at table creation — changing it requires recreating the column and re-embedding all documents."
     }
   ]}
 />
 
-By combining these methods into a cohesive PostgreSQL hybrid search RAG pipeline, you dramatically improve the precision of your AI application!
+## Production Checklist
+
+Before going live with your hybrid RAG pipeline:
+
+- ☑ Set `hnsw.ef_search = 100` (or higher) on your connection pool — the default 40 sacrifices too much recall
+- ☑ Verify query plan uses the HNSW index with `EXPLAIN ANALYZE`
+- ☑ Run `VACUUM ANALYZE documents` after bulk inserts to update statistics
+- ☑ Store `metadata` (source URL, section, date) in `jsonb` for post-retrieval filtering
+- ☑ Add `WHERE metadata @> '{"source": "docs"}'::jsonb` to filter by source before ranking
+- ☑ Monitor embedding API latency separately from DB query latency in your observability stack
+- ☑ Set `statement_timeout` on hybrid search queries to avoid slow queries blocking your LLM pipeline
+- ☑ Use `asyncpg` connection pools (min 2, max 20) — avoid creating a new connection per request
+
+By combining these methods into a cohesive PostgreSQL hybrid search RAG pipeline, you dramatically improve the precision and reliability of your AI application.
 
 ## You Might Also Like
 
@@ -157,4 +311,3 @@ By combining these methods into a cohesive PostgreSQL hybrid search RAG pipeline
 - [Scaling Vector Search with pgvector](/en/blog/postgres-vector-search-pgvector)
 - [AI Coding Assistants: Best Practices for 2026](/en/blog/ai-coding-assistants)
 - [Cursor vs Claude Code: Which ai Coding Tool Actually Wins in 2026?](/en/blog/cursor-and-claude)
-
