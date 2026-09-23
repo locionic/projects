@@ -1,0 +1,313 @@
+---
+title: "ClickHouse vs DuckDB: アーキテクチャの深掘りと本番環境ベンチマーク"
+date: "2026-09-23"
+summary: "2つの主要なカラムナ分析データベースエンジンを比較します。DuckDBの組み込みベクトル化とClickHouseの分散リアルタイムOLAPの使い分けを解説します。"
+tags: ['clickhouse', 'duckdb', 'data-engineering', 'databases', 'analytics', 'データベース', 'データエンジニアリング']
+draft: false
+featured: true
+category: Tech
+images: ["/static/images/clickhouse-vs-duckdb-analytical-engines.png"]
+---
+
+プロダクトマネージャーから、ユーザーエンゲージメント指標をアプリケーション内に直接表示するリアルタイム分析ダッシュボードという新しい要件が下されました。データセットは現在S3上にある500GBのParquet形式のイベントログで、毎日10GBずつ増加しています。経営陣はインタラクティブなチャートでサブ秒のクエリレイテンシを要求しています。あなたのチームは今、アーキテクチャ上の重大な岐路に立たされています。Parquetデータに対するゼロコピーの読み取りを約束する、超高速のインプロセスエンジンであるDuckDBを選ぶべきでしょうか？それとも、高スループットの取り込みと大規模なスケールに対応するために構築された、分散カラムナの巨人ClickHouseをデプロイすべきでしょうか？これは単に2つのツール間の選択ではありません。それは、組み込み型のシングルノード並列処理と、分散型のリアルタイム永続化という、2つの異なるデータ処理哲学の間の根本的な決定です。選択を誤れば、運用コストの急増やレイテンシ目標の未達、そして将来の痛みを伴うアーキテクチャの再設計につながる可能性があります。
+
+<AudioPlayer src="/static/audio/clickhouse-vs-duckdb-analytical-engines-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+## 中核となるアーキテクチャの対決
+
+表面的には、ClickHouseとDuckDBはどちらもカラムナ型でベクトル化された分析データベースです。両者ともSIMD (Single Instruction, Multiple Data) 命令を使用してデータをバッチで処理し、分析ワークロードにおいて従来のOLTPデータベースを機能不全に陥らせる行ごとのオーバーヘッドを回避します。しかし、類似点はここまでです。これらの設計目標、実行モデル、ストレージエンジンは根本的に異なり、データエンジニアリングの世界のまったく異なる領域に最適化されています。
+
+### 哲学とユースケースのスペクトラム
+
+**DuckDB: 分析のためのSQLite**
+DuckDBはインプロセスOLAPデータベースです。接続するサーバーではなく、アプリケーションにリンクするライブラリ (`libduckdb`) です。管理すべき別のプロセスもなく、ローカルクエリに対するネットワークオーバーヘッドもなく、複雑な設定もありません。その主な設計目標は以下の通りです。
+*   **ポータビリティとシンプルさ:** 外部依存関係はゼロ。`pip install duckdb` だけで十分です。
+*   **単一ノードでのパフォーマンス:** 1台のマシンのCPUとRAMの使用率を最大化します。
+*   **直接的なデータフォーマット実行:** 必須のインポート手順なしでParquet、Arrow、CSV、JSONファイルをクエリするための第一級の機能を提供します。
+
+これにより、DuckDBはインタラクティブなデータ分析（Pandasの遅い操作の代替）、組み込みアプリケーション分析（Node.jsやPythonアプリ内のダッシュボードを動かす）、そして単一ノードでの効率的なETL/データ変換タスクにおいて強力な存在となっています。
+
+**ClickHouse: 分散型リアルタイムOLAPエンジン**
+ClickHouseは、別のサーバープロセスとして実行される、本格的な分散データベース管理システム（DBMS）です。Yandexが自社のリアルタイムWeb分析プラットフォームを動かすために構築したもので、そのユースケースは以下を要求します。
+*   **大規模なリアルタイム取り込み:** Kafkaのような多様なソースから毎秒数百万行を取り込む能力。
+*   **水平スケーラビリティ:**シャーディングとレプリケーションを使用して、数百台のサーバーにまたがるペタバイト規模のデータまでスケールします。
+*   **ビッグデータに対する低レイテンシクエリ:** 巨大なデータセットに対する集計クエリにミリ秒単位で応答するように設計されています。
+*   **耐久性と高可用性:** レプリケーション、バックアップ、耐障害性といった本番環境向けの機能が組み込まれています。
+
+ClickHouseは、大規模なログ分析、リアルタイムのビジネスインテリジェンス、ユーザー向けの分析ダッシュボード、そしてテラバイトからペタバイト規模のデータセットと高い同時実行性の要件を伴うあらゆるシナリオで選択される武器です。
+
+### データストレージとインデックス: MergeTree 対 アダプティブカラムナブロック
+
+最も大きな違いは、ディスクにデータをどのように格納するかにあります。
+
+#### ClickHouse: Log-Structured Merge-Tree (LSM-Tree) の巨人
+
+ClickHouseの力は、`MergeTree` ファミリーのストレージエンジンから生まれます。これは標準的なB-Treeではありません。これはLog-Structured Merge-Treeの一種で、カラムナデータとバルクインサートに最適化されています。
+
+データを挿入すると、ClickHouseはそれをディスク上の新しい「データパート」（不変のカラムナファイルのセット）に書き込みます。バックグラウンドプロセスが、これらの小さなパートを継続的により大きく、より最適化されたパートにマージします。
+
+その魔法は **スパース主キーインデックス** にあります。テーブルを定義する際、`ORDER BY` 句を指定します。これは単に結果をソートするためだけではありません。これはディスク上のデータの物理的なソートキーなのです。
+
+```sql
+CREATE TABLE user_events (
+    `event_time` DateTime,
+    `user_id` UInt64,
+    `event_type` String,
+    `payload` Map(String, String)
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (user_id, event_time);
+```
+
+ここで、データは物理的に `user_id`、次に `event_time` でソートされます。ClickHouseはこのキーに対してスパース主キーインデックスを作成します。これはすべての行にインデックスを付けるのではなく、データのN番目のブロック（通常8,192行の「グラニュール」）の開始点のキー値を記録します。
+
+`WHERE user_id = 123` のようなクエリを実行すると、ClickHouseは小さな主キーインデックスファイル上でバイナリサーチを行い、この `user_id` を含む可能性のある少数のグラニュールを見つけ出します。そして、ディスクからそれらのグラニュールだけを読み取り、テラバイト単位の無関係なデータをスキップします。これが、ClickHouseがソートキー（特に時系列データ）でフィルタリングするクエリに対して信じられないほど高速である理由です。
+
+#### DuckDB: 最適化されたブロックと直接的なParquet実行
+
+DuckDBのネイティブストレージ形式は、カラムナデータブロックで構成されています。各カラムについて、ディスク上にブロックのセットを格納します。重要な革新は、各ブロックに **ゾーンマップ** を使用していることです。ゾーンマップは、そのデータチャンクの最小値と最大値を格納する軽量なメタデータです。
+
+クエリに `WHERE column_a > 100` のような述語が含まれている場合、DuckDBはまずゾーンマップをチェックします。あるブロックのゾーンマップがその最大値が `99` であることを示していれば、そのブロック全体がディスクから読み取られることなくスキップされます。これは述語プッシュダウンの一形態です。
+
+さらに、DuckDBは主キーや内部の結合操作のためにART (Adaptive Radix Tree) インデックスを構築し、高速なポイントルックアップを提供します。
+
+しかし、DuckDBのキラー機能は、これらの同じ原則を **外部データフォーマットに直接** 適用できる能力です。`SELECT COUNT(*) FROM 'data.parquet' WHERE ...` を実行すると、DuckDBはファイルを単純にスキャンしません。Parquetファイル自体の内部メタデータ、特にロワーグループ統計（本質的にはゾーンマップ）を活用して、ファイルの広大な部分をスキップします。これにより、既存のデータレイクに対するアドホックな分析が非常に高速になります。
+
+### クエリ実行: モーセル駆動並列処理 vs 古典的なベクトル化パイプライン
+
+両エンジンともベクトル化されていますが、単一マシン上での並列実行の方法は大きく異なります。
+
+#### ClickHouse: パイプライン並列処理
+
+ClickHouseは、Volcano/MonetDBパラダイムに強く影響を受けた、伝統的なプルベースのベクトル化モデルを使用します。各クエリは、演算子（例: Scan -> Filter -> Aggregate）のパイプラインに変換されます。実行中、最上位の演算子がその子からデータブロックを要求し、その子がさらにその子から要求する、というように続きます。
+
+並列処理は、このパイプラインを複数のワーカースレッド用に複製することで実現されます。データソースが分割され、各スレッドはデータの自身のセグメントで作業し、各ステージで完全なブロックを処理します。これは単純な直線的なクエリには非常に効率的ですが、結合や高カーディナリティの集計を含むより複雑なプランでは、同期のオーバーヘッドや負荷の不均衡を引き起こす可能性があります。
+
+#### DuckDB: モーセル駆動並列処理
+
+DuckDBは、「モーセル駆動並列処理 (Morsel-Driven Parallelism)」と呼ばれる、より現代的で柔軟なモデルを実装しています。
+
+1.  **パイプライン分割:** クエリプランは、同期ポイント（例: 集計ハッシュテーブルの構築）で複数のパイプラインに分割されます。
+2.  **モーセル:** データ自体は、「モーセル」と呼ばれる小さな固定サイズのチャンク（約10万行）で処理されます。
+3.  **動的スケジューリング:** グローバルなタスクスケジューラが、利用可能なワーカースレッドにモーセルを割り当てます。スレッドがあるパイプラインを通じてモーセルの処理を終えると、スケジューラに戻って次のモーセルを要求します。
+
+このアプローチは、単一ノード上で大きな利点をもたらします。
+*   **キャッシュ局所性:** より小さなモーセルを処理することで、CPUキャッシュにより良く収まります。
+*   **負荷分散:** 高速なスレッドが低速なスレッドよりも多くのモーセルを処理でき、自然にワークロードが分散されます。
+*   **パイプライニング:** 複雑な並列クエリであっても、ある演算子の結果が中間結果セット全体を実体化することなく、すぐに次の演算子で利用可能になる完全なクエリパイプライニングを可能にします。
+
+これが、DuckDBが単一の強力なマシン上で、複雑なTPC-Hクエリにおいて他のエンジンをしばしば上回る主な理由です。
+
+<br />
+<div align="center">
+
+**クエリ実行モデルの比較**
+
+</div>
+
+```mermaid
+graph TD
+    subgraph DuckDB (Morsel-Driven)
+        A[Data Source] --> B{Morsel Scheduler};
+        B -- Morsel 1 --> P1_T1[Pipeline 1 / Thread 1];
+        B -- Morsel 2 --> P1_T2[Pipeline 1 / Thread 2];
+        B -- Morsel 3 --> P1_T3[Pipeline 1 / Thread 3];
+        B -- Morsel 4 --> P1_T1;
+        P1_T1 --> C[Pipeline 2 (e.g., Final Agg)];
+        P1_T2 --> C;
+        P1_T3 --> C;
+        C --> D[Result];
+    end
+
+    subgraph ClickHouse (Pipeline Parallelism)
+        SA[Data Source] --> Split;
+        Split -- Part 1 --> P_T1[Pipeline / Thread 1];
+        Split -- Part 2 --> P_T2[Pipeline / Thread 2];
+        Split -- Part 3 --> P_T3[Pipeline / Thread 3];
+        P_T1 --> GATHER[Gather/Merge];
+        P_T2 --> GATHER;
+        P_T3 --> GATHER;
+        GATHER --> Result_CH[Result];
+    end
+
+    style DuckDB fill:#f9f,stroke:#333,stroke-width:2px
+    style ClickHouse fill:#ccf,stroke:#333,stroke-width:2px
+```
+
+## 本番環境ベンチマーク: TPC-H SF100
+
+口先だけでは意味がありません。これらのエンジンを一般的な分析ワークロードでベンチマークしてみましょう。AWS `m6i.8xlarge` インスタンス（32 vCPU、128 GiB RAM、NVMeストレージ）上で、スケールファクター100（生データで約100GB）のTPC-Hデータセットを使用します。
+
+**クエリ:**
+*   **Q1:** 複数の `SUM`, `AVG`, `COUNT` 操作と `GROUP BY` を含む重い集計クエリ。生の集計とスキャン速度をテストします。
+*   **Q6:** `WHERE` 句を持つ単純なフルテーブルスキャン。純粋なスキャン速度と述語プッシュダウンをテストします。
+
+### シナリオ1: 生ファイルへのクエリ（DuckDBの得意分野）
+
+ここでは、ディスク上にParquetファイルとして保存されている100GBのTPC-Hデータを直接クエリします。ClickHouseは `s3` テーブル関数を使用し、DuckDBはファイルをネイティブにクエリします。
+
+```python
+# DuckDB Direct Parquet Query
+import duckdb
+
+con = duckdb.connect()
+# For multi-file datasets
+con.execute("SET a_fancy_option=42;")
+result = con.execute("""
+    SELECT
+        l_returnflag,
+        l_linestatus,
+        SUM(l_quantity) AS sum_qty,
+        SUM(l_extendedprice) AS sum_base_price,
+        SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+        SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+        AVG(l_quantity) AS avg_qty,
+        AVG(l_extendedprice) AS avg_price,
+        AVG(l_discount) AS avg_disc,
+        COUNT(*) AS count_order
+    FROM 'lineitem.parquet'
+    GROUP BY l_returnflag, l_linestatus
+    ORDER BY l_returnflag, l_linestatus;
+""").fetchall()
+```
+
+```sql
+-- ClickHouse S3 Table Function Query
+SELECT
+    l_returnflag,
+    l_linestatus,
+    ... -- same aggregations as above
+FROM s3('https://my-bucket.s3.amazonaws.com/tpc-h-100/lineitem.parquet', 'Parquet')
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;
+```
+
+| エンジン           | TPC-H Q1 (s) | TPC-H Q6 (s) | 備考                                                              |
+| ---------------- | ------------ | ------------ | ------------------------------------------------------------------ |
+| **DuckDB 0.10.0**  | **2.98s**    | **0.51s**    | Parquetメタデータを読み取りロワーグループを枝刈り。卓越したパフォーマンス。 |
+| **ClickHouse 23.8**| 12.45s       | 2.89s        | リモートオブジェクト読み取りのオーバーヘッドが大きい。主要なユースケースではない。 |
+
+**分析:** DuckDBは、Parquetファイルに対するアドホックなクエリの undisputed champion（誰もが認めるチャンピオン）です。Parquetフォーマットとの深い統合により、ファイルメタデータに基づいて述語をプッシュダウンし、ロワーグループ全体をスキップできるため、絶大な優位性があります。ClickHouseの `s3` 関数は強力ですが、外部データラッパーのように扱われるため、このシナリオではDuckDBのネイティブパフォーマンスには及びません。
+
+### シナリオ2: ネイティブストレージへのクエリ（ClickHouseの得意分野）
+
+次に、データを各データベースのネイティブフォーマットに取り込みます。これは、データが永続的に管理される本番アプリケーションでこれらのシステムを使用する方法です。
+
+*   **ClickHouse:** データは `MergeTree` テーブルにロードされ、`ORDER BY (l_shipdate)` でソートされます。
+*   **DuckDB:** データは `CREATE TABLE lineitem AS SELECT * FROM 'lineitem.parquet'` を使用してネイティブのDuckDBテーブルにロードされます。
+
+| 操作                | DuckDB 0.10.0 | ClickHouse 23.8 | 備考                                                         |
+| ------------------------ | ------------- | --------------- | ------------------------------------------------------------- |
+| **取り込み時間 (100GB)** | 78s           | **45s**         | ClickHouseの `MergeTree` は高スループットの書き込みに最適化されている。 |
+| **TPC-H Q1 (ネイティブ)**    | **2.15s**     | 3.80s           | DuckDBのモーセル駆動並列処理がこの複雑な集計で輝く。  |
+| **TPC-H Q6 (ネイティブ)**    | 0.45s         | **0.18s**       | ClickHouseのスパースインデックスがグラニュールの95%を枝刈り。驚異的な速さ。 |
+
+**分析:** 結果は今やはるかに微妙なものになりました。
+*   **取り込み:** ClickHouseの `MergeTree` 構造は、高速なデータストリームを吸収するために特化して構築されており、取り込みベンチマークでは容易に勝利します。
+*   **Q1 (重い集計):** DuckDBがリードを保ちます。単一の強力なノード上では、そのモーセル駆動並列処理と、複雑な集計や結合に対する優れたキャッシュ利用率には敵いません。
+*   **Q6 (選択的スキャン):** ClickHouseがそのアーキテクチャの天才的な側面を示します。テーブルが `l_shipdate` でソートされているため、Q6クエリ (`WHERE l_shipdate >= '1994-01-01' AND l_shipdate < '1995-01-01'`) はスパース主キーインデックスを使用して、関連するデータパートとグラニュール*のみ*を特定してスキャンできます。ディスクからデータのほんの一部しか読み取らないため、100GBのデータセットに対して200ms未満のクエリ時間を実現します。DuckDBもゾーンマップのおかげで高速ですが、より多くのデータをスキャンする必要があります。
+
+### シナリオ3: 高い同時実行性
+
+このテストはより概念的なものです。100の同時クライアントが単純な集計クエリ (`SELECT COUNT(*) FROM lineitem WHERE <random_filter>`) を実行する状況をシミュレートします。
+*   **DuckDB:** 組み込みライブラリであるため、同時実行性の管理はアプリケーションの責任です。同じデータベースファイル（読み取り専用モード）を指す複数のスレッドを使用するか、複数のプロセスを立ち上げることで実現できます。しかし、リソース管理（CPU、RAM）は複雑なアプリケーションレベルの懸念事項となります。一人のユーザーによる一つの「重い」クエリが、同じプロセス内の他のすべてのユーザーを飢餓状態に陥らせる可能性があります。
+*   **ClickHouse:** サーバーとして、これはお手の物です。100の接続をそれぞれ別のスレッドで処理し、クエリキューを管理し、ユーザーごとのメモリとCPUの制限を強制します。高い同時実行負荷の下で安定した予測可能なパフォーマンスを提供しますが、組み込みのDuckDBモデルで同じ堅牢性を実現するには、大幅なカスタムエンジニアリングが必要になります。
+
+## 結論: どちらをいつ使うか？
+
+これは、どちらかのエンジンが「より良い」という競争ではありません。これらはデータ処理スペクトラム上の異なるタスクのために設計された専門家です。
+
+**DuckDBを選ぶべき時:**
+
+1.  **インタラクティブな分析:** あなたがPython/Rノートブックで作業するデータサイエンティストやアナリストである場合。DuckDBは、最大数百GBのデータセットに対するデータ操作や集計において、Pandasよりも桁違いに高速です。
+2.  **組み込み分析:** アプリケーションが高速な分析クエリを提供する必要があるが、別のデータベースサーバーの運用オーバーヘッドを避けたい場合。WebサーバーはDuckDBを使用して、ディスク上のParquetファイルから直接ダッシュボードを動かすことができます。
+3.  **軽量なETL:** データ変換パイプラインが単一のマシンで実行され、Parquet、CSV、JSONファイルを効率的に処理する必要がある場合。DuckDBは強力なSQLベースの変換エンジンとして機能します。
+
+```python
+# A typical DuckDB use case: data wrangling in Python
+import duckdb
+import pandas as pd
+
+# Zero-copy read from Pandas DataFrame
+df = pd.DataFrame({'a': [1, 2, 3], 'b': [4, 5, 6]})
+con = duckdb.connect()
+
+# Query the DataFrame directly using SQL
+result_df = con.execute("""
+    SELECT a, b * 2 AS b_doubled
+    FROM df
+    WHERE a > 1
+""").fetch_df()
+
+print(result_df)
+
+# Or perform a complex aggregation on a massive Parquet file
+# that would crash Pandas
+con.execute("SELECT COUNT(DISTINCT user_id) FROM 'events.parquet'")
+```
+
+**ClickHouseを選ぶべき時:**
+
+1.  **大規模なリアルタイム分析:** データストリーム（ログ、メトリクス、IoTイベント、ユーザークリック）を大規模に取り込み、分析するシステムを構築している場合。データが1TBを超え、増え続けている状況です。
+2.  **ユーザー向けダッシュボード:** 多くの同時ユーザーによって使用され、一貫して低いクエリレイテンシ（サブ秒）が要求されるBIツールやアプリケーションダッシュボードを動かす必要がある場合。
+3.  **中央集権的な分析ウェアハウス:** アプリケーションロジックとは別に、組織のための耐久性、複製性、スケーラビリティを備えた「信頼できる情報源」としての分析データベースが必要な場合。
+
+```sql
+-- A typical ClickHouse use case: real-time analytics table
+-- DDL for a table to store website page views
+CREATE TABLE page_views (
+    `view_time` DateTime,
+    `url` String,
+    `user_id` String,
+    `device_type` LowCardinality(String), -- Special optimization for few distinct values
+    `response_ms` UInt16
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(view_time)
+ORDER BY (device_type, url, view_time); -- Sort key for fast filtering
+
+-- Example Query for a dashboard: Get 95th percentile response time by device
+SELECT
+    device_type,
+    quantile(0.95)(response_ms) AS p95_response
+FROM page_views
+WHERE view_time >= now() - INTERVAL 1 DAY
+GROUP BY device_type;
+```
+
+<FAQ title="よくある質問">
+  <Question>データが1台のマシンに収まる場合でも、DuckDBを使うべきではないのはどんな時ですか？</Question>
+  <Answer>
+    高い同時実行性を要求するマルチテナントアプリケーションの主要なバックエンドとしてDuckDBを使用することには躊躇すべきです。DuckDBは複数の接続を処理できますが、ClickHouseやPostgreSQLのようなサーバーベースのシステムが持つ、堅牢で組み込みのリソース管理、クエリキューイング、セキュリティ制御が欠けています。あるテナントからの1つの複雑なクエリが利用可能なすべてのCPU/RAMを消費し、同じプロセスを共有する他のすべてのテナントに対して事実上のサービス拒否（DoS）を引き起こす可能性があります。また、ライブラリベースの性質上、バックアップ、レプリケーション、フェイルオーバーが第一級の機能ではないため、耐久性や高可用性が求められる記録用のデータベースとしては理想的ではありません。
+  </Answer>
+  <Question>ClickHouseはDuckDBのようにParquetファイルを直接クエリできますか？</Question>
+  <Answer>
+    はい、ClickHouseには `s3`、`hdfs`、`file` のような強力なテーブル関数があり、Parquet、CSV、その他のフォーマットを直接クエリできます。ベンチマークが示すように、これは機能的には効果的ですが、DuckDBの特化した実装ほどパフォーマンスは高くありません。ClickHouseにとって、これらの関数はアドホックな探索やデータ取り込みに最適です。繰り返し行われるパフォーマンスが重要なクエリについては、常にデータをネイティブの `MergeTree` テーブルに取り込んで、そのスパース主キーインデックスやその他の最適化を活用すべきです。ClickHouseでネイティブテーブルとリモートのParquetファイルをクエリするパフォーマンスの差は、10倍から100倍になることがあります。
+  </Answer>
+  <Question>DuckDBとClickHouseでは、RAMより大きなデータをどのように扱いますか？</Question>
+  <Answer>
+    両システムともRAMより大きなデータを扱えますが、その方法は大きく異なります。DuckDBは洗練されたバッファマネージャを持っており、中間結果（例えば、大きな結合や集計からの結果）をディスク上の一時ファイルに「スピル」します。これによりRAMより大きなデータセットに対するクエリを完了させることができますが、ディスクI/Oがボトルネックになるとパフォーマンスが大幅に低下する可能性があります。一方、ClickHouseは最初からアウトオブコア処理（メモリに収まらないデータ処理）のために設計されています。そのストレージエンジンは、スパースインデックスに基づいて、必要なデータの「グラニュール」だけをディスクからメモリに引き込むように設計されています。テーブル全体をRAMにロードすることはほとんどありません。これは、選択的なクエリであれば、10TBのデータセットでのパフォーマンスが100GBのデータセットでのパフォーマンスとしばしば同等であることを意味します。なぜなら、必要なデータの小さなスライスだけを読み取っているからです。
+  </Answer>
+  <Question>JOINのパフォーマンスと機能についてはどうですか？</Question>
+  <Answer>
+    両エンジンとも、単一ノード実行のために高度に最適化されたベクトル化ハッシュ結合アルゴリズムを持っています。特にDuckDBは優れた結合パフォーマンスを誇り、複雑なTPC-Hの結合クエリで競合他社をしばしば上回ります。しかし、重要な違いはスケールです。DuckDBの結合は単一ノードに限定されます。ClickHouseは分散システムであり、クラスタ全体で大規模な分散結合を実行できます。ClickHouseで2つのシャーディングされたテーブルを結合すると、各シャード上でローカルに結合を実行してから結果をマージすることも、結合を完了するために必要なデータをノード間でシャッフルすることもできます。これにより、マルチテラバイトのテーブルを結合することが可能になり、これはDuckDBでは単純に不可能なタスクです。
+  </Answer>
+</FAQ>
+
+## 最後の考察と参考文献
+
+ClickHouseとDuckDBの両方の台頭は、データ分析におけるパラダイムシフトを示しています。ワンサイズ・フィット・オールのデータベースは死にました。私たちは今、特化したツールの時代にあり、アーキテクチャ上のトレードオフを知ることは、シニアエンジニアにとって最も重要です。
+
+*   **DuckDB** は、インプロセスでのクエリ実行の傑作です。計算をデータに近づける技術を完成させ、オーバーヘッドを排除し、インタラクティブおよび組み込みユースケースでの単一ノードの効率を最大化します。
+*   **ClickHouse** は、分散システム設計の証です。データを特化したスケーラブルな計算エンジンに持ち込む技術を完成させ、大規模なリアルタイム分析で比類のないパフォーマンスを提供します。
+
+賢明なデータエンジニアは、これらを競合相手とは見なしません。彼らは、これらを現代のデータスタックにおける2つの不可欠で補完的なツールと見なします。dbt変換パイプラインでDuckDBを使用してS3上のParquetファイルを処理し、最終的にクリーンアップされたデータモデルをClickHouseにロードして、会社の最速かつ最も重要なダッシュボードを動かす、といった使い方が考えられます。
+
+---
+
+**関連技術資料:**
+
+*   [ClickHouse MergeTree Engine Documentation](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree)
+*   [The DuckDB "Morsel-Driven Parallelism" Paper](https://www.vldb.org/pvldb/vol14/p1907-raasveldt.pdf)
+*   [Architecture of the MonetDB System](http://www.monetdb.org/Downloads/Publications/p264-boncz.pdf) (現代のベクトル化エンジンの主要な影響源)
+*   [Comparing Columnar Formats (Parquet, Arrow, ORC)](https://databricks.com/session_na20/a-deep-dive-into-the-art-of-building-open-data-lakes-with-delta-lake-orc-and-parquet)

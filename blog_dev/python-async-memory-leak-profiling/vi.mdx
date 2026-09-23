@@ -1,0 +1,295 @@
+---
+title: 'Profiling rò rỉ bộ nhớ trong ứng dụng Python Async ở môi trường Production'
+images:
+  - '/static/images/python-async-memory-leak-profiling-featured.jpg'
+  - '/static/images/python-async-memory-leak-profiling-event-loop.jpg'
+  - '/static/images/python-async-memory-leak-profiling-tracemalloc.jpg'
+  - '/static/images/python-async-memory-leak-profiling-memray.jpg'
+  - '/static/images/python-async-memory-leak-profiling-patterns.jpg'
+date: '2026-07-29'
+tags: ["python", "asyncio", "memory-leaks", "profiling", "rò-rỉ-bộ-nhớ"]
+draft: false
+proficiencyLevel: "Advanced"
+programmingLanguage: "Python"
+summary: 'Xác định, phân tích và sửa lỗi rò rỉ bộ nhớ trong các vòng lặp asyncio, coroutine chạy dài, và các tác vụ nền của Python bằng cách sử dụng tracemalloc và công cụ trực quan hóa Memray.'
+authors: ['default']
+category: Tech
+---
+
+Nếu bạn đã từng vận hành một dịch vụ Python bất đồng bộ có độ tương tranh cao trên môi trường production, có lẽ bạn đã từng chứng kiến biểu đồ bộ nhớ từ từ tăng lên cho đến khi trình điều phối (orchestrator) của bạn cuối cùng phải tiêu diệt pod bằng một OOM killer (mã thoát 137).
+
+<AudioPlayer src="/static/audio/python-async-memory-leak-profiling-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+Mặc dù bộ dọn rác (garbage collector) của Python dọn dẹp các chu trình tham chiếu (reference cycles) tiêu chuẩn, event loop của asyncio lại tạo ra những cách tinh vi để giữ lại bộ nhớ. Các task không được await, các future chạy nền thiếu callback, và các iterator bất đồng bộ không được đóng sẽ âm thầm "ghim" các đối tượng vào trạng thái nội bộ của event loop.
+
+**Tham khảo chẩn đoán nhanh:**
+
+| Triệu chứng | Nguyên nhân gốc | Công cụ chẩn đoán | Cách khắc phục |
+| :--- | :--- | :--- | :--- |
+| RSS tăng sau khi thoát vòng lặp sớm | Frame của generator `async def` bị treo | `tracemalloc.take_snapshot()` | `contextlib.aclosing()` hoặc `await gen.aclose()` tường minh |
+| Pod bị OOM kill khi chịu tải | Các task không được await trong `asyncio.all_tasks()` | Dump `asyncio.all_tasks(loop)` | `asyncio.TaskGroup` hoặc loại bỏ tham chiếu mạnh khỏi set |
+| Bộ nhớ vẫn ở mức cao sau khi task hoàn thành | Phân mảnh bộ nhớ `pymalloc` của CPython | `memray run --live` | Thiết lập `MALLOC_TRIM_THRESHOLD_` hoặc tái khởi động worker |
+| Ngoại lệ không được xử lý tiêu thụ RAM | Các frame traceback bị ghim trong đối tượng task | Ghi log bằng `sys.unraisablehook` | Lấy ngoại lệ một cách tường minh hoặc dùng task callback |
+
+<Callout type="info" title="Cẩm nang về Concurrency & Profiling trong Môi trường Production">
+  Bạn đang tìm kiếm một hướng dẫn kiến trúc hoàn chỉnh về concurrency trong môi trường production, task group trong asyncio, so sánh threading và multiprocessing, và profiling bộ nhớ? Hãy đọc chương toàn diện của chúng tôi [High-Performance Concurrency and Profiling Chapter](/en/courses/modern-python-course/lessons/04-high-performance-concurrency-and-profiling) trong loạt bài Modern Python Series.
+</Callout>
+
+## Nguyên nhân gốc rễ: Tại sao asyncio giữ lại các đối tượng không được thu dọn
+
+Các vòng lặp asyncio của Python tích tụ các đối tượng bị rò rỉ chủ yếu khi các task không được await, các tham chiếu vòng tròn trong async generator, hoặc các callback của event loop không được đóng giữ lại các tham chiếu mạnh (strong references) trong bộ nhớ heap.
+
+![Rò rỉ bộ nhớ trong Event Loop](/static/images/python-async-memory-leak-profiling-event-loop.jpg)
+
+Khi một task bất đồng bộ bắt đầu thực thi bên trong một event loop đang hoạt động, bộ lập lịch (scheduler) sẽ đăng ký các tham chiếu mạnh đến đối tượng task cơ bản bên trong tập hợp các task đang chạy của nó. Nếu một worker chạy nền sinh ra các coroutine mà không thu thập hoặc await kết quả của chúng một cách hợp lệ, những task đó sẽ vẫn được đăng ký trong bộ nhớ ngay cả sau khi xử lý xong. Event loop không thể thu dọn rác (garbage collect) các frame của task đã hoàn thành khi các trình xử lý ngoại lệ tùy chỉnh hoặc các kết quả chưa được lấy giữ lại tham chiếu đến các biến cục bộ của frame. Ngoài ra, các generator bất đồng bộ được tạo bằng `async def` duy trì các tham chiếu đến frame generator nội bộ cho đến khi được đóng hoặc duyệt hết một cách tường minh bởi vòng lặp gọi nó. Khi các nhà phát triển không đóng các generator này đúng cách trong các trường hợp thoát vòng lặp sớm, CPython sẽ giữ toàn bộ frame thực thi bị ghim trong RAM vô thời hạn.
+
+Hãy xem xét một API gateway thông lượng cao xử lý các khối payload trực tuyến (streaming) thông qua một vòng lặp generator bất đồng bộ:
+
+```python
+import asyncio
+import gc
+from typing import AsyncGenerator
+
+class PayloadBuffer:
+    def __init__(self, data_chunk: bytes) -> None:
+        self.data_chunk = data_chunk
+        self.processed = False
+        self.metadata: dict[str, str] = {"origin": "gateway_ingress", "status": "buffered"}
+
+async def stream_payload_chunks(raw_stream: list[bytes]) -> AsyncGenerator[PayloadBuffer, None]:
+    for chunk in raw_stream:
+        buffer = PayloadBuffer(chunk)
+        # Nguy hiểm: Nếu consumer ngắt sớm, frame của generator này sẽ không được thu dọn và tồn tại trong bộ nhớ
+        yield buffer
+        buffer.processed = True
+
+async def leaky_request_handler(payload_chunks: list[bytes]) -> None:
+    gen = stream_payload_chunks(payload_chunks)
+    async for item in gen:
+        if item.data_chunk.startswith(b"ABORT"):
+            # Việc break sớm khiến frame của generator bị treo trong bộ nhớ mà không được hoàn tất
+            print("Aborting stream processing immediately due to invalid chunk payload header")
+            break
+```
+
+Trong đoạn mã trên, việc thoát khỏi vòng lặp `async for` bằng `break` để lại instance của generator bị tạm dừng giữa chừng. Vì frame của generator giữ tham chiếu đến các đối tượng `PayloadBuffer` và các biến stream cục bộ, các chu kỳ garbage collection không thể thu hồi bộ nhớ đó cho đến khi vòng lặp kết thúc. Khi hàng ngàn yêu cầu bị ngắt sớm do lỗi xác thực hoặc client ngắt kết nối, các frame generator tích tụ sẽ tiêu thụ hàng trăm megabyte bộ nhớ RSS của tiến trình. Nếu dịch vụ của bạn xử lý hàng chục ngàn yêu cầu mỗi giờ, mẫu rò rỉ bộ nhớ này sẽ nhanh chóng tiêu thụ hết bộ nhớ hệ thống có sẵn.
+
+Để ngăn chặn vector rò rỉ cụ thể này, các dịch vụ production phải đảm bảo rằng tất cả các generator bất đồng bộ đều thực hiện việc dọn dẹp cuối cùng (finalization) một cách tường minh bằng cách sử dụng `aclose` hoặc context manager. Ngoài ra, các nhà phát triển không nên để các task chạy nền không được theo dõi mà không đính kèm các callback hoàn thành task để dọn dẹp các tham chiếu khi quá trình thực thi kết thúc. Khi xây dựng các kiến trúc máy chủ linh hoạt, việc hiểu các quy tắc về vòng đời tham chiếu này là điều bắt buộc đối với các kỹ sư backend.
+
+Hiểu được biểu diễn nội bộ của các task asyncio giúp làm rõ tại sao các future không được await vẫn tồn tại qua các tick của event loop. Mỗi instance của task chứa một từ điển tham chiếu tường minh bao gồm các frame traceback, biến cục bộ, cấu trúc contextvars và chi tiết ngoại lệ. Khi một ngoại lệ không được bắt xảy ra trong một task chạy nền mà không có ai await nó, CPython sẽ giữ lại đối tượng traceback để in ra khi task đó được garbage collect. Tuy nhiên, nếu bản thân task vẫn được tham chiếu trong một registry toàn cục hoặc một bảng callback của event loop đang hoạt động, quá trình garbage collection đó sẽ không bao giờ xảy ra. Do đó, các cấu trúc payload lớn được tham chiếu bên trong frame của task sẽ bị kẹt trong bộ nhớ vô thời hạn.
+
+Một nguồn rò rỉ bộ nhớ thường gặp khác liên quan đến việc sử dụng không đúng cách các đối tượng `asyncio.Queue` trong các kiến trúc worker pool. Khi các producer đẩy các mục vào queue nhanh hơn các task consumer có thể xử lý chúng, các queue không được quản lý sẽ phình to đến kích thước khổng lồ. Ngay cả khi các consumer cuối cùng bắt kịp, bộ cấp phát bộ nhớ nội bộ của Python cũng không ngay lập tức giải phóng bộ nhớ đã được trả lại cho hệ điều hành chủ. Việc hiểu ranh giới giữa bộ cấp phát heap `pymalloc` nội bộ của Python và các trình quản lý bộ nhớ cấp hệ thống là rất cần thiết khi diễn giải các biểu đồ bộ nhớ trên production.
+
+## Xác định các generator frame bị treo bằng tracemalloc
+
+Tracemalloc xác định các frame của async generator không được thu dọn bằng cách chụp các ảnh chụp nhanh (snapshot) của các cấp phát heap và so sánh sự khác biệt về bộ nhớ giữa các chu kỳ garbage collection.
+
+![Profiling Async bằng Tracemalloc](/static/images/python-async-memory-leak-profiling-tracemalloc.jpg)
+
+Module `tracemalloc` tiêu chuẩn của Python ghi lại các traceback cho mọi đối tượng được cấp phát trên heap của Python khi được khởi tạo sớm trong quá trình thực thi ứng dụng. Bằng cách chụp các snapshot cơ sở sau khi ứng dụng khởi động xong và so sánh chúng với các snapshot được chụp sau khi thực hiện các bài kiểm tra tải, các nhà phát triển có thể xác định chính xác số dòng mã nguồn gây ra việc tích tụ các khối bộ nhớ. Đối với các ứng dụng bất đồng bộ, việc lọc các snapshot theo tên tệp module cụ thể sẽ cô lập các ứng cử viên rò rỉ khỏi chi phí hoạt động thông thường của event loop. Bằng cách phân tích sự thay đổi cấp phát bộ nhớ theo từng dòng, các kỹ sư có thể phân biệt giữa các đợt tăng đột biến bộ nhớ tạm thời và các rò rỉ bộ nhớ dai dẳng.
+
+Đây là một tiện ích profiling production hoàn chỉnh theo dõi sự gia tăng cấp phát qua các chu kỳ thực thi bất đồng bộ:
+
+```python
+import asyncio
+import tracemalloc
+import linecache
+import gc
+from typing import Any
+
+class AsyncMemoryProfiler:
+    def __init__(self, top_n: int = 10) -> None:
+        self.top_n = top_n
+        self.snapshot_before: tracemalloc.Snapshot | None = None
+
+    def start(self) -> None:
+        tracemalloc.start(25)
+        self.snapshot_before = tracemalloc.take_snapshot()
+
+    def compare_with_baseline(self) -> list[str]:
+        if self.snapshot_before is None:
+            raise RuntimeError("Profiler wasn't started prior to baseline comparison execution")
+        
+        # Buộc chạy garbage collection trước khi chụp snapshot hiện tại
+        gc.collect()
+        snapshot_after = tracemalloc.take_snapshot()
+        stats = snapshot_after.compare_to(self.snapshot_before, "lineno")
+        
+        report_lines: list[str] = []
+        for stat in stats[:self.top_n]:
+            frame = stat.traceback[0]
+            filename = frame.filename
+            line_number = frame.lineno
+            line_text = linecache.getline(filename, line_number).strip()
+            size_kb = stat.size_diff / 1024
+            count_diff = stat.count_diff
+            report_lines.append(
+                f"File: {filename}:{line_number} | Diff: {size_kb:+.2f} KB | Objects: {count_diff:+} | Code: {line_text}"
+            )
+        return report_lines
+```
+
+Thực thi profiler này trong các lần lặp của bài kiểm tra tải sẽ phơi bày các nguồn cấp phát tăng đều đặn theo lưu lượng truy cập:
+
+```python
+async def run_profiling_suite() -> None:
+    profiler = AsyncMemoryProfiler(top_n=5)
+    profiler.start()
+    
+    # Mô phỏng việc xử lý 5000 yêu cầu streaming đồng thời trong các vòng lặp worker
+    for iteration in range(5000):
+        fake_chunks = [b"HEADER_START", b"DATA_CHUNK_001", b"ABORT_SIGNAL_TRIGGER"]
+        await leaky_request_handler(fake_chunks)
+        
+    results = profiler.compare_with_baseline()
+    print("
+--- Memory Allocation Delta Report Summary ---")
+    for entry in results:
+        print(entry)
+```
+
+Phân tích các báo cáo của `tracemalloc` cho thấy các điểm cấp phát chính xác nơi các đối tượng generator, frame từ điển và các cấp phát chuỗi tồn tại giữa các yêu cầu. Khi `tracemalloc` cho thấy sự gia tăng đều đặn về số lượng cấp phát cho các dòng khởi tạo generator, các nhà phát triển có thể ngay lập tức xác nhận rò rỉ do generator không được đóng mà không cần phải gắn các debugger nặng nề từ bên ngoài. Việc tích hợp các kiểm tra `tracemalloc` tự động vào bộ tích hợp liên tục (CI suite) của bạn sẽ ngăn chặn các lỗi hồi quy rò rỉ bộ nhớ tiếp cận môi trường staging.
+
+Tuy nhiên, `tracemalloc` chỉ ghi lại các cấp phát được thực hiện thông qua các bộ cấp phát bộ nhớ tiêu chuẩn của Python (`PyMem_Malloc` và `PyObject_Malloc`). Nếu ứng dụng của bạn sử dụng các C extension hoặc các thư viện được biên dịch gốc bỏ qua các bộ cấp phát của Python, `tracemalloc` sẽ bỏ lỡ hoàn toàn các cấp phát đó. Xây dựng một quy trình profiling hoàn chỉnh đòi hỏi phải kết hợp `tracemalloc` với các bộ cấp phát hệ thống gốc khi làm việc với các C extension hiệu suất cao.
+
+Khi kiểm tra đầu ra của `tracemalloc`, hãy chú ý đến cấu hình độ sâu traceback. Theo mặc định, `tracemalloc` chỉ ghi lại một stack frame cho mỗi lần cấp phát để giảm thiểu chi phí hiệu năng. Tăng độ sâu frame lên hai mươi lăm frame cho phép các kỹ sư truy vết việc khởi tạo đối tượng trở lại các trình xử lý ứng dụng cấp cao qua các điểm yield bất đồng bộ. Mặc dù việc ghi lại traceback sâu hơn làm tăng nhẹ mức sử dụng bộ nhớ của profiling, nó cung cấp khả năng hiển thị ngữ cảnh quan trọng khi gỡ lỗi các chuỗi gọi bất đồng bộ phức tạp.
+
+Trong các microservice dựa trên sự kiện phức tạp, việc lọc sự khác biệt của snapshot theo các mẫu tệp cụ thể của miền ứng dụng giúp cô lập các lỗi ứng dụng khỏi các cấp phát của framework bên thứ ba. Bằng cách bỏ qua các frame của thư viện chuẩn và các vòng lặp nội bộ của web framework, các kỹ sư tập trung trực tiếp vào logic nghiệp vụ tùy chỉnh nơi rò rỉ bắt nguồn. Kết hợp các bộ lọc miền với tổng hợp thống kê được nhóm theo số dòng sẽ mang lại các bản tóm tắt gỡ lỗi rõ ràng, có thể hành động.
+
+## Phân tích C extension và sự phình to của heap bằng Memray
+
+Memray theo dõi sự phình to bộ nhớ bất đồng bộ của C-extension gốc bằng cách profiling các cấp phát bộ nhớ ở cấp độ C cùng với các stack frame của Python để làm nổi bật các C-buffer không được quản lý.
+
+![Profiling C Extension bằng Memray](/static/images/python-async-memory-leak-profiling-memray.jpg)
+
+Các thư viện gốc như `numpy`, `pyarrow`, `grpc`, hoặc các C-extension tùy chỉnh cấp phát bộ nhớ trực tiếp thông qua `malloc` của hệ thống hoặc các bộ cấp phát C++ tùy chỉnh. Khi các worker bất đồng bộ truyền các buffer dữ liệu vào các C extension mà không giải phóng tường minh các con trỏ cơ bản, bộ nhớ của tiến trình sẽ tăng nhanh chóng mặc dù `tracemalloc` báo cáo việc sử dụng heap của Python ổn định. Memray móc nối vào cả nội bộ của trình thông dịch Python và các ký hiệu cấp phát bộ nhớ cấp thấp để xây dựng các flamegraph thống nhất về phân phối bộ nhớ qua ranh giới C và Python. Khả năng này làm cho Memray trở nên vô giá khi gỡ lỗi các driver cơ sở dữ liệu bất đồng bộ hoặc các máy chủ suy luận học máy.
+
+Để profile một tiến trình máy chủ bất đồng bộ bằng Memray trong môi trường production hoặc staging, hãy khởi chạy ứng dụng bằng trình bao bọc CLI của Memray:
+
+```bash
+# Chạy dịch vụ bất đồng bộ dưới trình bao bọc profiling của Memray với giám sát trực tiếp
+memray run --live --output async_profile.bin -m uvicorn app.main:app --port 8000 --workers 1
+```
+
+Trong khi chế độ profiling trực tiếp cung cấp phản hồi ngay lập tức trên console, việc tạo các báo cáo HTML tương tác cho phép kiểm tra chi tiết các call stack qua các khoảng thời gian:
+
+```bash
+# Tạo hình ảnh hóa flamegraph tương tác từ tập dữ liệu ghi nhị phân
+memray flamegraph async_profile.bin -o memray_flamegraph.html
+
+# Tạo báo cáo dạng bảng được lọc theo ngưỡng kích thước cấp phát
+memray table async_profile.bin -o memray_table.html
+```
+
+Khi xem xét đầu ra của Memray cho các ứng dụng bất đồng bộ, hãy đặc biệt chú ý đến các cấp phát được thực hiện bên trong các worker thread hoặc các callback của C-extension. Bảng sau tóm tắt các khác biệt hoạt động chính giữa `tracemalloc` và `Memray` cho các quy trình gỡ lỗi bất đồng bộ:
+
+| Khía cạnh tính năng | Python Tracemalloc | Memray C Profiler |
+| :--- | :--- | :--- |
+| Chi phí Profiling | Thấp (làm chậm thực thi 5% đến 15%) | Trung bình (làm chậm thực thi 15% đến 35%) |
+| Theo dõi C Extension | Không hỗ trợ (chỉ cấp phát heap của Python) | Hỗ trợ đầy đủ (Theo dõi malloc và calloc gốc) |
+| Trực quan hóa đầu ra | Tóm tắt văn bản trên console và danh sách thống kê | Flamegraph HTML tương tác và bản đồ 3D |
+| Khả năng sử dụng trên Production | Rất an toàn cho môi trường staging trực tiếp | Phù hợp nhất cho các lần kiểm tra tải và staging |
+| Độ sâu Stack Frame | Độ sâu truy vết theo số dòng có thể cấu hình | Độ sâu call stack C và Python thống nhất hoàn chỉnh |
+
+Sử dụng Memray cùng với `tracemalloc` mang lại cho các nhóm khả năng hiển thị toàn diện về cả việc giữ lại đối tượng Python cấp cao và rò rỉ C-buffer cấp thấp trong các pipeline bất đồng bộ. Khi các nhóm kết hợp cả hai công cụ, họ tạo ra một khuôn khổ chẩn đoán toàn diện có khả năng xác định bất kỳ sự bất thường nào về việc giữ lại bộ nhớ trên toàn bộ stack phần mềm.
+
+Việc theo dõi cấp phát gốc của Memray tiết lộ các lỗi tinh vi trong các thư viện C hiệu suất cao mà các công cụ Python tiêu chuẩn hoàn toàn bỏ qua. Ví dụ, khi sử dụng `pyarrow` để xử lý các bản ghi IPC trực tuyến bên trong một endpoint bất đồng bộ, các trình đọc batch bản ghi không được đóng sẽ cấp phát các buffer bộ nhớ C++ gốc không bao giờ được đăng ký trong các lệnh gọi `sys.getsizeof()`. Memray làm nổi bật các khối bộ nhớ gốc này trực tiếp trên flamegraph của nó, chỉ cho các nhà phát triển đến đúng destructor C++ bị thiếu hoặc handle của Arrow table chưa được giải phóng.
+
+Ngoài ra, Memray bao gồm các chế độ theo dõi chuyên biệt cho các ứng dụng bất đồng bộ đa luồng và đa tiến trình. Khi chạy các máy chủ web như Uvicorn hoặc Gunicorn với nhiều tiến trình worker, Memray có thể ghi lại các cấp phát trên tất cả các instance worker cùng một lúc. Phân tích các báo cáo worker tổng hợp giúp ngăn chặn các tình huống mà rò rỉ bộ nhớ chỉ xuất hiện dưới các cấu hình cân bằng tải cụ thể hoặc các điều kiện race condition đa tiến trình.
+
+## Các mẫu thiết kế để tránh rò rỉ bộ nhớ với async generator và background task
+
+Bạn nên cấu trúc các async generator không rò rỉ bộ nhớ bằng cách bao bọc việc khởi tạo tài nguyên bên trong các khối try-finally và dọn dẹp tường minh các iterator chưa đóng bằng các lệnh gọi aclose.
+
+![Các mẫu thiết kế Async không rò rỉ bộ nhớ](/static/images/python-async-memory-leak-profiling-patterns.jpg)
+
+Cơ chế an toàn nhất để quản lý vòng đời của async generator là sử dụng `contextlib.aclosing` hoặc xây dựng các asynchronous context manager tùy chỉnh. Trình trợ giúp `aclosing` đảm bảo rằng ngay cả khi một consumer ngắt sớm khỏi vòng lặp `async for`, phương thức `aclose()` của generator sẽ được gọi ngay lập tức khi thoát khỏi context. Điều này kích hoạt việc thực thi bất kỳ khối `finally` nào bên trong frame của generator, giải phóng các tham chiếu bị giữ và đóng các socket mạng đúng cách. Việc triển khai mẫu này trên tất cả các endpoint streaming đảm bảo rằng việc ngắt kết nối client đột ngột không để lại các đối tượng generator lơ lửng trong bộ nhớ.
+
+Đây là phiên bản đã được tái cấu trúc, không rò rỉ bộ nhớ của bộ xử lý payload streaming của chúng ta trước đó:
+
+```python
+import asyncio
+from contextlib import aclosing
+from typing import AsyncIterator
+
+async def resilient_stream_processor(raw_chunks: list[bytes]) -> AsyncIterator[bytes]:
+    # Async generator linh hoạt với đảm bảo dọn dẹp tường minh trong khối try finally
+    try:
+        for chunk in raw_chunks:
+            # Nhường quyền kiểm soát cho bên gọi trong khi vẫn đảm bảo an toàn dọn dẹp
+            yield chunk
+    finally:
+        # Khối này thực thi một cách đáng tin cậy khi generator.aclose() được gọi bởi bên gọi
+        print("Cleaning up stream processing generator frame resources cleanly")
+
+async def safe_request_handler(payload_chunks: list[bytes]) -> None:
+    # Bao bọc async iterator bên trong trình bao bọc context manager aclosing
+    async with aclosing(resilient_stream_processor(payload_chunks)) as stream:
+
+        async for chunk in stream:
+            if chunk.startswith(b"ABORT"):
+                print("Safely exiting stream processing via context manager finalization")
+                break
+```
+
+Ngoài việc sử dụng `aclosing`, các dịch vụ chạy các task asyncio nền nên theo dõi các future đang hoạt động bằng cách sử dụng một registry quản lý task. Khi các task nền hoàn thành, registry sẽ loại bỏ các tham chiếu task bằng cách sử dụng các callback hoàn thành:
+
+```python
+class TaskRegistry:
+    def __init__(self) -> None:
+        self._active_tasks: set[asyncio.Task[Any]] = set()
+
+    def spawn_tracked_task(self, coroutine: Any) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coroutine)
+        self._active_tasks.add(task)
+        # Tự động loại bỏ tham chiếu task khi callback hoàn thành được kích hoạt
+        task.add_done_callback(self._active_tasks.discard)
+        return task
+
+    async def shutdown(self) -> None:
+        if self._active_tasks:
+            print(f"Cancelling pending background tasks count: {len(self._active_tasks)}")
+            for task in self._active_tasks:
+                task.cancel()
+            await asyncio.gather(*self._active_tasks, return_exceptions=True)
+```
+
+Việc áp dụng quản lý task có cấu trúc và các async generator được quản lý bằng context giúp loại bỏ phần lớn các lỗi giữ lại bộ nhớ trong các microservice asyncio trên production. Các kỹ sư phần mềm thiết lập các mẫu kiến trúc này trong toàn bộ nhóm kỹ thuật của họ sẽ duy trì nhất quán dấu chân bộ nhớ RSS của tiến trình ở mức thấp ngay cả dưới các đợt tăng đột biến lưu lượng nghiêm trọng.
+
+Khi chọn một ASGI framework cho các dịch vụ này, kiến trúc của framework ảnh hưởng lớn đến bộ nhớ cơ bản trên mỗi worker. Xem [so sánh benchmark FastAPI và Litestar của chúng tôi](/en/blog/fastapi-vs-litestar-comparison) để biết dấu chân bộ nhớ trên mỗi worker và thông lượng. Khi triển khai lên môi trường container, hãy xây dựng runtime của bạn với [Astral uv trong các bản dựng Docker đa giai đoạn](/en/blog/python-uv-package-manager-guide) để giữ cho các image cơ sở gọn nhẹ.
+
+Để đảm bảo sự ổn định lâu dài trong các microservice khối lượng lớn, các nhóm phần mềm phải tích hợp profiling bộ nhớ tự động vào các pipeline tích hợp liên tục của họ. Chạy các bài kiểm tra tải trên môi trường staging với `tracemalloc` được bật cho phép các nhà phát triển phát hiện các lỗi hồi quy về cấp phát trước khi mã nguồn đến máy chủ production. Ngoài ra, việc đặt giới hạn bộ nhớ RSS nghiêm ngặt bên trong các nền tảng điều phối container như Kubernetes đảm bảo rằng bất kỳ sự tích tụ bộ nhớ bất ngờ nào cũng sẽ kích hoạt việc khởi động lại pod một cách có kiểm soát thay vì gây ra các lỗi nút xếp chồng trên các cụm microservice.
+
+Thiết lập các runbook vận hành rõ ràng để xử lý sự cố bộ nhớ đảm bảo rằng các nhóm kỹ thuật phản ứng hiệu quả khi có cảnh báo về bộ nhớ. Khi một cảnh báo cho thấy việc sử dụng bộ nhớ ngày càng tăng trong một container production, các kỹ sư nên ngay lập tức chụp một heap snapshot bằng cách sử dụng một endpoint chẩn đoán được nhúng trước khi khởi động lại instance dịch vụ. Việc kiểm tra các heap snapshot được chụp trực tiếp từ các node production đang hoạt động cung cấp bằng chứng không thể chối cãi về cấu trúc dữ liệu nào đã gây ra sự phình to bộ nhớ.
+
+Cuối cùng, hãy thiết kế các pipeline dữ liệu bất đồng bộ của bạn để thực thi các giới hạn trên về độ sâu queue nội bộ và các semaphore tương tranh. Các queue không giới hạn và các worker task không được điều tiết vẫn là nguyên nhân vận hành chính gây ra sự phình to bộ nhớ bất ngờ dưới các đợt tăng tải đột ngột. Bằng cách kết hợp các queue có giới hạn với các registry task tường minh và các async generator được quản lý bằng context, bạn sẽ xây dựng các ứng dụng Python linh hoạt có khả năng chạy vô thời hạn mà không bị suy giảm bộ nhớ.
+
+
+
+## Các bài viết bạn có thể quan tâm
+
+- [Optimizing Python FastAPI for High-Concurrency](/en/blog/optimizing-fastapi-high-concurrency)
+- [FastAPI vs Litestar (2026): Performance, Benchmarks & When to Switch](/en/blog/fastapi-vs-litestar-comparison)
+- [FastAPI vs Celery: When to Use BackgroundTasks vs Distributed Task Queues](/en/blog/fastapi-vs-celery-background-tasks)
+- [A Practical List of Annoying Click Tasks—and How to Automate Them with Python](/en/blog/python-practice-automation)
+
+
+## Tham khảo kỹ thuật và xử lý sự cố
+
+### Duy trì RSS của tiến trình sau khi Task hoàn thành
+Python sử dụng các vùng bộ nhớ (memory pool) nội bộ tùy chỉnh được quản lý bởi pymalloc để xử lý hiệu quả các cấp phát đối tượng nhỏ. Khi các đối tượng được garbage collect bên trong các vòng lặp asyncio, pymalloc giải phóng bộ nhớ trở lại các pool nội bộ của Python thay vì trả lại các trang cho nhân hệ điều hành. Do đó, các công cụ hệ thống như `top` hoặc `ps` báo cáo việc sử dụng bộ nhớ RSS cao ngay cả khi heap nội bộ của Python đã thu hồi không gian đó cho các cấp phát trong tương lai.
+
+### Các Frame Traceback bị ghim do ngoại lệ không được xử lý
+Khi một task chạy nền gây ra một ngoại lệ không được xử lý và không được await, đối tượng ngoại lệ sẽ lưu trữ một tham chiếu đến frame traceback thực thi của nó. Frame traceback này giữ lại các tham chiếu đến tất cả các biến cục bộ, đối số và các đối tượng trung gian có mặt khi lỗi xảy ra. Trừ khi một thành phần khác await task đó hoặc trích xuất ngoại lệ, các đối tượng đó sẽ bị ghim trong bộ nhớ vô thời hạn.
+
+### Sử dụng Weakref cho các bộ đệm Async
+Sử dụng `weakref.WeakValueDictionary` hoặc `weakref.WeakKeyDictionary` ngăn chặn các triển khai cache trong bộ nhớ khỏi việc ghim các đối tượng vô thời hạn. Khi các đối tượng được cache không còn có tham chiếu mạnh ở nơi khác trong ứng dụng, garbage collection sẽ tự động loại bỏ chúng khỏi các từ điển tham chiếu yếu, tránh các lỗi dọn dẹp cache thủ công.
+
+### Giữ lại bộ nhớ do Queue không giới hạn trong Worker Pool
+Các asyncio queue không được đóng giữ các tham chiếu mạnh đến tất cả các payload của mục được đệm bên trong cấu trúc deque nội bộ của chúng. Nếu các worker task bị lỗi hoặc thoát ra mà không làm rỗng queue, các payload của mục còn lại và các biến ngữ cảnh liên quan sẽ tồn tại trong bộ nhớ cho đến khi chính đối tượng queue được garbage collect.
+
+### Garbage Collection tường minh và tái sử dụng bộ nhớ của pymalloc
+Nhìn chung, nên tránh các lệnh gọi tường minh đến `gc.collect()` trong các đường dẫn nóng (hot path) của production vì việc garbage collection toàn bộ sẽ tạm dừng thực thi event loop. Tuy nhiên, việc gọi `gc.collect()` định kỳ bên trong các vòng lặp bảo trì nền chuyên dụng hoặc ngay sau khi hoàn thành các công việc hàng loạt lớn giúp dọn dẹp các tham chiếu vòng tròn trước khi xảy ra phân mảnh heap.
+
+### RSS của tiến trình và cấp phát bộ nhớ Heap
+Resident Set Size (RSS) đo lường tổng RAM vật lý được cấp phát cho tiến trình bởi nhân hệ điều hành, bao gồm cả các thư viện C và các buffer gốc. Bộ nhớ heap được đo bằng các công cụ như `tracemalloc` chỉ theo dõi các đối tượng Python được quản lý trực tiếp bởi bộ cấp phát của runtime CPython.

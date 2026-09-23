@@ -1,0 +1,345 @@
+---
+title: 'Tối ưu hóa Docker BuildKit với Cache Mount & Multi-Stage (Hướng dẫn 2026)'
+images:
+  - '/static/images/docker-buildkit-cache-mount-optimization-featured.jpg'
+  - '/static/images/docker-buildkit-cache-mount-optimization-architecture.jpg'
+  - '/static/images/docker-buildkit-cache-mount-optimization-multistage.jpg'
+  - '/static/images/docker-buildkit-cache-mount-optimization-cache-mounts.jpg'
+  - '/static/images/docker-buildkit-cache-mount-optimization-remote-cache.jpg'
+  - '/static/images/docker-buildkit-cache-mount-optimization-secret-mounts.jpg'
+date: '2026-07-29'
+tags: ["docker", "devops", "cicd", "tối ưu hóa docker", "hướng dẫn docker"]
+draft: false
+proficiencyLevel: "Intermediate"
+programmingLanguage: "Go"
+summary: 'Tăng tốc build Docker bằng cách sử dụng cache mount của BuildKit, target multi-stage, và backend cache từ xa qua S3/registry cho các container Go, Node.js, và Rust.'
+authors: ['default']
+category: Tech
+---
+
+Mỗi lần một thành viên trong nhóm của chúng tôi push một thay đổi CSS chỉ vỏn vẹn hai dòng, pipeline GitHub Actions của chúng tôi lại bị đình trệ suốt 14 phút. Thủ phạm chính là cơ chế cache layer tiêu chuẩn của Docker: chỉ một file mã nguồn bị sửa đổi cũng làm mất hiệu lực các layer phía sau, buộc Docker phải tải lại hàng trăm megabyte package và biên dịch lại các dependency từ đầu trong mỗi lần chạy.
+
+<AudioPlayer src="/static/audio/docker-buildkit-cache-mount-optimization-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+Bằng cách kích hoạt Docker BuildKit và thêm các cache mount bền bỉ (`--mount=type=cache`), chúng tôi đã giảm thời gian build từ 14 phút xuống chỉ còn 42 giây.
+
+Đây là những gì đã thất bại với các lần build Docker truyền thống, sự khác biệt trong đồ thị thực thi của BuildKit, và cấu hình Dockerfile multi-stage chính xác mà chúng tôi sử dụng cho Go, Node, và Rust.
+
+<Callout type="info" title="Series Kỹ thuật: Bộ công cụ Python Hiện đại">
+  Bạn đang xây dựng các container Python hiệu suất cao với Docker BuildKit? Hãy tìm hiểu cách tận dụng Astral uv để giải quyết virtualenv trong chưa đầy một giây, tạo lockfile tất định và CI cực nhanh trong [Chương về Bộ công cụ Python Hiện đại](/en/courses/modern-python-course/lessons/03-the-modern-python-tooling-stack) của chúng tôi.
+</Callout>
+
+## Kiến trúc BuildKit và Thực thi DAG Đồng thời
+
+BuildKit cải thiện hiệu suất build container so với các builder cũ bằng cách xây dựng một Đồ thị Không tuần hoàn Có hướng (DAG) các bước build để thực thi đồng thời các stage build độc lập, đồng thời bỏ qua các target build không được tham chiếu. Builder Docker cũ đánh giá các chỉ thị Dockerfile một cách tuần tự nghiêm ngặt từ trên xuống dưới, thực thi từng bước trên một luồng build duy nhất. Ngược lại, BuildKit phân tích Dockerfile của bạn thành một cây cú pháp Biểu diễn Trung gian Cấp thấp (LLB) nội bộ, cho phép engine của nó chạy song song các stage biên dịch độc lập và loại bỏ hoàn toàn các stage trung gian không sử dụng.
+
+![Kiến trúc BuildKit và Đồ thị Thực thi](/static/images/docker-buildkit-cache-mount-optimization-architecture.jpg)
+
+Khi BuildKit phân tích một đồ thị chỉ thị, nó xác định các dependency giữa các bước build riêng lẻ và thực thi đồng thời các stage không phụ thuộc vào nhau. Ví dụ, nếu một Dockerfile multi-stage xây dựng một ứng dụng web frontend trong một stage và một service Go backend trong một stage khác, BuildKit sẽ biên dịch cả hai target ứng dụng song song trên các lõi CPU có sẵn. Hơn nữa, nếu target build của bạn chỉ tham chiếu đến image binary của backend, BuildKit sẽ bỏ qua hoàn toàn stage build frontend, giúp tiết kiệm chu kỳ tính toán và băng thông mạng.
+
+Để kích hoạt BuildKit trên các phiên bản Docker Engine trước 23.0, hãy đặt `DOCKER_BUILDKIT=1` trong môi trường của bạn hoặc cấu hình trong tệp cấu hình Docker daemon:
+
+```json
+{
+  "features": {
+    "buildkit": true
+  }
+}
+```
+
+Các bản cài đặt Docker Desktop và CLI hiện đại kích hoạt BuildKit theo mặc định thông qua `docker buildx`, cung cấp các tùy chọn dòng lệnh mở rộng để quản lý các bản build đa kiến trúc, các instance build và các backend cache từ xa.
+
+Dưới đây là so sánh cấu trúc cho thấy sự khác biệt về đồ thị thực thi giữa các bản build Docker cũ và thực thi DAG của BuildKit:
+
+```
++-----------------------------------------------------------------------------------+
+| Builder Docker Cũ (Thực thi Tuần tự Tuyến tính)                                   |
+| [Bước 1: FROM] ---> [Bước 2: RUN apt-get] ---> [Bước 3: COPY] ---> [Bước 4: RUN]  |
++-----------------------------------------------------------------------------------+
+
++-----------------------------------------------------------------------------------+
+| Engine BuildKit (Cây Thực thi DAG Đồng thời)                                      |
+|               /---> [Stage 1: Build App Go] ---------\                            |
+| [Bước 1: LLB]                                         ===> [Stage 3: Image Cuối]  |
+|               \---> [Stage 2: Build Web Assets] ------/                           |
++-----------------------------------------------------------------------------------+
+```
+
+## Cô lập Multi-Stage: Môi trường Build và Image Runtime
+
+Build multi-stage làm giảm dung lượng container runtime bằng cách tách biệt môi trường biên dịch nặng nề khỏi image thực thi runtime tối giản trong cùng một file Dockerfile. Việc biên dịch các ứng dụng hiện đại đòi hỏi các SDK, trình biên dịch, file header và các công cụ build cồng kềnh như GCC, Go toolchains, hoặc các gói npm của Node mà không cần thiết sau khi quá trình biên dịch binary hoàn tất. Việc đưa các công cụ build này vào image container cuối cùng của bạn làm tăng kích thước image lên hàng gigabyte và khiến môi trường production của bạn đối mặt với các lỗ hổng bảo mật không cần thiết.
+
+![Mô hình Build Multi-Stage và Cô lập Target](/static/images/docker-buildkit-cache-mount-optimization-multistage.jpg)
+
+Với build multi-stage, bạn định nghĩa nhiều chỉ thị `FROM` trong cùng một Dockerfile. Các stage ban đầu đóng vai trò là môi trường builder tạm thời được trang bị đầy đủ các toolchain biên dịch. Stage cuối cùng sử dụng một base image tối giản như `alpine`, `distroless`, hoặc `scratch` và chỉ sao chép các artifact binary đã biên dịch từ các stage builder trước đó bằng cách sử dụng `COPY --from=<stage-name>`.
+
+Hãy để tôi cho bạn thấy một Dockerfile multi-stage được tối ưu hóa cho một microservice Go giúp giảm kích thước image cuối cùng từ 800MB xuống còn 15MB:
+
+```dockerfile
+# Chỉ thị cú pháp cần thiết cho các tính năng của BuildKit
+# syntax=docker/dockerfile:1.7
+
+# Stage 1: Môi trường Build
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+
+# Cài đặt chứng chỉ bảo mật và git
+RUN apk add --no-cache git ca-certificates
+
+# Sao chép các tệp manifest dependency trước để tối đa hóa cache layer
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Sao chép mã nguồn và biên dịch binary được liên kết tĩnh
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/server ./cmd/api
+
+# Stage 2: Runtime Production Tối giản
+FROM scratch
+
+# Sao chép chứng chỉ gốc SSL từ builder
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# Sao chép binary đã biên dịch từ builder
+COPY --from=builder /app/server /server
+
+EXPOSE 8080
+ENTRYPOINT ["/server"]
+```
+
+Trong thiết lập multi-stage cho production này, stage cuối cùng kế thừa từ `scratch`, không chứa bất kỳ file hệ điều hành, tiện ích shell, hoặc trình quản lý gói nào. Image kết quả chỉ chứa binary Go đã được biên dịch tĩnh và các chứng chỉ gốc SSL, cung cấp một bề mặt tấn công tối thiểu và thời gian pull để triển khai cực kỳ nhanh trên các cluster Kubernetes của bạn.
+
+## Cache Mount cho Trình quản lý Gói: Node, Go, và Python
+
+Bạn sử dụng cache mount của BuildKit cho các trình quản lý gói bằng cách thêm cờ `--mount=type=cache` vào các lệnh `RUN`, giúp lưu trữ bền bỉ các thư mục cache như `~/.cache/go-build`, `~/.npm`, hoặc `/root/.cache/pip` qua các lần build liên tiếp. Theo mặc định, mỗi bước `RUN` trong Dockerfile được thực thi trong một hệ thống tệp container cô lập. Khi các trình quản lý gói tải xuống dependency hoặc biên dịch các file object, những file được cache đó sẽ bị loại bỏ khi bước `RUN` hoàn tất, buộc các lần build tiếp theo phải tải lại các kho lưu trữ package mỗi khi file mã nguồn thay đổi.
+
+![Tích hợp Cache Mount cho Trình quản lý Gói](/static/images/docker-buildkit-cache-mount-optimization-cache-mounts.jpg)
+
+Cache mount của BuildKit giải quyết vấn đề này bằng cách mount trực tiếp các thư mục lưu trữ lâu dài trên host vào container build trong quá trình thực thi lệnh `RUN`. Các volume cache này tồn tại qua nhiều lần gọi build trên node build, cho phép các trình quản lý gói như `npm`, `pip`, `go`, `cargo`, và `apt` tái sử dụng các binary đã được cache mà không cần lưu trữ những file cache tạm thời đó vào các layer của image container cuối cùng.
+
+Đây là một Dockerfile được tối ưu hóa cho thấy các cấu hình cache mount cho môi trường Node.js, Go, và Python:
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+
+# --- Node.js npm Cache Mount
+---
+FROM node:20-alpine AS node-builder
+WORKDIR /app
+COPY package*.json ./
+# Mount thư mục cache npm để lưu trữ các tarball đã tải xuống
+RUN --mount=type=cache,target=/root/.npm     npm ci --prefer-offline
+
+# --- Go Module và Compiler Cache Mount
+---
+FROM golang:1.22-alpine AS go-builder
+WORKDIR /app
+COPY go.mod go.sum ./
+# Mount cả cache tải xuống module Go và cache của trình biên dịch
+RUN --mount=type=cache,target=/go/pkg/mod     --mount=type=cache,target=/root/.cache/go-build     go mod download
+
+# --- Python Pip Cache Mount
+---
+FROM python:3.11-slim AS python-builder
+WORKDIR /app
+COPY requirements.txt ./
+# Mount cache wheel của pip
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+```
+
+Hãy chú ý kỹ đến tham số `target=/root/.npm` được chỉ định trong dòng lệnh. Khi BuildKit thực thi `npm ci`, nó sẽ mount một volume cache bền bỉ tại `/root/.npm`. Nếu bạn thêm một package dependency mới vào `package.json`, `npm` sẽ chỉ tìm nạp duy nhất kho lưu trữ package mới đó trong khi tái sử dụng tất cả các tarball dependency đã tải xuống trước đó từ cache mount. Tối ưu hóa này giúp giảm thời gian cài đặt dependency từ vài phút xuống còn vài giây.
+
+Đối với các microservice Python, các lần cài đặt `pip` tiêu chuẩn vẫn có thể tốn nhiều thời gian để giải quyết các wheel và biên dịch các C extension. Kết hợp cache mount của BuildKit với trình quản lý gói `uv` dựa trên Rust của Astral giúp giảm thời gian đồng bộ dependency xuống mức dưới một giây. Xem hướng dẫn đầy đủ của chúng tôi về [cách sử dụng Astral uv trong các bản build Docker multi-stage](/en/blog/python-uv-package-manager-guide) để cache lockfile và tạo các runner production gọn nhẹ.
+
+Đối với các node build đa người dùng (multi-tenant) nơi nhiều dự án được build đồng thời, hãy thêm tùy chọn `id` để giới hạn phạm vi của cache mount cho các ứng dụng cụ thể (ví dụ `--mount=type=cache,id=payment-api-npm,target=/root/.npm`). Việc chia sẻ ID cache giữa các service liên quan cho phép các microservice có cùng bộ dependency chia sẻ các artifact build được cache một cách an toàn.
+
+## Backend Cache từ xa trong Pipeline CI/CD
+
+Bạn cấu hình các backend cache từ xa trong pipeline CI/CD bằng cách truyền các cờ `--cache-to` và `--cache-from` vào `docker buildx build`, xuất các cache layer build trung gian sang các container registry từ xa hoặc bộ nhớ cache của GitHub Actions. Trong khi các cache mount cục bộ tăng tốc các lần build trên một máy chủ cố định duy nhất, các runner CI/CD tạm thời (như GitHub Actions hoặc các node tạm thời của Kubernetes) lại bắt đầu với ổ đĩa cục bộ trống, làm mất trạng thái cache cục bộ giữa các lần chạy workflow.
+
+![Cache từ xa qua Registry và GitHub Actions](/static/images/docker-buildkit-cache-mount-optimization-remote-cache.jpg)
+
+Các backend cache từ xa cho phép các agent build tải lên siêu dữ liệu cache layer và các artifact build lên một registry trung tâm hoặc một bucket lưu trữ đám mây sau khi hoàn thành một bản build. Khi một runner CI/CD tạm thời mới thực thi một công việc build tiếp theo, nó sẽ truy vấn backend cache từ xa bằng `--cache-from`, chỉ tải xuống các cache layer đã thay đổi cần thiết để lắp ráp image mới.
+
+Dưới đây là bốn loại backend cache từ xa chính của BuildKit:
+
+| Loại Backend Cache | Điểm cuối Lưu trữ Target | Môi trường Sử dụng Tốt nhất | Ví dụ Cấu hình Cờ |
+| :--- | :--- | :--- | :--- |
+| **`inline`** | Nhúng trong manifest của image | Các bản build single-stage đơn giản | `--cache-to type=inline` |
+| **`registry`** | Image OCI registry chuyên dụng | Các bản build multi-stage doanh nghiệp | `--cache-to type=registry,ref=repo/cache:latest,mode=max` |
+| **`gha`** | Dịch vụ Cache của GitHub Actions | Các workflow của GitHub Actions | `--cache-to type=gha,mode=max` |
+| **`local`** | Thư mục NFS hoặc thư mục cục bộ được chia sẻ | Các runner Jenkins tại chỗ (on-premise) | `--cache-to type=local,dest=/path/to/cache` |
+
+Khi sử dụng bộ xuất cache `registry` hoặc `gha`, việc đặt `mode=max` là rất cần thiết cho các bản build multi-stage. Theo mặc định, `mode=min` chỉ xuất các layer cache cho image đầu ra cuối cùng, loại bỏ các layer của stage builder trung gian. Việc đặt `mode=max` hướng dẫn BuildKit xuất các layer cache cho tất cả các stage trong Dockerfile, đảm bảo rằng các bước biên dịch trung gian vẫn được cache đầy đủ qua các lần build.
+
+Đây là một workflow GitHub Actions hoàn chỉnh, cấp độ production, sử dụng backend cache `gha` của BuildKit:
+
+```yaml
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push with GHA Remote Cache
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/company-org/api-service:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+Workflow GitHub Actions này tự động khôi phục các layer cache của BuildKit từ dịch vụ cache của GitHub trước khi quá trình biên dịch bắt đầu. Ngay cả khi bản build của bạn được thực thi trên một node runner tạm thời hoàn toàn mới, BuildKit vẫn kéo các layer trung gian đã được biên dịch sẵn, cho phép các lần build diễn ra gần như tức thì.
+
+## Secret Mount và Chuyển tiếp SSH mà không làm rò rỉ Credential
+
+Bạn sử dụng secret mount và chuyển tiếp SSH bằng cách chỉ định `--mount=type=secret` hoặc `--mount=type=ssh` trong các lệnh `RUN` để truyền các khóa SSH riêng tư và token API vào các lệnh build mà không ghi cứng credential vào các layer của image container. Trước đây, các nhà phát triển thường truyền secret build bằng cách sử dụng các biến `ARG` hoặc biến môi trường, điều này làm rò rỉ vĩnh viễn các giá trị secret trong lịch sử siêu dữ liệu của layer image, có thể nhìn thấy qua `docker history`.
+
+![Secret Mount và Chuyển tiếp SSH của BuildKit](/static/images/docker-buildkit-cache-mount-optimization-secret-mounts.jpg)
+
+Secret mount của BuildKit mount các tệp nhạy cảm vào một hệ thống tệp tạm thời trong bộ nhớ (`tmpfs`) chỉ có thể truy cập trong quá trình thực thi của một bước `RUN` duy nhất. Khi lệnh hoàn tất, BuildKit sẽ unmount tệp secret, đảm bảo rằng các chuỗi token nhạy cảm hoặc khóa riêng tư không để lại dấu vết nào trong các layer image container cuối cùng hoặc trung gian.
+
+Đây là một ví dụ Dockerfile sử dụng secret mount để cài đặt các gói npm riêng tư và clone các kho Git riêng tư:
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+COPY package*.json ./
+
+# Mount token NPM riêng tư một cách an toàn khi chạy
+RUN --mount=type=secret,id=npm_token     NPM_TOKEN=$(cat /run/secrets/npm_token)     npm ci
+
+COPY . .
+RUN npm run build
+```
+
+Để build Dockerfile này cục bộ hoặc trong CI/CD mà không làm rò rỉ secret, hãy truyền cờ `--secret` trong quá trình thực thi build:
+
+```bash
+# Truyền secret từ biến môi trường
+export NPM_TOKEN="npm_1a2b3c4d5e6f7g8h9i0j"
+docker buildx build --secret id=npm_token,env=NPM_TOKEN -t my-app:latest .
+
+# Truyền secret từ file cục bộ
+docker buildx build --secret id=npm_token,src=./.npmrc -t my-app:latest .
+```
+
+Nếu quy trình build của bạn cần tìm nạp các module Go riêng tư hoặc git submodule qua SSH, hãy sử dụng chuyển tiếp SSH agent với `--mount=type=ssh`. Điều này hướng dẫn BuildKit chuyển tiếp socket SSH agent cục bộ của bạn vào container build, cho phép các lệnh `git clone` xác thực một cách an toàn bằng danh tính SSH cục bộ của bạn mà không cần mount các file khóa riêng tư thô vào đĩa.
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+
+RUN apk add --no-cache git openssh-client
+
+# Cho phép host key của GitHub
+RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+# Clone dependency riêng tư bằng SSH agent được chuyển tiếp
+RUN --mount=type=ssh     git clone git@github.com:company-org/private-lib.git
+```
+
+Thực thi `docker buildx build --ssh default .` sẽ chuyển tiếp phiên SSH agent đang hoạt động của bạn vào container, đảm bảo xác thực an toàn trong khi vẫn duy trì sự riêng tư hoàn toàn cho credential.
+
+## Kiểm tra và Giám sát Hiệu quả Cache Layer
+
+Bạn kiểm tra và giám sát hiệu quả cache layer của BuildKit bằng cách phân tích log đầu ra của quá trình build bằng `--progress=plain`, kiểm tra lịch sử layer bằng `docker history`, và kiểm tra dung lượng đĩa của cache build bằng `docker buildx du`. Việc giám sát tỷ lệ cache hit đảm bảo rằng thứ tự các chỉ thị Dockerfile của bạn không vô tình làm mất hiệu lực cache layer trong mỗi lần commit.
+
+Khi thực thi build, hãy truyền `--progress=plain` để xem log thực thi đầy đủ chi tiết xem BuildKit đã tải từng bước từ cache (`CACHED`) hay thực thi lại chỉ thị (`RUNNING`):
+
+```bash
+docker buildx build --progress=plain -t my-service:latest .
+```
+
+Việc xem lại đầu ra plain progress sẽ cho thấy trạng thái thực thi chính xác của từng bước:
+
+```
+#5 [builder 2/5] WORKDIR /app
+#5 CACHED
+
+#6 [builder 3/5] COPY package*.json ./
+#6 CACHED
+
+#7 [builder 4/5] RUN --mount=type=cache,target=/root/.npm npm ci
+#7 CACHED
+
+#8 [builder 5/5] COPY . .
+#8 DONE 0.4s
+```
+
+Nếu một bước hiển thị `RUNNING` thay vì `CACHED`, hãy kiểm tra các chỉ thị trước đó. Nguyên nhân phổ biến nhất gây mất hiệu lực cache là đặt `COPY . .` quá sớm trong Dockerfile. Vì các file mã nguồn thay đổi thường xuyên, việc đặt các lệnh `COPY` rộng gần đầu Dockerfile sẽ làm mất hiệu lực tất cả các cache layer tiếp theo. Luôn luôn sao chép các file lock dependency (`go.mod`, `package-lock.json`, `requirements.txt`) trước, chạy tải xuống dependency, và sao chép mã nguồn ứng dụng chính trong các bước sau.
+
+Để quản lý mức tiêu thụ đĩa trên các máy chủ build cố định, hãy sử dụng `docker buildx du` để kiểm tra dung lượng đĩa mà cache BuildKit sử dụng và `docker buildx prune` để dọn dẹp các cache build cũ:
+
+```bash
+# Kiểm tra dung lượng đĩa đang được sử dụng bởi cache BuildKit
+docker buildx du
+
+# Giải phóng dung lượng đĩa cache bằng cách xóa các cache build không sử dụng cũ hơn 7 ngày
+docker buildx prune --filter "until=168h" --force
+```
+
+Việc dọn dẹp thường xuyên các cache build cũ giúp ngăn ngừa tình trạng cạn kiệt dung lượng đĩa trên các host build được chia sẻ trong khi vẫn giữ lại các layer base image và cache mount của trình quản lý gói được sử dụng thường xuyên.
+
+## Tham khảo Kỹ thuật và Xử lý sự cố
+
+### Chỉ thị Cú pháp BuildKit
+
+Bạn kích hoạt các chỉ thị cú pháp BuildKit bằng cách thêm `# syntax=docker/dockerfile:1.7` làm dòng đầu tiên trong file Dockerfile của bạn. Chỉ thị này hướng dẫn BuildKit tải xuống và sử dụng phiên bản trình phân tích cú pháp frontend Dockerfile được chỉ định, mở khóa các tính năng nâng cao như `--mount=type=cache`, `--mount=type=secret`, và cú pháp heredoc ngay cả khi Docker daemon trên host của bạn sử dụng phiên bản trình phân tích cú pháp tích hợp cũ hơn.
+
+### Chế độ Cache từ xa: mode=min vs mode=max
+
+Sự khác biệt nằm ở chỗ các stage build nào được bao gồm trong kho lưu trữ cache từ xa được xuất ra. Chế độ `min` (mặc định) chỉ xuất các layer cache cho stage target cuối cùng của Dockerfile. Chế độ `max` xuất các layer cache cho tất cả các stage builder trung gian và các target build. Khi sử dụng build multi-stage trong CI/CD, hãy luôn đặt `mode=max` để các stage biên dịch trung gian vẫn được cache đầy đủ qua các lần build.
+
+### Lưu trữ Cache Gói vs apt-get clean
+
+Bạn không nên chạy `apt-get clean` hoặc xóa các thư mục danh sách gói khi sử dụng cache mount của BuildKit vì các lệnh đó sẽ xóa sạch chính xác các file cache của trình quản lý gói mà bạn muốn lưu trữ bền bỉ qua các lần build. Các hướng dẫn tối ưu hóa Docker truyền thống khuyến nghị dọn dẹp danh sách apt để giữ cho kích thước layer cuối cùng nhỏ. Với cache mount của BuildKit (`--mount=type=cache,target=/var/cache/apt`), các file cache tồn tại bên ngoài các layer của image cuối cùng, làm cho các lệnh dọn dẹp cache thủ công trở nên không cần thiết.
+
+### Nhiều Cache Mount trong một Lệnh RUN duy nhất
+
+Có, bạn có thể chỉ định nhiều cờ `--mount=type=cache` trong một dòng lệnh `RUN` duy nhất. Ví dụ, trong một dự án Go, bạn có thể mount đồng thời cả cache tải xuống module Go và cache của trình biên dịch Go: `RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build go build -o server .`. Điều này đảm bảo cả việc giải quyết dependency và biên dịch binary đều tái sử dụng các artifact đã được cache.
+
+### Secret Mounts vs Build ARGs
+
+Secret mount của BuildKit (`--mount=type=secret`) mount các file nhạy cảm vào một hệ thống tệp tạm thời trong bộ nhớ (`tmpfs`) trong quá trình thực thi bước mà không lưu giá trị secret vào siêu dữ liệu của layer. Các biến `ARG` của Docker truyền các giá trị vào các biến môi trường mà vẫn được lưu trữ vĩnh viễn trong siêu dữ liệu lịch sử của image, cho phép bất kỳ ai có quyền truy cập vào image container có thể trích xuất secret bằng `docker history` hoặc `docker inspect`.
+
+### Đồ thị Thực thi Multi-Stage song song
+
+Docker BuildKit phân tích Dockerfile của bạn để tạo một Đồ thị Không tuần hoàn Có hướng (DAG) các dependency của stage build. Nếu Dockerfile của bạn chứa nhiều stage `FROM` không phụ thuộc vào nhau, BuildKit sẽ biên dịch các stage đó đồng thời trên các lõi CPU có sẵn. Nếu một stage không cần thiết để build image target cuối cùng được chỉ định, BuildKit sẽ bỏ qua hoàn toàn stage đó, tối ưu hóa việc sử dụng tài nguyên.
+
+### Lựa chọn Base Image: Alpine vs Distroless vs Scratch
+
+Việc lựa chọn giữa các base image runtime phụ thuộc vào loại binary ứng dụng của bạn và yêu cầu gỡ lỗi. `Scratch` là một base image trống, lý tưởng cho các binary Go hoặc Rust được biên dịch tĩnh, tạo ra kích thước image cực nhỏ không có lỗ hổng hệ điều hành. `Distroless` chỉ chứa các runtime ngôn ngữ (như Python hoặc Java) và các dependency hệ thống mà không có các binary shell, cung cấp tính bảo mật cao. `Alpine` bao gồm một trình quản lý gói nhẹ và busybox shell, làm cho nó trở nên lý tưởng khi cần các tiện ích gỡ lỗi container.
+
+## Có thể bạn cũng thích
+
+- [Astral uv trong Docker: Build Multi-Stage, Cache BuildKit & CI Nhanh chóng](/en/blog/python-uv-package-manager-guide)
+- [FastAPI Docker Multistage Builds: Giảm 70% Kích thước Image của bạn](/en/blog/fastapi-docker-multistage-build)
+- [Tại sao Image Docker của tôi nặng 1GB (Và cách tôi thu nhỏ chúng xuống 50MB)](/en/blog/docker-image-optimization)
+- [Docker Compose cho Phát triển Cục bộ: Hướng dẫn Thiết lập Toàn diện](/en/blog/docker-compose-local-development)

@@ -1,0 +1,345 @@
+---
+title: 'Docker BuildKitのキャッシュマウントとマルチステージ最適化（2026年版ガイド）'
+images:
+  - '/static/images/docker-buildkit-cache-mount-optimization-featured.jpg'
+  - '/static/images/docker-buildkit-cache-mount-optimization-architecture.jpg'
+  - '/static/images/docker-buildkit-cache-mount-optimization-multistage.jpg'
+  - '/static/images/docker-buildkit-cache-mount-optimization-cache-mounts.jpg'
+  - '/static/images/docker-buildkit-cache-mount-optimization-remote-cache.jpg'
+  - '/static/images/docker-buildkit-cache-mount-optimization-secret-mounts.jpg'
+date: '2026-07-29'
+tags: ["docker", "devops", "cicd", "ビルド高速化", "コンテナ"]
+draft: false
+proficiencyLevel: "Intermediate"
+programmingLanguage: "Go"
+summary: 'Go、Node.js、Rustコンテナ向けに、BuildKitのキャッシュマウント、マルチステージターゲット、リモートのS3/レジストリキャッシュバックエンドを使用してDockerビルドを高速化します。'
+authors: ['default']
+category: Tech
+---
+
+私たちのチームでは、誰かが2行のCSS変更をプッシュするたびに、GitHub Actionsのパイプラインが14分間も停止するという問題に悩まされていました。原因は、標準的なDockerのレイヤーキャッシュにありました。たった一つのソースファイルが変更されただけで、後続のレイヤーが無効化され、Dockerは実行のたびに数百メガバイトのパッケージを再ダウンロードし、依存関係をゼロから再コンパイルしていたのです。
+
+<AudioPlayer src="/static/audio/docker-buildkit-cache-mount-optimization-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+Docker BuildKitを有効化し、永続的なキャッシュマウント（`--mount=type=cache`）を追加することで、そのビルド時間を14分からわずか42秒に短縮することに成功しました。
+
+本稿では、従来のDockerビルドで何が問題だったのか、BuildKitの実行グラフがどのように異なるのか、そして私たちがGo、Node、Rustで実際に使用しているマルチステージDockerfileの具体的な設定について解説します。
+
+<Callout type="info" title="エンジニアリングシリーズ：モダンPythonツーリングスタック">
+  Docker BuildKitで高性能なPythonコンテナをビルドする場合、Astral uvを活用して1秒未満のvirtualenv解決、決定論的なロックファイル、超高速なCIを実現する方法については、私たちの[モダンPythonツーリングスタックの章](/en/courses/modern-python-course/lessons/03-the-modern-python-tooling-stack)で解説しています。
+</Callout>
+
+## BuildKitのアーキテクチャとDAGの並列実行
+
+BuildKitは、従来のビルダーに比べてコンテナビルドのパフォーマンスを向上させます。これは、ビルドステップの有向非巡回グラフ（DAG）を構築し、独立したビルドステージを並列実行し、参照されないビルドターゲットをスキップすることで実現されます。従来のDockerビルダーはDockerfileの命令を上から下へと厳密にシーケンシャルに評価し、すべてのステップを単一のビルドスレッドで実行します。対照的に、BuildKitはDockerfileを内部の低レベル中間表現（LLB）の構文木にパースし、そのエンジンが独立したコンパイルステージを並列で実行し、未使用の中間ステージを完全に破棄することを可能にします。
+
+![BuildKitのアーキテクチャと実行グラフ](/static/images/docker-buildkit-cache-mount-optimization-architecture.jpg)
+
+BuildKitが命令グラフを解析する際、個々のビルドステップ間の依存関係を特定し、依存関係のないステージを同時に実行します。例えば、マルチステージDockerfileが一方のステージでフロントエンドのWebアプリをビルドし、もう一方のステージでバックエンドのGoサービスをビルドする場合、BuildKitは利用可能なCPUコア全体で両方のアプリケーションターゲットを並列にコンパイルします。さらに、ビルドターゲットがバックエンドのバイナリイメージのみを参照している場合、BuildKitはフロントエンドのビルドステージを完全にスキップし、計算サイクルとネットワーク帯域幅を節約します。
+
+23.0より前のバージョンのDocker EngineでBuildKitを有効にするには、環境変数で`DOCKER_BUILDKIT=1`を設定するか、Dockerデーモンの設定ファイルを構成します。
+
+```json
+{
+  "features": {
+    "buildkit": true
+  }
+}
+```
+
+最新のDocker DesktopおよびCLIのインストールでは、`docker buildx`を通じてBuildKitがデフォルトで有効になっています。これにより、マルチアーキテクチャビルド、ビルドインスタンス、リモートキャッシングバックエンドを管理するための拡張コマンドラインオプションが提供されます。
+
+以下は、従来のDockerビルドとBuildKitのDAG実行の実行グラフの違いを示す構造比較です。
+
+```
++-----------------------------------------------------------------------------------+
+| 従来のDockerビルダー（線形シーケンシャル実行）                                   |
+| [Step 1: FROM] ---> [Step 2: RUN apt-get] ---> [Step 3: COPY] ---> [Step 4: RUN]  |
++-----------------------------------------------------------------------------------+
+
++-----------------------------------------------------------------------------------+
+| BuildKitエンジン（DAGによる並列実行ツリー）                                       |
+|               /---> [ステージ1: Goアプリのビルド] ---------\                     |
+| [Step 1: LLB]                                         ===> [ステージ3: 最終イメージ] |
+|               \---> [ステージ2: Webアセットのビルド] ------/                     |
++-----------------------------------------------------------------------------------+
+```
+
+## マルチステージによる分離：ビルド環境 vs ランタイムイメージ
+
+マルチステージビルドは、単一のDockerfile内で、重いコンパイル環境を最小限のランタイム実行イメージから分離することにより、ランタイムコンテナのフットプリントを削減します。現代のアプリケーションのコンパイルには、GCC、Goツールチェーン、Nodeのnpmパッケージといった巨大なSDK、コンパイラ、ヘッダーファイル、ビルドツールが必要ですが、これらはバイナリのコンパイルが完了すれば不要になります。これらのビルドツールを最終的なコンテナイメージに含めると、イメージサイズがギガバイト単位に膨れ上がり、本番環境を不要なセキュリティ脆弱性に晒すことになります。
+
+![マルチステージビルドのパターンとターゲットの分離](/static/images/docker-buildkit-cache-mount-optimization-multistage.jpg)
+
+マルチステージビルドでは、単一のDockerfile内に複数の`FROM`命令を定義します。初期のステージは、完全なコンパイルツールチェーンを備えた一時的なビルダー環境として機能します。最終ステージでは、`alpine`、`distroless`、`scratch`のような最小限のベースイメージを使用し、`COPY --from=<stage-name>`を使って以前のビルダーステージからコンパイル済みのバイナリアーティファクトのみをコピーします。
+
+最終的なイメージサイズを800MBから15MBに削減する、Goマイクロサービス向けに最適化されたマルチステージDockerfileを以下に示します。
+
+```dockerfile
+# Syntax directive required for BuildKit features
+# syntax=docker/dockerfile:1.7
+
+# Stage 1: Build Environment
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+
+# Install security certificates and git
+RUN apk add --no-cache git ca-certificates
+
+# Copy dependency manifests first to maximize layer caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code and compile statically linked binary
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/server ./cmd/api
+
+# Stage 2: Minimal Production Runtime
+FROM scratch
+
+# Copy SSL root certificates from builder
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# Copy compiled binary from builder
+COPY --from=builder /app/server /server
+
+EXPOSE 8080
+ENTRYPOINT ["/server"]
+```
+
+この本番用のマルチステージ設定では、最終ステージは`scratch`から継承されます。`scratch`にはオペレーティングシステムのファイル、シェルユーティリティ、パッケージマネージャが一切含まれていません。結果として得られるイメージには、静的にコンパイルされたGoバイナリとSSLルート証明書のみが含まれ、最小限のアタックサーフェス（攻撃対象領域）と、Kubernetesクラスタ全体で非常に高速なデプロイのプルタイムを実現します。
+
+## パッケージマネージャのキャッシュマウント：Node、Go、Python
+
+BuildKitのキャッシュマウントは、`RUN`命令に`--mount=type=cache`フラグを追加することで利用でき、`~/.cache/go-build`、`~/.npm`、`/root/.cache/pip`のようなディレクトリキャッシュを連続したビルド間で永続化させます。デフォルトでは、Dockerfile内のすべての`RUN`ステップは、隔離されたコンテナファイルシステム内で実行されます。パッケージマネージャが依存関係をダウンロードしたり、オブジェクトファイルをコンパイルしたりすると、それらのキャッシュファイルは`RUN`ステップが完了した時点で破棄されてしまい、ソースコードファイルが変更されるたびに後続のビルドでパッケージアーカイブを再ダウンロードする必要がありました。
+
+![パッケージマネージャのキャッシュマウント統合](/static/images/docker-buildkit-cache-mount-optimization-cache-mounts.jpg)
+
+BuildKitのキャッシュマウントは、`RUN`命令の実行中に永続的なホストディレクトリをビルドコンテナに直接マウントすることでこの問題を解決します。これらのキャッシュボリュームは、ビルドノード上での複数のビルド呼び出しにわたって永続化するため、`npm`、`pip`、`go`、`cargo`、`apt`のようなパッケージマネージャが、一時的なキャッシュファイルを最終的なコンテナイメージレイヤーに保存することなく、キャッシュされたバイナリを再利用できるようになります。
+
+以下は、Node.js、Go、Python環境でのキャッシュマウント設定を示す最適化されたDockerfileです。
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+
+# --- Node.js npm Cache Mount
+---
+FROM node:20-alpine AS node-builder
+WORKDIR /app
+COPY package*.json ./
+# Mount npm cache directory to persist downloaded tarballs
+RUN --mount=type=cache,target=/root/.npm     npm ci --prefer-offline
+
+# --- Go Module and Compiler Cache Mount
+---
+FROM golang:1.22-alpine AS go-builder
+WORKDIR /app
+COPY go.mod go.sum ./
+# Mount both Go module download cache and compiler cache
+RUN --mount=type=cache,target=/go/pkg/mod     --mount=type=cache,target=/root/.cache/go-build     go mod download
+
+# --- Python Pip Cache Mount
+---
+FROM python:3.11-slim AS python-builder
+WORKDIR /app
+COPY requirements.txt ./
+# Mount pip wheel cache
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+```
+
+コマンドラインで指定されている`target=/root/.npm`パラメータに注意してください。BuildKitが`npm ci`を実行する際、永続的なキャッシュボリュームを`/root/.npm`にマウントします。`package.json`に新しい依存パッケージを追加した場合、`npm`は新しい単一のパッケージアーカイブのみを取得し、以前にダウンロードされたすべての依存関係のtarballはキャッシュマウントから再利用します。この最適化により、依存関係のインストール時間は数分から数秒に短縮されます。
+
+Pythonマイクロサービスの場合、標準の`pip`インストールは、ホイールの解決やC拡張機能のコンパイルにかなりの時間を費やすことがあります。BuildKitのキャッシュマウントと、AstralのRust製パッケージマネージャ`uv`を組み合わせることで、依存関係の同期時間を1秒未満に短縮できます。ロックファイルのキャッシングと軽量な本番ランナーについては、[マルチステージDockerビルドでのAstral uvの使用に関する完全ガイド](/en/blog/python-uv-package-manager-guide)を参照してください。
+
+複数のプロジェクトが同時にビルドされるマルチテナントなビルドノードでは、キャッシュマウントを特定のアプリケーションにスコープするために`id`オプションを追加します（例：`--mount=type=cache,id=payment-api-npm,target=/root/.npm`）。関連するサービス間でキャッシュIDを共有することで、同一の依存関係セットを持つマイクロサービスがキャッシュされたビルドアーティファクトを安全に共有できます。
+
+## CI/CDパイプラインにおけるリモートキャッシュバックエンド
+
+CI/CDパイプラインでリモートキャッシュバックエンドを設定するには、`docker buildx build`に`--cache-to`と`--cache-from`フラグを渡し、中間ビルドレイヤーキャッシュをリモートのコンテナレジストリやGitHub Actionsのキャッシュストレージにエクスポートします。ローカルのキャッシュマウントは単一の永続的なサーバー上でのビルドを高速化しますが、エフェメラルなCI/CDランナー（GitHub ActionsやKubernetesのエフェメラルノードなど）は空のローカルディスクで起動するため、ワークフローの実行ごとにローカルのキャッシュ状態が失われます。
+
+![リモートレジストリとGitHub Actionsのキャッシング](/static/images/docker-buildkit-cache-mount-optimization-remote-cache.jpg)
+
+リモートキャッシュバックエンドを使用すると、ビルドエージェントはビルド完了時にレイヤーキャッシュのメタデータとビルドアーティファクトを中央のレジストリやクラウドストレージバケットにアップロードできます。新しいエフェメラルなCIランナーが後続のビルドジョブを実行する際、`--cache-from`でリモートキャッシュバックエンドに問い合わせ、新しいイメージの組み立てに必要な変更されたレイヤーキャッシュのみをダウンロードします。
+
+以下は、BuildKitの4つの主要なリモートキャッシュバックエンドタイプです。
+
+| キャッシュバックエンドタイプ | ターゲットストレージエンドポイント | 最適なユースケース環境 | 設定フラグの例 |
+| :--- | :--- | :--- | :--- |
+| **`inline`** | イメージマニフェストに埋め込み | 単純なシングルステージビルド | `--cache-to type=inline` |
+| **`registry`** | 専用のOCIレジストリイメージ | エンタープライズのマルチステージビルド | `--cache-to type=registry,ref=repo/cache:latest,mode=max` |
+| **`gha`** | GitHub Actionsキャッシュサービス | GitHub Actionsワークフロー | `--cache-to type=gha,mode=max` |
+| **`local`** | 共有NFSまたはローカルディレクトリ | オンプレミスのJenkinsランナー | `--cache-to type=local,dest=/path/to/cache` |
+
+`registry`または`gha`キャッシュエクスポーターを使用する場合、マルチステージビルドには`mode=max`の設定が不可欠です。デフォルトの`mode=min`では、最終的な出力イメージのレイヤーキャッシュのみがエクスポートされ、中間的なビルダーステージのレイヤーは破棄されます。`mode=max`を設定すると、BuildKitはDockerfile内のすべてのステージのレイヤーキャッシュをエクスポートするよう指示され、ビルド間で中間的なコンパイルステップが完全にキャッシュされるようになります。
+
+以下は、BuildKitの`gha`キャッシュバックエンドを利用した、本番環境レベルの完全なGitHub Actionsワークフローです。
+
+```yaml
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push with GHA Remote Cache
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/company-org/api-service:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+このGitHub Actionsワークフローは、コンパイルが始まる前にGitHubキャッシュサービスからBuildKitのレイヤーキャッシュを自動的に復元します。ビルドが完全に新しいエフェメラルなランナーノードで実行されたとしても、BuildKitは事前にコンパイルされた中間レイヤーをプルし、ほぼ瞬時のビルドを可能にします。
+
+## シークレットマウントとSSH転送による認証情報の漏洩防止
+
+シークレットマウントとSSH転送は、`RUN`命令で`--mount=type=secret`または`--mount=type=ssh`を指定して使用し、プライベートSSHキーやAPIトークンをコンテナイメージレイヤーに焼き込むことなくビルドコマンドに渡すことができます。歴史的に、開発者は`ARG`変数や環境変数を使用してビルドシークレットを渡してきましたが、これは`docker history`で可視化できるイメージレイヤーのメタデータ履歴内にシークレット値を恒久的に漏洩させてしまいます。
+
+![BuildKitのシークレットマウントとSSH転送](/static/images/docker-buildkit-cache-mount-optimization-secret-mounts.jpg)
+
+BuildKitのシークレットマウントは、機密ファイルを一時的なインメモリファイルシステム（`tmpfs`）にマウントします。これは単一の`RUN`ステップの実行中のみアクセス可能であり、コマンドが完了すると、BuildKitはシークレットファイルをアンマウントし、機密性の高いトークン文字列や秘密鍵が最終イメージや中間イメージのレイヤーに一切痕跡を残さないことを保証します。
+
+以下は、プライベートnpmパッケージのインストールやプライベートGitリポジトリのクローンにシークレットマウントを使用したDockerfileの例です。
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+COPY package*.json ./
+
+# Mount private NPM token securely at runtime
+RUN --mount=type=secret,id=npm_token     NPM_TOKEN=$(cat /run/secrets/npm_token)     npm ci
+
+COPY . .
+RUN npm run build
+```
+
+このDockerfileをローカルまたはCI/CDでシークレットを漏洩させずにビルドするには、ビルド実行時に`--secret`フラグを渡します。
+
+```bash
+# 環境変数からシークレットを渡す
+export NPM_TOKEN="npm_1a2b3c4d5e6f7g8h9i0j"
+docker buildx build --secret id=npm_token,env=NPM_TOKEN -t my-app:latest .
+
+# ローカルファイルからシークレットを渡す
+docker buildx build --secret id=npm_token,src=./.npmrc -t my-app:latest .
+```
+
+ビルドプロセスがSSH経由でプライベートなGoモジュールやGitサブモジュールを取得する必要がある場合は、`--mount=type=ssh`でSSHエージェント転送を使用します。これは、ローカルのSSHエージェントソケットをビルドコンテナに転送するようBuildKitに指示するものであり、`git clone`コマンドが生の秘密鍵ファイルをディスクにマウントすることなく、ローカルのSSHアイデンティティを使用して安全に認証できるようにします。
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+
+RUN apk add --no-cache git openssh-client
+
+# GitHubホストキーを承認する
+RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+# 転送されたSSHエージェントを使用してプライベート依存関係をクローンする
+RUN --mount=type=ssh     git clone git@github.com:company-org/private-lib.git
+```
+
+`docker buildx build --ssh default .`を実行すると、アクティブなSSHエージェントセッションがコンテナに転送され、完全な認証情報のプライバシーを維持しながら安全な認証が保証されます。
+
+## レイヤーキャッシュ効率の監査と検査
+
+BuildKitのレイヤーキャッシュ効率を監査・検査するには、`--progress=plain`を使用してビルド出力ログを分析し、`docker history`でレイヤー履歴を検査し、`docker buildx du`でビルドキャッシュのディスク使用量を監査します。キャッシュヒット率を監視することで、Dockerfileの命令順序がコミットごとに意図せずレイヤーキャッシュを無効化していないかを確認できます。
+
+ビルドを実行する際、`--progress=plain`を渡すことで、BuildKitが各ステップをキャッシュから読み込んだか（`CACHED`）、あるいは命令を再実行したか（`RUNNING`）を詳述する完全なテキスト実行ログを表示できます。
+
+```bash
+docker buildx build --progress=plain -t my-service:latest .
+```
+
+プレーンなプログレス出力を確認すると、各ステップの正確な実行状態がわかります。
+
+```
+#5 [builder 2/5] WORKDIR /app
+#5 CACHED
+
+#6 [builder 3/5] COPY package*.json ./
+#6 CACHED
+
+#7 [builder 4/5] RUN --mount=type=cache,target=/root/.npm npm ci
+#7 CACHED
+
+#8 [builder 5/5] COPY . .
+#8 DONE 0.4s
+```
+
+あるステップが`CACHED`ではなく`RUNNING`と表示されている場合、先行する命令を検査してください。キャッシュ無効化の最も一般的な原因は、`COPY . .`をDockerfileの早い段階に配置することです。ソースコードファイルは頻繁に変更されるため、広範な`COPY`コマンドをDockerfileの先頭近くに配置すると、後続のすべてのレイヤーキャッシュが無効になります。常に依存関係のロックファイル（`go.mod`, `package-lock.json`, `requirements.txt`）を最初にコピーし、依存関係のダウンロードを実行し、その後のステップでメインのアプリケーションソースコードをコピーするようにしてください。
+
+永続的なビルドサーバーでのディスク消費を管理するには、`docker buildx du`を使用してBuildKitキャッシュのディスク使用量を検査し、`docker buildx prune`で古いビルドキャッシュをクリアします。
+
+```bash
+# アクティブなBuildKitキャッシュのディスク使用量を検査する
+docker buildx du
+
+# 7日以上経過した未使用のビルドキャッシュを削除してディスク領域を解放する
+docker buildx prune --filter "until=168h" --force
+```
+
+古いビルドキャッシュを定期的に整理することで、頻繁に使用されるベースイメージレイヤーやパッケージマネージャのキャッシュマウントを保持しつつ、共有ビルドホストのディスク領域枯渇を防ぎます。
+
+## テクニカルリファレンスとトラブルシューティング
+
+### BuildKit構文ディレクティブ
+
+BuildKitの構文ディレクティブは、Dockerfileの最初の行として`# syntax=docker/dockerfile:1.7`を追加することで有効化されます。このディレクティブは、指定されたDockerfileフロントエンドパーサーのバージョンをダウンロードして使用するようBuildKitに指示し、ホストのDockerデーモンが古い組み込みパーサーバージョンを使用していても、`--mount=type=cache`、`--mount=type=secret`、ヒアドキュメント構文などの高度な機能をアンロックします。
+
+### リモートキャッシュモード：mode=min vs mode=max
+
+違いは、エクスポートされるリモートキャッシュアーカイブにどのビルドステージが含まれるかという点にあります。`min`モード（デフォルト）は、Dockerfileの最終ターゲットステージのレイヤーキャッシュのみをエクスポートします。`max`モードは、すべての中間ビルダーステージとビルドターゲットのレイヤーキャッシュをエクスポートします。CI/CDでマルチステージビルドを使用する場合は、中間コンパイルステージがビルド間で完全にキャッシュされるように、常に`mode=max`を設定すべきです。
+
+### パッケージキャッシュの永続化 vs apt-get clean
+
+BuildKitのキャッシュマウントを使用する場合、`apt-get clean`を実行したりパッケージリストのディレクトリを削除したりすべきではありません。なぜなら、これらのコマンドはビルド間で永続化させたいまさにそのパッケージマネージャのキャッシュファイルを消去してしまうからです。従来のDocker最適化ガイドでは、最終的なレイヤーサイズを小さく保つためにaptリストをクリアすることが推奨されていました。BuildKitのキャッシュマウント（`--mount=type=cache,target=/var/cache/apt`）では、キャッシュファイルは最終イメージレイヤーの外部に存在するため、手動でのキャッシュクリーンアップコマンドは不要になります。
+
+### 単一のRUN命令における複数のキャッシュマウント
+
+はい、単一の`RUN`命令行に複数の`--mount=type=cache`フラグを指定することは可能です。例えば、Goプロジェクトでは、GoモジュールのダウンロードキャッシュとGoビルドのコンパイラキャッシュの両方を同時にマウントできます：`RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build go build -o server .`。これにより、依存関係の解決とバイナリコンパイルの両方でキャッシュされたアーティファクトが再利用されます。
+
+### シークレットマウント vs ビルドARG
+
+BuildKitのシークレットマウント（`--mount=type=secret`）は、ステップ実行中に機密ファイルを一時的なインメモリファイルシステム（`tmpfs`）にマウントし、レイヤーメタデータにシークレット値を保存しません。一方、Dockerの`ARG`変数は値を環境変数に渡しますが、これはイメージ履歴メタデータに恒久的に保存され、コンテナイメージにアクセスできる人なら誰でも`docker history`や`docker inspect`を使ってシークレットを抽出できてしまいます。
+
+### マルチステージの並列実行グラフ
+
+Docker BuildKitはDockerfileを解析して、ビルドステージの依存関係の有向非巡回グラフ（DAG）を作成します。Dockerfileに互いに依存しない複数の`FROM`ステージが含まれている場合、BuildKitは利用可能なCPUコア全体でそれらのステージを並列にコンパイルします。指定された最終ターゲットイメージのビルドに必要のないステージがある場合、BuildKitはそのステージを完全にスキップし、リソース使用量を最適化します。
+
+### ベースイメージの選択：Alpine vs Distroless vs Scratch
+
+ランタイムベースイメージの選択は、アプリケーションのバイナリタイプとデバッグ要件に依存します。`Scratch`は空のベースイメージであり、静的にコンパイルされたGoやRustのバイナリに最適で、OSの脆弱性がゼロの非常に小さなイメージサイズを生み出します。`Distroless`は、シェルバイナリなしで言語ランタイム（PythonやJavaなど）とシステム依存関係のみを含み、高いセキュリティを提供します。`Alpine`は軽量なパッケージマネージャとbusyboxシェルを含んでおり、コンテナ内でのデバッグユーティリティが必要な場合に最適です。
+
+## おすすめの記事
+
+- [DockerでのAstral uv活用：マルチステージビルド、BuildKitキャッシング、高速CI](/en/blog/python-uv-package-manager-guide)
+- [FastAPIのDockerマルチステージビルド：イメージサイズを70%削減する](/en/blog/fastapi-docker-multistage-build)
+- [なぜ私のDockerイメージは1GBもあったのか（そして、いかにして50MBに縮小したか）](/en/blog/docker-image-optimization)
+- [ローカル開発のためのDocker Compose：完全セットアップガイド](/en/blog/docker-compose-local-development)
