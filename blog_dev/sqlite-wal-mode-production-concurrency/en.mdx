@@ -185,6 +185,70 @@ Imagine a Node.js or Python web server with a worker pool. Ten requests arrive s
 
 From the application's perspective, it feels concurrent. The database itself is serializing the writes. As long as individual write transactions are short and fast, this model supports very high write *throughput*. The bottleneck is not the number of concurrent writers, but the duration of the longest write transaction. **Keep your write transactions small and fast.**
 
+### The Hidden Trap: `SQLITE_BUSY_SNAPSHOT` and `BEGIN IMMEDIATE`
+
+Even when `PRAGMA busy_timeout = 5000;` is configured, developers frequently encounter immediate `sqlite3.OperationalError: database is locked` exceptions with **zero wait time**.
+
+This happens due to **deferred transactions** (`BEGIN;` or Python's default transaction model):
+1. A transaction starts by executing a `SELECT` statement. SQLite opens a **read transaction** against the current WAL snapshot.
+2. In the meantime, another connection commits an `INSERT` or `UPDATE`, advancing the WAL snapshot version.
+3. Later in your first transaction, your application attempts an `UPDATE` or `INSERT`. SQLite must now upgrade the connection lock from Reader to Writer.
+4. **The conflict:** SQLite cannot allow the write on an outdated snapshot without violating snapshot isolation guarantees.
+5. Instead of waiting for `busy_timeout`, SQLite aborts immediately with `SQLITE_BUSY_SNAPSHOT` (extended error code 517).
+
+#### The Solution: Immediate Transactions
+Whenever a transaction will perform writes, start it with `BEGIN IMMEDIATE;`:
+
+```python
+# Acquire write lock immediately at transaction start
+cursor.execute("BEGIN IMMEDIATE;")
+cursor.execute("UPDATE accounts SET balance = balance - 100 WHERE id = 1;")
+cursor.execute("UPDATE accounts SET balance = balance + 100 WHERE id = 2;")
+conn.commit()
+```
+`BEGIN IMMEDIATE` acquires the `RESERVED` write lock right at the beginning before reading. If another transaction is currently writing, SQLite will honor the full `busy_timeout` and wait for the lock to free up.
+
+---
+
+### Framework Recipes: Production Integration
+
+#### Django / DRF Configuration
+In Django, hook the `connection_created` signal to apply production PRAGMAs automatically on every connection:
+
+```python
+# In your django app's apps.py or models.py
+from django.db.backends.signals import connection_created
+from django.dispatch import receiver
+
+@receiver(connection_created)
+def configure_sqlite_production(sender, connection, **kwargs):
+    if connection.vendor == "sqlite":
+        with connection.cursor() as cursor:
+            cursor.execute("PRAGMA journal_mode = WAL;")
+            cursor.execute("PRAGMA busy_timeout = 5000;")
+            cursor.execute("PRAGMA synchronous = NORMAL;")
+            cursor.execute("PRAGMA cache_size = -64000;")
+            cursor.execute("PRAGMA foreign_keys = ON;")
+```
+
+#### FastAPI / SQLAlchemy (Async Engine)
+```python
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy import event
+
+engine = create_async_engine("sqlite+aiosqlite:///app.db")
+
+@event.listens_for(engine.sync_engine, "connect")
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode = WAL;")
+    cursor.execute("PRAGMA busy_timeout = 5000;")
+    cursor.execute("PRAGMA synchronous = NORMAL;")
+    cursor.execute("PRAGMA cache_size = -64000;")
+    cursor.execute("PRAGMA foreign_keys = ON;")
+    cursor.close()
+```
+
 ## The Sweet Spot: When SQLite Beats Client-Server Databases
 
 SQLite is not a PostgreSQL killer. It's a different tool for a different job. It shines when your primary bottleneck is network latency and operational complexity.
