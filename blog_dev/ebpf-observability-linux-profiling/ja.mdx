@@ -1,0 +1,388 @@
+---
+title: >-
+  本番環境におけるeBPF：低オーバーヘッドなLinuxオブザーバビリティ、トレーシング、カーネルプロファイリング
+date: '2026-09-23'
+summary: >-
+  eBPFを使用して、オーバーヘッドを最小限に抑えたLinuxカーネルのオブザーバビリティを実装します。システムコールのレイテンシ測定、メモリ割り当ての追跡、サイドカーなしでのネットワークソケット監視を解説します。
+tags:
+  - ebpf
+  - linux
+  - observability
+  - devops
+  - systems
+  - オブザーバビリティ
+  - カーネル
+draft: false
+featured: true
+category: Tech
+images: ['/static/images/ebpf-observability-linux-profiling.png']
+---
+
+システムエンジニアとして、私たちは常にトレードオフのジレンマに直面しています。パフォーマンスの低下（リグレッション）をデバッグし、セキュリティの脅威を特定し、システムの信頼性を確保するためには、本番環境の内部状態を詳細に把握する必要があります。しかし、観測という行為そのものが、測定対象のシステムに負荷を与えてしまいます。従来の `strace` のようなツールは、最大で100倍ものパフォーマンス低下を引き起こす可能性があります。また、サービスメッシュの主流であるサイドカープロキシは、ネットワークレイテンシを増加させ、ポッドごとに無視できないCPUとメモリリソースを消費します。これがいわゆる「オブザーバビリティ税（観測コスト）」です。もし、カーネル自体を安全にプログラミングすることで、オーバーヘッドをほぼゼロにして完全な可視性を手に入れられるとしたらどうでしょうか？これは空想ではなく、eBPFによって本番環境ですでに実現されている技術です。
+
+<AudioPlayer src="/static/audio/ebpf-observability-linux-profiling.mp3" title="Executive Audio Briefing" />
+
+## eBPFとは？カーネルレベルの仮想マシン
+
+eBPF（extended Berkeley Packet Filter）は、Linuxカーネルのソースコードを変更したり、カーネルモジュールをロードしたりすることなく、カーネル内でサンドボックス化された安全なプログラムを実行できるようにする革新的な技術です。カーネル内に組み込まれた、超軽量で高効率なイベント駆動型の仮想マシンと考えることができます。システムコールの発行、ネットワークパケットの受信、カーネル関数の実行など、特定のイベントが発生した際に、事前ロードされたeBPFプログラムが実行され、データの収集、動作の変更、セキュリティポリシーの適用を行います。
+
+このアーキテクチャは、主に以下の4つのコアコンポーネントで構成されています。
+
+1.  **eBPFプログラム:** C言語の制限されたサブセットで記述された小さなプログラム。Clang/LLVMなどのコンパイラを使用してeBPFバイトコードにコンパイルされます。
+2.  **フック（アタッチポイント）:** eBPFプログラムをアタッチできるカーネルコード内のポイント。主な種類には、**kprobes**（動的なカーネル関数フック）、**tracepoints**（カーネル定義の安定したトレースポイント）、**XDP**（超高速ネットワークパケット処理用のeXpress Data Path）、**TC**（トラフィック制御フック）があります。
+3.  **eBPFマップ:** カーネルメモリ上に配置されるキー・バリュー形式のデータ構造。eBPFプログラムが状態を保持し、ユーザ空間のアプリケーション（および他のeBPFプログラム）と効率的にデータをやり取りするための主要メカニズムです。ハッシュマップ、配列、高性能なリングバッファなどがあります。
+4.  **ベリファイア（検証器）:** eBPFの安全性を担保する中核コンポーネント。eBPFバイトコードがロードされる前に静的解析を実行し、プログラムが無限ループに陥らないこと（必ず終了すること）、メモリ境界外アクセスを行わないこと、カーネルパニックを引き起こさないことを数学的に保証します。ルールに違反したプログラムはロード前に即座に拒否されます。
+
+検証に合格したeBPFバイトコードは、JIT（Just-In-Time）コンパイラによってホストCPUのネイティブ機械語にコンパイルされ、極めて高いネイティブ速度で実行されます。
+
+### eBPFの開発と実行フロー
+
+C言語コードからカーネルでの実行までの流れは、明確なマルチステージプロセスで進行します。ユーザ空間の「ローダー」アプリケーションがこのプロセスをオーケストレーションします。
+
+<Mermaid chart={`
+graph TD
+    subgraph Userspace["ユーザ空間 (Userspace)"]
+        A["C言語ソースコード<br/>(my_prog.c)"] -->|"clang / LLVM"| B["eBPFバイトコード<br/>(ELFオブジェクトファイル)"]
+        C["ローダーアプリ<br/>(Python/Go/Rust)"] -->|"bpf() システムコール"| D["カーネル"]
+        C -->|"データ読み取り"| E["eBPFマップ / リングバッファ"]
+        B -->|"ロード"| C
+    end
+
+    subgraph KernelSpace["カーネル空間 (Kernel Space)"]
+        D --> F["ベリファイア (安全性検証)"]
+        F -->|"検証合格"| G["JITコンパイラ"]
+        G -->|"ネイティブ機械語へ変換"| H["マシンコード"]
+        H -->|"フックへアタッチ"| I["カーネルフック<br/>(Tracepoint, kprobe)"]
+        I -->|"イベント発生で実行"| H
+        H -->|"データ書き込み"| E
+    end
+
+    style A fill:#f9f,stroke:#333,stroke-width:2px
+    style C fill:#ccf,stroke:#333,stroke-width:2px
+`} />
+
+この関心事の分離は非常に重要です。特権を持つカーネルは検証済みの安全なコードのみを実行し、プログラムのロードや収集データの処理といった複雑なロジックは、非特権のユーザ空間に安全に留まります。
+
+## 実践：`openat` システムコールのレイテンシプロファイリング
+
+eBPFの威力を体感するために、実用的なツールを構築してみましょう。ファイルI/Oのボトルネックの原因になりやすい `openat` システムコールのレイテンシを測定します。各呼び出しのPID、コマンド名、ファイル名、実行所要時間（レイテンシ）を記録します。
+
+これを実現するために、`sys_enter_openat` と `sys_exit_openat` の2つのトレースポイントにeBPFプログラムをアタッチします。
+
+### eBPFカーネルプログラム (C言語)
+
+カーネル内部で動作するCプログラムです。プロセスがシステムコールに入った開始タイムスタンプを保存するために `BPF_MAP_TYPE_HASH` を使用し、最終的なイベントデータをユーザ空間に送信するために `BPF_MAP_TYPE_RINGBUF` を使用します。リングバッファはメモリ効率が高く、負荷時にもデータ欠落が発生しにくい最新の推奨メカニズムです。
+
+```c
+// ファイル: syscall_tracer.c
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
+
+#define MAX_FILENAME_LEN 256
+
+// ユーザ空間に送信するイベント構造体
+struct event {
+    u32 pid;
+    u64 latency_ns;
+    char comm[16];
+    char filename[MAX_FILENAME_LEN];
+};
+
+// スレッドID (TID) をキーにして開始時刻を保持するハッシュマップ
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, u32);
+    __type(value, u64);
+} start SEC(".maps");
+
+// ユーザ空間へのイベント送信用リングバッファ
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024); // 256 KB
+} events SEC(".maps");
+
+// openatシステムコールの開始トレースポイント
+SEC("tracepoint/syscalls/sys_enter_openat")
+int tracepoint__syscalls__sys_enter_openat(struct trace_event_raw_sys_enter* ctx) {
+    u64 id = bpf_get_current_pid_tgid();
+    u32 tid = (u32)id;
+    u64 ts = bpf_ktime_get_ns();
+
+    // 開始タイムスタンプを記録
+    bpf_map_update_elem(&start, &tid, &ts, BPF_ANY);
+    return 0;
+}
+
+// openatシステムコールの終了トレースポイント
+SEC("tracepoint/syscalls/sys_exit_openat")
+int tracepoint__syscalls__sys_exit_openat(struct trace_event_raw_sys_exit* ctx) {
+    u64 id = bpf_get_current_pid_tgid();
+    u32 tid = (u32)id;
+    u64 *ts_ptr;
+
+    // 開始タイムスタンプを取得
+    ts_ptr = bpf_map_lookup_elem(&start, &tid);
+    if (ts_ptr == 0) {
+        return 0;
+    }
+
+    u64 latency = bpf_ktime_get_ns() - *ts_ptr;
+    bpf_map_delete_elem(&start, &tid);
+
+    // 1マイクロ秒未満の極小イベントはフィルタリング
+    if (latency < 1000) {
+        return 0;
+    }
+
+    // リングバッファにスペースを確保
+    struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        return 0;
+    }
+
+    // イベントデータを格納
+    u32 pid = id >> 32;
+    e->pid = pid;
+    e->latency_ns = latency;
+
+    // コマンド名を取得
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    // コンテキスト引数からファイル名ポインタを取得
+    // bpf_probe_read_user_str を使って安全にユーザ空間メモリから読み出す
+    const char __user *filename_ptr = (const char __user *)ctx->args[1];
+    bpf_probe_read_user_str(&e->filename, sizeof(e->filename), filename_ptr);
+
+    // リングバッファにイベントをコミット
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+```
+
+### ユーザ空間ローダー 1：Python + BCC
+
+BPF Compiler Collection (BCC) は、プロトタイピングや迅速なスクリプト作成に最適なツールキットです。Clang/LLVMコンパイラを内部に持ち、実行時にCソースコードを即時コンパイルします。
+
+```python
+#!/usr/bin/python3
+# ファイル: bcc_loader.py
+from bcc import BPF
+import ctypes as ct
+
+bpf_text = """
+#include <uapi/linux/ptrace.h>
+#include <linux/fs.h>
+#include <linux/sched.h>
+
+#define MAX_FILENAME_LEN 256
+
+struct event {
+    u32 pid;
+    u64 latency_ns;
+    char comm[TASK_COMM_LEN];
+    char filename[MAX_FILENAME_LEN];
+};
+BPF_RINGBUF_OUTPUT(events, 8);
+BPF_HASH(start, u32);
+
+int tracepoint__syscalls__sys_enter_openat(struct tracepoint__syscalls__sys_enter_openat *args) {
+    u64 id = bpf_get_current_pid_tgid();
+    u32 tid = (u32)id;
+    u64 ts = bpf_ktime_get_ns();
+    start.update(&tid, &ts);
+    return 0;
+}
+
+int tracepoint__syscalls__sys_exit_openat(struct tracepoint__syscalls__sys_exit_openat *args) {
+    u64 id = bpf_get_current_pid_tgid();
+    u32 tid = (u32)id;
+    u64 *ts_ptr = start.lookup(&tid);
+
+    if (ts_ptr == 0) {
+        return 0;
+    }
+
+    u64 latency = bpf_ktime_get_ns() - *ts_ptr;
+    start.delete(&tid);
+
+    if (latency < 1000) {
+        return 0;
+    }
+
+    struct event *e = events.ringbuf_reserve(sizeof(struct event));
+    if (!e) {
+        return 0;
+    }
+
+    e->pid = id >> 32;
+    e->latency_ns = latency;
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+    
+    const char __user* filename_ptr = (const char __user*)args->filename;
+    bpf_probe_read_user_str(&e->filename, sizeof(e->filename), filename_ptr);
+
+    events.ringbuf_submit(e, 0);
+    return 0;
+}
+"""
+
+class Event(ct.Structure):
+    _fields_ = [
+        ("pid", ct.c_uint),
+        ("latency_ns", ct.c_ulonglong),
+        ("comm", ct.c_char * 16),
+        ("filename", ct.c_char * 256),
+    ]
+
+def print_event(cpu, data, size):
+    event = ct.cast(data, ct.POINTER(Event)).contents
+    print(f"{event.pid:<10} {event.comm.decode():<16} {event.latency_ns / 1000:<10.2f} us   '{event.filename.decode()}'")
+
+b = BPF(text=bpf_text)
+b["events"].open_ring_buffer(print_event)
+
+print(f"{'PID':<10} {'COMM':<16} {'LATENCY':<13} {'FILENAME'}")
+
+while True:
+    try:
+        b.ring_buffer_poll()
+    except KeyboardInterrupt:
+        exit()
+```
+
+BCCは開発段階で手軽ですが、ターゲットホストにコンパイラ環境をインストールする必要があり、起動時のオーバーヘッドがあります。本番環境のサービスには、事前コンパイル方式（Ahead-Of-Time）が適しています。
+
+### ユーザ空間ローダー 2：Go + cilium/ebpf
+
+本番環境のマイクロサービスでは、Go言語と `cilium/ebpf` ライブラリの組み合わせが最も堅牢です。CO-RE（Compile Once, Run Everywhere）パラダイムに従い、Cコードは事前にELFオブジェクトファイルにコンパイルされ、Goバイナリに直接埋め込まれます。
+
+```go
+// ファイル: go_loader.go
+package main
+
+import (
+    "bytes"
+    "encoding/binary"
+    "errors"
+    "log"
+    "os"
+    "os/signal"
+    "syscall"
+
+    "github.com/cilium/ebpf/link"
+    "github.com/cilium/ebpf/ringbuf"
+)
+
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go syscall_bpf syscall_tracer.c -- -O2 -g -Wall
+
+func main() {
+    stopper := make(chan os.Signal, 1)
+    signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
+
+    objs := syscall_bpfObjects{}
+    if err := loadSyscall_bpfObjects(&objs, nil); err != nil {
+        log.Fatalf("オブジェクトロード失敗: %v", err)
+    }
+    defer objs.Close()
+
+    enter_tp, err := link.Tracepoint("syscalls", "sys_enter_openat", objs.TracepointSyscallsSysEnterOpenat, nil)
+    if err != nil {
+        log.Fatalf("enterトレースポイントアタッチ失敗: %v", err)
+    }
+    defer enter_tp.Close()
+
+    exit_tp, err := link.Tracepoint("syscalls", "sys_exit_openat", objs.TracepointSyscallsSysExitOpenat, nil)
+    if err != nil {
+        log.Fatalf("exitトレースポイントアタッチ失敗: %v", err)
+    }
+    defer exit_tp.Close()
+
+    rd, err := ringbuf.NewReader(objs.Events)
+    if err != nil {
+        log.Fatalf("ringbufリーダー初期化失敗: %v", err)
+    }
+    defer rd.Close()
+
+    go func() {
+        <-stopper
+        rd.Close()
+    }()
+
+    log.Println("イベント待機中...")
+    log.Printf("%-10s %-16s %-13s %s\n", "PID", "COMM", "LATENCY (us)", "FILENAME")
+
+    var event syscall_bpfEvent
+    for {
+        record, err := rd.Read()
+        if err != nil {
+            if errors.Is(err, ringbuf.ErrClosed) {
+                log.Println("終了シグナルを受信しました")
+                return
+            }
+            log.Printf("読み取りエラー: %v", err)
+            continue
+        }
+
+        if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event); err != nil {
+            log.Printf("パースエラー: %v", err)
+            continue
+        }
+        
+        comm := string(event.Comm[:bytes.IndexByte(event.Comm[:], 0)])
+        filename := string(event.Filename[:bytes.IndexByte(event.Filename[:], 0)])
+
+        log.Printf("%-10d %-16s %-13.2f %s\n", event.Pid, comm, float64(event.LatencyNs)/1000.0, filename)
+    }
+}
+```
+
+外部依存関係のない単一の静的バイナリが生成されるため、Kubernetesコンテナでのデプロイに最適です。
+
+## eBPF 対 サイドカー：Ciliumのアーキテクチャ事例
+
+オブザーバビリティのコストが最も顕著に現れるのはサービスメッシュです。Istioのような従来のメッシュは、すべてのポッドにEnvoyサイドカープロキシを注入します。
+
+これにより以下の問題が生じます。
+1.  **レイテンシの増加:** リクエストがアプリケーションからサイドカー、そしてネットワークへと、TCP/IPスタックを2重に経由します。
+2.  **リソース浪費:** 各サイドカーが独自のCPUとメモリを消費し、クラスター全体のリソースが大幅に圧迫されます。
+3.  **運用の複雑さ:** ポッド数に比例して管理対象のコンテナが増加します。
+
+eBPFベースのCNIおよびサービスメッシュであるCiliumは、サイドカーを排除します。
+
+*   **ソケット層での最適化:** ソケットフック（`cgroup/sock_addr`）にアタッチされたeBPFプログラムがトラフィックを即座にリダイレクトし、ノード単位の単一プロキシで処理します。
+*   **パケット層での高速処理:** L3/L4負荷分散には、**TC** や **XDP** フックを使用し、カーネル内でパケットを直接処理して `iptables` を凌駕するスループットを達成します。
+*   **透過的なオブザーバビリティ:** eBPFがすべてのカーネルイベントを可視化できるため、コードの変更やサイドカーの挿入なしで、すべての通信のHTTPメトリクスやDNS解決ログを自動取得できます。
+
+<FAQ title="よくある質問 (FAQ)">
+  <Question>eBPFベリファイアはどのように動作し、どのような制限がありますか？</Question>
+  <Answer>
+    ベリファイアはeBPFプログラムを有向非巡回グラフ（DAG）として扱い、実行前にすべての可能なパスをシミュレーションします。
+    - **ループの禁止:** 無限ループを防ぐため、安全が証明されない後方ジャンプを禁止します。
+    - **メモリ安全性:** すべてのポインタアクセスに対してNULLチェックと境界チェックを強制します。
+    - **スタック制限:** スタックサイズの上限は厳密に512バイトに制限されています。
+    
+    主な制限は解析の複雑さです。処理命令数が約100万を超えるとベリファイアはプログラムを拒否するため、複雑なロジックは小さなプログラムに分割してテイルコールで連携させる必要があります。
+  </Answer>
+  <Question>kprobes、tracepoints、uprobesの違いは何ですか？</Question>
+  <Answer>
+    安定性と適用対象が異なります。
+    - **Tracepoints:** カーネルソース内に戦略的に配置された安定したフック。カーネルバージョン間でAPIの安定性が保証されており、本番環境の第一選択肢です。
+    - **kprobes:** ほぼすべてのカーネル関数に動的にアタッチできる強力なプローブ。詳細なデバッグに向きますが、カーネル更新で関数名が変わると動作しなくなる可能性があります。
+    - **uprobes:** ユーザ空間のアプリケーションや共有ライブラリ（libcやOpenSSLなど）の関数にアタッチしてプロファイリングを行います。
+  </Answer>
+  <Question>本番環境にはBCCとlibbpf/cilium-ebpfのどちらを採用すべきですか？</Question>
+  <Answer>
+    本番環境には **libbpfベース（Goのcilium/ebpfやRustのlibbpf-rs）** が最適です。CO-RE（Compile Once, Run Everywhere）により、事前コンパイルされたELFバイナリを単一の実行可能ファイルとして配布でき、BTF（BPF Type Format）によって異なるカーネルバージョン間でも安全に動作します。BCCは開発時のアドホックな調査に適しています。
+  </Answer>
+</FAQ>
+
+## 結論：カーネルプログラマブルな未来へ
+
+eBPFは、オペレーティングシステムのアーキテクチャにおける根本的なパラダイムシフトです。硬直したカーネルAPIや重厚なユーザ空間エージェントの時代から、カーネルそのものを安全かつ柔軟にプログラミングできる時代へと移行しています。
+
+オブザーバビリティの観点では、ついに「観測コスト」を排除できるようになりました。真実の単一ソースであるLinuxカーネルから、直接かつ超低オーバーヘッドでシステムコール、メモリ、ネットワークの深層データを取得できます。
