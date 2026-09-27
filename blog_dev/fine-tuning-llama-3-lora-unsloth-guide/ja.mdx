@@ -1,0 +1,272 @@
+---
+title: "LoRAとUnslothによるLlama3のファインチューニング：開発者ガイド"
+images:
+  - '/static/images/fine-tuning-llama-3-lora-unsloth-guide-featured.jpg'
+  - '/static/images/fine-tuning-llama-3-lora-unsloth-guide-qlora-architecture.jpg'
+  - '/static/images/fine-tuning-llama-3-lora-unsloth-guide-unsloth-kernels.jpg'
+  - '/static/images/fine-tuning-llama-3-lora-unsloth-guide-dataset-formatting.jpg'
+  - '/static/images/fine-tuning-llama-3-lora-unsloth-guide-hyperparameter-tuning.jpg'
+  - '/static/images/fine-tuning-llama-3-lora-unsloth-guide-gguf-export.jpg'
+date: '2026-07-29'
+tags: ["ai", "ai-tools"]
+draft: false
+summary: "LoRA、QLoRA、Unsloth、カスタムTritonGPUカーネル、勾配チェックポイント、メモリ節約を用いたLlama3のファインチューニングに関する開発者向けステップバイステップガイド。"
+authors: ['default']
+category: Tech
+---
+
+
+ドメイン固有のタスク向けにオープンウェイトの大規模言語モデルをカスタマイズするには、法外なハードウェアコストを回避する効率的なファインチューニング技術が必要です。MetaのLlama 3ファミリーモデルを適応させる機械学習エンジニアは、標準のPyTorchファインチューニングスクリプトを使用すると、メモリ断片化とステップトレーニング速度の低下に悩まされることがよくあります。コンシューマー向けグラフィックハードウェアで全パラメータファインチューニングを試みると、VRAM割り当てのメモリ不足によりトレーニングプロセスが即座にクラッシュします。
+
+この開発者ガイドでは、Low-Rank Adaptation (LoRA)、Quantized Low-Rank Adaptation (QLoRA)、およびUnslothの最適化されたTritonカーネルを使用して、MetaのLlama 3モデルの完全なファインチューニングパイプラインについて詳しく説明します。本番環境向けのPyTorchトレーニングコード、データセットフォーマットスクリプト、ハイパーパラメータガイドライン、およびローカルのOllamaサービング用のGGUF量子化手順を入手できます。
+
+<AudioPlayer src="/static/audio/fine-tuning-llama-3-lora-unsloth-guide.mp3" title="Executive Audio Briefing" />
+
+## パラメータ効率の良いファインチューニングがハードウェア要件を削減する理由
+
+パラメータ効率の良いファインチューニングは、ベースモデルの重みを凍結し、トランスフォーマーのアテンション層にアタッチされた少数の低ランクアダプター行列をトレーニングすることで、ハードウェア要件を削減します。80億パラメータモデルの全パラメータファインチューニング中、PyTorchは32ギガバイトのベースモデルの重み、64ギガバイトの勾配状態、および96ギガバイトのAdamオプティマイザー状態をVRAMに保存する必要があります。パラメータ効率の良い技術は、ベースの重みに対するオプティマイザー状態のオーバーヘッドを排除し、VRAMの総消費量を80%以上削減します。
+
+![QLoRA 4-Bit Quantization](/static/images/fine-tuning-llama-3-lora-unsloth-guide-qlora-architecture.jpg)
+
+このメモリ削減を理解するために、バックプロパゲーション中にLow-Rank Adaptationが重み更新行列をどのように分解するかを調べます。LoRAは、密な重み行列を直接更新する代わりに、更新行列を、モデルの隠れ次元よりも大幅に小さいランクを持つ2つの低ランク行列に因数分解します。この行列因数分解により、トレーニング可能なパラメータは80億から5000万未満に削減されます。
+
+```python
+# PyTorch script demonstrating LoRA rank matrix parameter counting
+def calculate_lora_trainable_parameters(
+    hidden_dim: int = 4096,
+    num_layers: int = 32,
+    lora_rank: int = 16,
+    target_modules: list[str] = ["q_proj", "k_proj", "v_proj", "o_proj"]
+) -> int:
+    # Each target projection layer gets matrix A (hidden x rank) and B (rank x hidden)
+    params_per_matrix = 2 * hidden_dim * lora_rank
+    matrices_per_layer = len(target_modules)
+    total_lora_params = num_layers * matrices_per_layer * params_per_matrix
+    return total_lora_params
+
+# Calculate trainable parameters for Llama-3-8B model with rank 16
+trainable_params = calculate_lora_trainable_parameters(lora_rank=16)
+print(f"Total LoRA trainable parameters: {trainable_params:,} ({trainable_params / 8e9 * 100:.2f}% of base model)")
+```
+
+上記のPythonスニペットは、すべてのコアアテンション射影層でランク16を設定すると、約4100万のトレーニング可能なパラメータが得られることを示しています。総モデルパラメータの1%未満をトレーニングすることで、VRAMの要求が大幅に削減され、16ギガバイトのメモリを持つGPUでのファインチューニングが可能になります。
+
+Quantized Low-Rank Adaptation (QLoRA) は、ベースモデルの重みを特殊な4ビットNormalFloatデータ型に変換することで、さらに圧縮します。QLoRAは、勾配更新中のメモリ急増を防ぐために、二重量子化とページングされたオプティマイザーを導入します。その結果、ソフトウェア開発者は、出力精度を犠牲にすることなく、RTX 4080のような単一のデスクトップGPUで8Bパラメータモデルをファインチューニングできます。
+
+トレーニング中のメモリ割り当ての安定性は、VRAMでの勾配蓄積オーバーフローを防ぐことに大きく依存します。標準のPyTorch autogradエンジンは、慎重に境界を設定しない限りメモリを断片化する大きな動的計算グラフを構築します。QLoRAのパラメータ削減と勾配チェックポイントを組み合わせることで、長いトレーニングエポック全体で安定したメモリフットプリントを維持できます。
+
+初期のトレーニングステップ中に損失収束曲線（loss convergence curves）を評価することで、ハイパーパラメータの選択に関する即時のフィードバックが得られます。トレーニング損失が横ばいになるか、無限大に爆発する場合は、アダプターランクまたは学習率パラメータの即時調整が必要です。パラメータ効率の良い技術により、エンジニアは完全なトレーニング実行を数日間待つことなく、数時間で迅速なハイパーパラメータスイープを実行できます。
+
+## UnslothのカスタムTritonカーネルはモデルトレーニングをどのように高速化するか？
+
+UnslothのカスタムTritonカーネルは、PyTorchの手動バックプロパゲーションループをハンド最適化されたGPU C++およびOpenAI Tritonコードに書き換えることで、モデルトレーニングを高速化します。標準のHugging Face TransformersおよびPEFTトレーニングルーチンは、ステップごとに数百の個別のCUDAカーネル起動を実行する汎用PyTorch autogradメカニズムに依存しています。Unslothは、アテンション計算、RoPE位置埋め込み、RMSNorm層正規化、および交差エントロピー損失関数を統合されたTritonカーネルに融合し、カーネルオーバーヘッドを排除します。
+
+![Unsloth Custom Triton Kernels](/static/images/fine-tuning-llama-3-lora-unsloth-guide-unsloth-kernels.jpg)
+
+カスタムGPUカーネル融合により、Unslothはトレーニングスループットを2〜5倍に向上させ、同時にピークVRAM消費量をさらに60%削減します。これらの速度向上により、機械学習チームは、アクセス可能なクラウドGPUインスタンスで30分以内に命令チューニングを実行できます。
+
+```python
+# Unsloth fine-tuning setup script for Llama-3-8B model
+from unsloth import FastLanguageModel
+import torch
+
+def initialize_unsloth_model(model_name: str, max_seq_length: int = 2048):
+    # Load 4-bit quantized base model with custom Triton kernel bindings
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=max_seq_length,
+        dtype=None,  # Auto-detect float16 or bfloat16 based on GPU
+        load_in_4bit=True
+    )
+    
+    # Configure LoRA adapter targets with optimized gradient tracking
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=16,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_alpha=16,
+        lora_dropout=0,  # Optimized zero dropout for Unsloth speedup
+        bias="none",
+        use_gradient_checkpointing="unsloth"
+    )
+    print("Initialized Unsloth FastLanguageModel successfully.")
+    return model, tokenizer
+
+if __name__ == "__main__":
+    m, t = initialize_unsloth_model("unsloth/llama-3-8b-Instruct-bnb-4bit")
+```
+
+上記のPythonコードは、Unslothが標準のHugging Faceモデルの読み込みを高性能モデルラッパーに置き換える方法を示しています。`use_gradient_checkpointing="unsloth"`を設定すると、オフロードされたRAMチェックポイントが利用され、開発者は標準のPyTorchトレーニングスクリプトで許可されている2倍のバッチサイズを処理できます。
+
+Unsloth内の手動バックワードパス実装は、重い中間autogradグラフを構築することなく、LoRAアダプター行列の勾配を直接計算します。Triton C++ラッパー内で偏導関数を手動で計算することで、Unslothは標準のPyTorchモデルがVRAMに保持するアクティベーションテンソルを保存するのをスキップします。この低レベルの最適化により、長いコンテキストトレーニングシーケンス中のメモリ不足エラーが防止されます。
+
+UnslothのBfloat16精度サポートは、最新のNVIDIA AmpereおよびHopperアーキテクチャの深いトランスフォーマー層全体で数値安定性を維持します。従来のFP16混合精度と比較して、BF16は、損失計算中のアンダーフローを防ぐより広い動的指数範囲を提供します。Tritonカーネル内でBF16精度を使用することで、トレーニング全体で安定した勾配伝播が保証されます。
+
+Hugging FaceのSFTTrainerとの統合により、開発者はUnslothの基盤となるカーネル高速化の恩恵を受けながら、使い慣れたデータセット読み込みパイプラインを維持できます。Unslothは、初期化時にHugging Faceトレーナークラスを自動的にパッチ適用し、既存のトレーニングワークフローとの完全な後方互換性を保証します。
+
+## Llama 3チャットテンプレート用の命令データセットを準備する方法
+
+Llama 3チャットテンプレート用の命令データセットを準備するには、生のプロンプトと応答のペアをMeta固有のヘッダートークン構文にフォーマットし、トークン化中に適切な損失マスキングを適用します。Llama 3モデルは、システムプロンプトルール、ユーザーの質問、アシスタントの応答を区別するために、`<|start_header_id|>`、`<|end_header_id|>`、および`<|eot_id|>`のような特殊なヘッダートークンを使用します。データセットフォーマットスクリプトがこれらの特殊トークンを省略したり、シーケンス境界を誤って配置したりすると、ファインチューニングされたモデルは本番環境で破損したフォーマット構文を生成します。
+
+![Dataset Prep & Loss Masking](/static/images/fine-tuning-llama-3-lora-unsloth-guide-dataset-formatting.jpg)
+
+モデルがユーザープロンプトの質問を記憶するのではなく、アシスタントの回答を生成することを学習するように、データセットの準備中に損失マスキングも同様に重要です。バックプロパゲーション中、交差エントロピー損失計算は、アシスタント応答ヘッダーの前のすべての入力トークンに`-100`ラベルインデックスを割り当てることで、プロンプト質問トークンを無視する必要があります。
+
+```python
+# Dataset formatting script applying Llama 3 chat template and loss masking
+def format_llama3_chat_prompt(sample: dict, tokenizer) -> dict:
+    messages = [
+        {"role": "system", "content": "You are an expert Python engineering assistant."},
+        {"role": "user", "content": sample["instruction"]},
+        {"role": "assistant", "content": sample["response"]}
+    ]
+    
+    # Apply official Llama 3 Jinja template to construct formatted text string
+    formatted_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False
+    )
+    return {"text": formatted_text}
+
+# Example validation of template text formatting
+print("Formatted chat template function constructed successfully.")
+```
+
+上記のPythonスニペットは、Hugging Faceトークナイザーが公式のJinjaテンプレートルールを適用して、準拠したテキスト文字列を生成する方法を示しています。`tokenizer.apply_chat_template()`を使用すると、Llama 3の事前学習済みアテンション層が必要とする正確な構造位置に特殊なヘッダー制御トークンがテキストシーケンスに挿入されることが保証されます。
+
+テキストシーケンスをトークン化するには、動的なパディングメモリ割り当てオーバーヘッドを防ぐために、固定された最大シーケンス長を設定する必要があります。`max_seq_length=2048`を設定すると、サイズが大きすぎるデータセットサンプルが切り捨てられ、短いシーケンスが均一なバッチ境界にパディングされます。テキストを適切に切り捨てることで、トークン化中の隠れたシーケンスの破損が防止されます。
+
+トレーニング実行を開始する前に、破損した、重複した、または低品質のトレーニングサンプルをデータセットからフィルタリングする必要があります。ノイズの多いデータセットでモデルをファインチューニングすると、モデルがプロンプトテキストをエコーしたり、反復的なフレーズループを生成したりする命令の劣化が発生します。重複排除と長さフィルタリングを使用してデータセットを事前にクリーンアップすることで、高いモデル出力品質が保証されます。
+
+トレーニングと評価の分割間のデータ共謀は、ベンチマーク検証メトリックを無効にします。トークン化の前に評価データセットを分離することで、損失メトリックが記憶されたデータセットシーケンスではなく、実際の汎化性能を反映することが保証されます。厳密なデータセット分割境界を維持することで、信頼できる検証追跡が保証されます。
+
+## 最適な精度を得るためにLoRAのランクとアルファパラメータを調整する方法
+
+最適な精度を得るためにLoRAのランクとアルファパラメータを調整するには、アダプターパラメータ容量と過学習のリスクのバランスを取り、デフォルトのアルファ対ランク比を1対1または2対1で使用します。LoRAのランクパラメータは、低ランク更新行列の内部次元を決定し、アダプターがベースモデルに追加する適応容量を制御します。ランク値を低く設定しすぎると、モデルが複雑なドメイン知識を学習する能力が制限され、ランク値を高く設定しすぎると、VRAMフットプリントが増加し、小さなトレーニングデータセットを記憶するリスクが高まります。
+
+![LoRA Hyperparameter Tuning](/static/images/fine-tuning-llama-3-lora-unsloth-guide-hyperparameter-tuning.jpg)
+
+スケーリングパラメータ`lora_alpha`は、アダプターの重みに対する定数乗数として機能し、凍結されたベースモデルパラメータに対するアダプターの更新の大きさを調整します。標準的な経験的慣行では、`lora_alpha`を`lora_rank`または`2 * lora_rank`に設定し、手動での学習率の再計算を必要とせずに、勾配ステップ全体で安定した数値スケーリングを提供します。
+
+```python
+# Script configuring SFTTrainer with optimized LoRA hyperparameters
+from trl import SFTTrainer
+from transformers import TrainingArguments
+
+def configure_fine_tuning_trainer(model, tokenizer, dataset):
+    training_args = TrainingArguments(
+        output_dir="./llama3_lora_results",
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=4,
+        warmup_steps=10,
+        max_steps=60,
+        learning_rate=2e-4,  # Standard learning rate for QLoRA fine-tuning
+        fp16=not torch.cuda.is_bf16_supported(),
+        bf16=torch.cuda.is_bf16_supported(),
+        logging_steps=1,
+        optim="adamw_8bit",  # Use 8-bit AdamW to minimize VRAM footprint
+        weight_decay=0.01,
+        lr_scheduler_type="linear",
+        seed=3407
+    )
+    
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=dataset,
+        dataset_text_field="text",
+        max_seq_length=2048,
+        dataset_num_proc=2,
+        args=training_args
+    )
+    return trainer
+```
+
+上記の構成スクリプトは、8ビットAdamWオプティマイザーを使用してLlama 3をファインチューニングするための標準的なハイパーパラメータ設定を示しています。線形減衰を伴う`learning_rate=2e-4`を設定すると、凍結されたベースの重みを不安定にすることなく、アダプター行列全体で安定した損失削減が提供されます。
+
+トランスフォーマーブロック内のすべての線形射影層をターゲットにすると、クエリおよび値射影層のみをターゲットにするよりも大幅に高い適応品質が得られます。研究によると、`q_proj`、`k_proj`、`v_proj`、`o_proj`、`gate_proj`、`up_proj`、および`down_proj`層を同時にターゲットにすることで、`r=16`のような低いランク設定が可能になり、制限された`r=64`構成よりも優れたパフォーマンスを発揮します。
+
+QLoRAファインチューニングの学習率の選択には、全パラメータチューニングよりも高いレートが必要です。ベースの重みは凍結され、アダプター行列のみが更新を受け入れるため、`1e-4`と`3e-4`の間の学習率により、アダプターパラメータは基盤となるベースモデル表現を妨げることなく迅速に収束できます。
+
+トレーニング損失曲線と並行して評価損失曲線を監視することで、データセットの過学習の初期兆候を検出できます。トレーニング損失が低下し続け、検証損失が上昇する場合は、トレーニングを直ちに停止する必要があります。早期停止コールバックを適用することで、アダプターパラメータが特殊なトレーニングプロンプトパターンに過学習するのを防ぎます。
+
+## ファインチューニングされた重みをGGUFにエクスポートしてローカルで提供する方法
+
+ファインチューニングされた重みをGGUFにエクスポートしてローカルで提供するには、低ランクアダプター行列をベースモデルの重みにマージし、結合されたモデルを16ビットHugging Face形式で保存し、`llama.cpp`量子化ツールを使用してチェックポイントを変換します。ファインチューニングされた重みを4ビットまたは5ビットのGGUFファイルに量子化することで、カスタマイズされたモデルをOllamaまたはvLLM内で低VRAMフットプリントでローカルに実行できます。
+
+![GGUF Export & Ollama Deployment](/static/images/fine-tuning-llama-3-lora-unsloth-guide-gguf-export.jpg)
+
+Unslothには、アダプターのマージとGGUF量子化ファイルの構築をPythonコード内で直接自動化するネイティブエクスポートメソッドが含まれています。この組み込みのエクスポート機能により、外部の`llama.cpp` C++バイナリを手動でコンパイルする必要がなくなります。
+
+```python
+# Script demonstrating native GGUF export and Ollama Modelfile generation
+def export_model_to_gguf(model, tokenizer, output_dir: str):
+    print("Saving fine-tuned model and merging LoRA adapters...")
+    
+    # Save merged FP16 model and native 4-bit Q4_K_M GGUF file
+    model.save_pretrained_gguf(
+        output_dir,
+        tokenizer,
+        quantization_method="q4_k_m"
+    )
+    print(f"Exported Q4_K_M GGUF model successfully to {output_dir}")
+
+# Generate Modelfile for Ollama integration
+def generate_ollama_modelfile(gguf_filename: str) -> str:
+    modelfile_text = "FROM ./" + gguf_filename + "
+" + "PARAMETER temperature 0.2
+" + 'SYSTEM "You are a fine-tuned Python assistant."'
+    return modelfile_text
+```
+
+上記のPythonスニペットは、Unslothのネイティブ`.save_pretrained_gguf()`メソッドを使用してGGUFエクスポートを実行する方法を示しています。`q4_k_m`形式に直接エクスポートすると、即座にローカルデプロイメントできる最適化されたモデルファイルが生成されます。
+
+エクスポートされたGGUFモデルの重みの整合性を検証するには、チェックポイントを本番レジストリにプッシュする前に、ローカルCLIランタイムを使用してテキスト生成の精度をテストする必要があります。`llama-cli`を介してテスト評価プロンプトを実行することで、量子化中に特殊な制御トークンと文字エンコーディングマッピングが損なわれていないことを確認します。
+
+ファインチューニングされたGGUFモデルをローカルのOllamaデーモンにデプロイするには、`ollama create`を使用して名前付きモデル参照を構築します。開発者は、生成された`Modelfile`をコマンドに指定して、カスタムのファインチューニングされた重みをOllamaのローカルモデルインベントリに登録します。
+
+バージョン管理されたモデルアーティファクトを管理するには、ファインチューニングされたアダプターの重みをベースモデルの重みとは別にアーティファクトレジストリに保存する必要があります。コンパクトな20メガバイトのアダプターファイルをベースモデルのチェックサム参照とともに保存することで、エンジニアリングチーム全体でのアーティファクトのバージョン管理が簡素化されます。
+
+## Llama 3のファインチューニングに関する最も一般的な質問は何ですか？
+
+### UnslothとQLoRAでLlama 3 8Bをファインチューニングするには、どのくらいのVRAMが必要ですか？
+
+UnslothとQLoRAでLlama 3 8Bをファインチューニングするには、2000トークンのコンテキストシーケンス長を使用する場合、最低7ギガバイトのGPU VRAMが必要です。このメモリ効率により、NVIDIA RTX 3080やRTX 4080 GPUのようなコンシューマー向けグラフィックカードでのファインチューニングが可能になります。
+
+### ベースのLlama 3モデルと命令チューニングされたLlama 3モデルのどちらをファインチューニングすべきですか？
+
+ターゲットアプリケーションがチャットインタラクション、命令のフォロー、またはツール呼び出しを必要とする場合は、命令チューニングされたLlama 3モデルをファインチューニングすべきです。ベースモデルは、基本的なチャットターンフォーマットルールを学習するためには、はるかに大きな命令データセットを必要とします。
+
+### 効果的なLoRAドメイン適応には、いくつのトレーニングサンプルが必要ですか？
+
+特殊なタスク適応やスタイルアライメントの場合、500〜2000個のクリーンな命令サンプルを含む高品質なデータセットが強力な結果をもたらします。ドメイン知識の拡張には、数万個のサンプルを含むより大きなデータセットが必要です。
+
+### QLoRAファインチューニングは、完全なFP16ファインチューニングと比較してモデルの精度を低下させますか？
+
+広範な経験的研究により、4ビットNormalFloat量子化を使用したQLoRAファインチューニングは、標準のNLPベンチマーク全体で完全なFP16ファインチューニングの精度と一致し、ハードウェアメモリのごく一部しか使用しないことが示されています。
+
+### Unslothを使用してApple Silicon MacBookでLlama 3モデルをファインチューニングできますか？
+
+いいえ、UnslothにはNVIDIA CUDA GPUとカスタムTritonカーネルバインディングが必要です。Apple Silicon MacBookでオープンウェイトモデルをファインチューニングする場合、MLXやPyTorch MPSバックエンドを備えたAxolotlのようなフレームワークが推奨される選択肢です。
+
+### LoRAのランクパラメータとLoRAのアルファパラメータの違いは何ですか？
+
+LoRAのランクはアダプター行列の内部次元を定義し、トレーニング可能なパラメータの総容量を決定します。LoRAのアルファは、フォワードパス中にアダプター行列の重み更新をスケーリングするスケーリングファクターです。
+
+## ファインチューニングされたモデルを本番クラスターにデプロイする方法
+
+ファインチューニングされたモデルを本番クラスターにデプロイするには、vLLMやOllamaのような高スループット推論エンジンを使用して、マージされたGGUFまたはSafetensorsの重みを提供する必要があります。本番環境でマージされていないアダプターの重みを提供すると、推論のフォワードパス中に余分な計算レイテンシーが発生します。LoRAアダプターをベースモデルのパラメータにマージすることで、最大推論速度で実行される単一の統合モデルチェックポイントが作成されます。
+
+モデルのファインチューニングのための自動化された継続的インテグレーションパイプラインを確立することで、再現性のあるモデルデプロイメントが保証されます。CIワークフローは、データセット検証チェックを実行し、クラウドGPUワーカーで自動ファインチューニングジョブをトリガーし、テストベンチマークに対して出力パープレキシティを評価し、検証済みのGGUFアーティファクトを中央モデルレジストリに自動的に登録する必要があります。
+
+デプロイされたファインチューニング済みエンドポイント全体の推論パフォーマンスと出力品質を監視することで、継続的な運用フィードバックが得られます。レイテンシーメトリック、ユーザーフィードバック信号、およびトークン生成速度を追跡することで、カスタムモデルが実際の運用ワークロードで高いサービス品質を維持していることを確認します。
+
+LoRAのパラメータ効率、Unsloth Tritonカーネルアクセラレーション、および構造化されたGGUFエクスポートワークフローを組み合わせることで、エンドツーエンドのモデルカスタマイズパイプラインを確立できます。この技術スタックにより、ソフトウェアチームは高価なGPUクラスターインフラストラクチャを必要とせずに、オープンウェイトモデルを効率的に適応させることができます。
+
+## 関連コンテンツ
+
+- [Running Local ai Models with Ollama: My Journey from Server Bills to Privacy-First Development](/en/blog/running-local-ai-models-ollama)
+- [vLLM vs Ollama: Local LLM Throughput & GPU Benchmarks](/en/blog/vllm-vs-ollama-local-llm-benchmarking)
+- [Semantic Caching with Redis and Qdrant for LLM Cost Reduction](/en/blog/semantic-caching-redis-qdrant-llm-cost-reduction)
+- [Building Intent-Based UIs: The Future of frontend Development](/en/blog/intent-based-ui-architecture)

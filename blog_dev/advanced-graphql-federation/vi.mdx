@@ -1,0 +1,410 @@
+---
+title: "GraphQL Federation Nâng Cao: Xây Dựng Supergraph Phân Tán"
+date: "2026-09-06"
+lastmod: "2026-09-22"
+summary: "Xây dựng các API GraphQL phân tán cấp doanh nghiệp bằng Apollo Federation v2: giải quyết thực thể subgraph, tổng hợp schema, chỉ thị @key, chiến lược caching và định tuyến gateway với tối ưu hóa hiệu suất."
+tags: ["graphql", "federation", "api", "architecture", "typescript"]
+images: ["/static/images/advanced-graphql-federation.png"]
+draft: false
+---
+
+GraphQL federation là sự phát triển tự nhiên dành cho các tổ chức đã vượt quá quy mô của một lược đồ GraphQL đơn lẻ, nguyên khối. Khi các nhóm kỹ thuật mở rộng quy mô, việc duy trì một lược đồ thống nhất trở thành một nút thắt cổ chai về mặt tổ chức — mỗi trường mới đòi hỏi sự phối hợp với chủ sở hữu lược đồ, mỗi thay đổi gây lỗi sẽ ảnh hưởng đến tất cả người dùng.
+
+Federation giải quyết vấn đề này bằng một **supergraph phân tán**: nhiều nhóm duy trì các **subgraph** GraphQL độc lập, được kết hợp thành một API thống nhất duy nhất bởi một **gateway**. Các client truy vấn một endpoint và thấy một lược đồ mạch lạc; đằng sau hậu trường, gateway định tuyến các mảnh truy vấn đến các subgraph thích hợp và ghép nối các kết quả lại với nhau.
+
+Hướng dẫn này bao gồm Apollo Federation v2 (tiêu chuẩn hiện tại), các mẫu thiết kế subgraph, phân giải thực thể, giảm thiểu N+1 với DataLoaders, caching và các cân nhắc về hiệu suất sản xuất.
+
+<AudioPlayer src="/static/audio/advanced-graphql-federation.mp3" title="Tóm tắt âm thanh dành cho điều hành viên" />
+
+## Kiến trúc Supergraph
+
+```
+                    ┌─────────────────────────────────┐
+Client ────────────▶│        Apollo Router (Gateway)   │
+                    └─────┬─────────┬────────┬─────────┘
+                          │         │        │
+                    ┌─────▼──┐ ┌────▼──┐ ┌──▼──────┐
+                    │ Users  │ │Orders │ │ Products │
+                    │Subgraph│ │Subgraph│ │ Subgraph │
+                    └────────┘ └────────┘ └──────────┘
+                          │         │        │
+                    Postgres    MongoDB    Postgres
+```
+
+Client đưa ra một truy vấn duy nhất:
+```graphql
+query GetOrderWithDetails {
+  order(id: "ord_123") {
+    id
+    total
+    user {
+      name
+      email
+    }
+    items {
+      product {
+        name
+        price
+      }
+      quantity
+    }
+  }
+}
+```
+
+**Bộ lập kế hoạch truy vấn** của router chia truy vấn này thành các hoạt động con, tìm nạp dữ liệu từ các subgraph Orders, Users và Products song song nếu có thể, và hợp nhất kết quả. Client nhận được một phản hồi mà không cần biết về sự phân phối cơ bản.
+
+## Định nghĩa lược đồ Subgraph
+
+Mỗi subgraph sử dụng các chỉ thị dành riêng cho Federation để khai báo những gì nó sở hữu và những gì nó có thể đóng góp cho các subgraph khác.
+
+### Chỉ thị `@key`: Khai báo thực thể
+
+Chỉ thị `@key` khai báo một thực thể — một loại có thể được tham chiếu và mở rộng trên các subgraph. Khóa chỉ định (các) trường xác định duy nhất một phiên bản:
+
+**Subgraph Users:**
+```graphql
+# users-subgraph/schema.graphql
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key", "@shareable"])
+
+type User @key(fields: "id") {
+  id: ID!
+  name: String!
+  email: String!
+  createdAt: String!
+}
+
+type Query {
+  user(id: ID!): User
+  me: User
+}
+```
+
+**Subgraph Orders:**
+```graphql
+# orders-subgraph/schema.graphql
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key", "@external", "@requires"])
+
+# Reference the User entity defined in the Users subgraph
+type User @key(fields: "id") {
+  id: ID!
+  orders: [Order!]!
+}
+
+type Order @key(fields: "id") {
+  id: ID!
+  total: Float!
+  status: OrderStatus!
+  userId: ID!
+  user: User!
+  items: [OrderItem!]!
+}
+
+enum OrderStatus { PENDING, FULFILLED, CANCELLED }
+
+type OrderItem {
+  productId: ID!
+  quantity: Int!
+  unitPrice: Float!
+}
+
+type Query {
+  order(id: ID!): Order
+  orders(userId: ID!): [Order!]!
+}
+```
+
+Lưu ý rằng subgraph Orders khai báo `User @key(fields: "id")` chỉ với trường `id` — nó **tham chiếu** thực thể User mà không sở hữu nó. Gateway biết rằng để phân giải `order.user.name`, nó phải tìm nạp `userId` từ Orders trước, sau đó truy vấn Users với `{ _entities(representations: [{__typename: "User", id: $userId}]) }`.
+
+## Phân giải thực thể: Hàm `__resolveReference`
+
+Mọi thực thể phải triển khai một resolver `__resolveReference`. Gateway gọi hàm này khi cần phân giải các tham chiếu giữa các subgraph:
+
+```typescript
+// users-subgraph/resolvers.ts
+import { UserService } from "./services/UserService";
+
+const resolvers = {
+  User: {
+    // Called by the gateway with the entity "representation" (partial object containing @key fields)
+    __resolveReference: async (reference: { id: string }, context: Context) => {
+      return context.dataSources.userService.findById(reference.id);
+    },
+  },
+  Query: {
+    user: (_: unknown, { id }: { id: string }, context: Context) => {
+      return context.dataSources.userService.findById(id);
+    },
+    me: (_: unknown, __: unknown, context: Context) => {
+      return context.dataSources.userService.findById(context.userId);
+    },
+  },
+};
+```
+
+Gateway có thể gọi `__resolveReference` với một **lô** các biểu diễn trong một yêu cầu duy nhất (thông qua truy vấn `_entities`). Đây là nơi các vấn đề N+1 xuất hiện nếu bạn không cẩn thận.
+
+## Vấn đề N+1 trong Federation
+
+Hãy xem xét một truy vấn danh sách đơn hàng trả về 50 đơn hàng, mỗi đơn hàng có một trường `user`. Nếu không tối ưu hóa, gateway sẽ:
+
+1. Tìm nạp 50 đơn hàng từ subgraph Orders (1 truy vấn)
+2. Đối với người dùng của mỗi đơn hàng, gọi `_entities` 50 lần đến subgraph Users (50 truy vấn)
+
+Tổng cộng: **51 cuộc gọi subgraph** để hiển thị một trang.
+
+### Giải pháp: DataLoader trong `__resolveReference`
+
+Apollo Router tự động **gom nhóm** các yêu cầu phân giải thực thể. Nó thu thập tất cả các tham chiếu `User` từ một hoạt động và gửi chúng trong một truy vấn `_entities` duy nhất. Nhưng `__resolveReference` của bạn vẫn phải xử lý điều này một cách hiệu quả:
+
+```typescript
+import DataLoader from "dataloader";
+
+// Create a DataLoader per request (in context factory)
+export function createUserLoader(db: Database): DataLoader<string, User> {
+  return new DataLoader(
+    async (userIds: readonly string[]) => {
+      // Single DB query fetches all users at once
+      const users = await db.query(
+        "SELECT * FROM users WHERE id = ANY($1)",
+        [userIds]
+      );
+      
+      // DataLoader requires results in the same order as input keys
+      const userMap = new Map(users.map((u) => [u.id, u]));
+      return userIds.map((id) => userMap.get(id) ?? new Error(`User ${id} not found`));
+    },
+    { cache: true }   // cache within request — same user requested twice = one DB hit
+  );
+}
+
+// In context factory:
+const context = {
+  loaders: { user: createUserLoader(db) }
+};
+
+// In resolver:
+const resolvers = {
+  User: {
+    __resolveReference: async (reference: { id: string }, context: Context) => {
+      return context.loaders.user.load(reference.id);
+    },
+  },
+};
+```
+
+Với mẫu này: 50 đơn hàng → 1 cuộc gọi theo lô đến subgraph Users → 1 truy vấn SQL. Tổng cộng: **2 cuộc gọi subgraph**.
+
+## Chỉ thị `@requires`: Các trường được tính toán
+
+Đôi khi một subgraph cần các trường từ một subgraph khác để tính toán các trường của riêng nó. Chỉ thị `@requires` khai báo sự phụ thuộc này:
+
+```graphql
+# shipping-subgraph/schema.graphql
+type User @key(fields: "id") {
+  id: ID!
+  address: String! @external       # owned by Users subgraph
+  shippingZone: ShippingZone!      # computed from address by Shipping subgraph
+    @requires(fields: "address")
+}
+```
+
+```typescript
+const resolvers = {
+  User: {
+    __resolveReference: async (reference: { id: string; address: string }) => {
+      // `address` is provided by the gateway from the Users subgraph
+      return {
+        id: reference.id,
+        shippingZone: computeShippingZone(reference.address),
+      };
+    },
+  },
+};
+```
+
+Bộ lập kế hoạch truy vấn của gateway tự động tìm nạp `address` từ Users trước khi gọi subgraph Shipping. Bạn khai báo sự phụ thuộc; router sẽ tìm ra thứ tự thực thi.
+
+## Thành phần lược đồ với Rover CLI
+
+Apollo Rover là CLI để quản lý lược đồ supergraph của bạn:
+
+```bash
+# Install Rover
+curl -sSL https://rover.apollo.dev/nix/latest | sh
+
+# Check subgraph schema for Federation compatibility
+rover subgraph check my-graph@production \
+  --schema ./users-subgraph/schema.graphql \
+  --name users
+
+# Publish subgraph schema to Apollo Studio
+rover subgraph publish my-graph@production \
+  --schema ./users-subgraph/schema.graphql \
+  --name users \
+  --routing-url https://users.internal.example.com/graphql
+
+# Compose supergraph schema locally (for CI validation)
+rover supergraph compose --config ./supergraph.yaml > supergraph-schema.graphql
+```
+
+**`supergraph.yaml`:**
+```yaml
+federation_version: =2.3.5
+subgraphs:
+  users:
+    routing_url: https://users.internal.example.com/graphql
+    schema:
+      file: ./users-subgraph/schema.graphql
+  orders:
+    routing_url: https://orders.internal.example.com/graphql
+    schema:
+      file: ./orders-subgraph/schema.graphql
+  products:
+    routing_url: https://products.internal.example.com/graphql
+    schema:
+      file: ./products-subgraph/schema.graphql
+```
+
+**Luôn chạy `rover supergraph compose` trong CI** trước khi triển khai bất kỳ thay đổi lược đồ subgraph nào. Các lỗi thành phần (như định nghĩa loại xung đột hoặc chuỗi `@requires` không hợp lệ) sẽ thất bại nhanh chóng ở đây thay vì trong thời gian chạy.
+
+## Chiến lược Caching
+
+Federation giới thiệu nhiều ranh giới bộ nhớ đệm. Một chiến lược caching được thiết kế tốt là rất cần thiết cho hiệu suất:
+
+### 1. Caching phản hồi cấp Subgraph
+
+Sử dụng các chỉ thị `@cacheControl` để chú thích TTL trên mỗi trường:
+
+```graphql
+type Product @key(fields: "id") @cacheControl(maxAge: 300) {
+  id: ID!
+  name: String! @cacheControl(maxAge: 3600)    # rarely changes
+  price: Float! @cacheControl(maxAge: 60)       # changes more often
+  stockCount: Int! @cacheControl(maxAge: 0)     # never cache
+}
+```
+
+Apollo Router tôn trọng các tiêu đề `Cache-Control` từ các subgraph và có thể phục vụ các phản hồi supergraph được lưu trong bộ nhớ đệm cho các truy vấn công khai/đã xác thực một cách riêng biệt.
+
+### 2. DataLoader caching (phạm vi yêu cầu)
+
+Như đã trình bày ở trên, DataLoader lưu vào bộ nhớ đệm trong một yêu cầu duy nhất. Không bao giờ sử dụng lại các phiên bản DataLoader giữa các yêu cầu — chúng sẽ phục vụ dữ liệu cũ.
+
+### 3. Redis cho các thực thể nóng
+
+Đối với các thực thể được đọc nhiều (ví dụ: danh mục sản phẩm ít thay đổi):
+
+```typescript
+async function findProductById(id: string): Promise<Product> {
+  const cached = await redis.get(`product:${id}`);
+  if (cached) return JSON.parse(cached);
+  
+  const product = await db.products.findById(id);
+  await redis.setex(`product:${id}`, 300, JSON.stringify(product)); // 5-min TTL
+  return product;
+}
+```
+
+## Triển khai Apollo Router
+
+Apollo Router là gateway cấp sản xuất được viết bằng Rust, thay thế Apollo Gateway Node.js:
+
+```yaml
+# router.yaml
+supergraph:
+  path: /graphql
+
+cors:
+  origins:
+    - https://app.example.com
+  
+headers:
+  all:
+    request:
+      - propagate:
+          matching: ^x-.*   # forward all x-* headers to subgraphs
+
+traffic_shaping:
+  all:
+    deduplicate_variables: true
+  router:
+    timeout: 30s
+  subgraphs:
+    users:
+      timeout: 5s
+    orders:
+      timeout: 10s
+
+telemetry:
+  exporters:
+    tracing:
+      otlp:
+        endpoint: http://otel-collector:4317
+```
+
+Chạy nó:
+```bash
+docker run -p 4000:4000 \
+  -v $(pwd)/supergraph-schema.graphql:/app/supergraph.graphql \
+  -v $(pwd)/router.yaml:/app/router.yaml \
+  ghcr.io/apollographql/router:v1.46.0 \
+  --supergraph /app/supergraph.graphql \
+  --config /app/router.yaml
+```
+
+Apollo Router xử lý ~8 triệu yêu cầu/giây trên một lõi cho các truy vấn đơn giản — nhanh hơn nhiều lần so với gateway Node.js.
+
+## Lập kế hoạch truy vấn và hiệu suất
+
+Bộ lập kế hoạch truy vấn của Apollo Router tạo ra một **kế hoạch thực thi** cho mọi hoạt động đến. Bạn có thể kiểm tra các kế hoạch bằng:
+
+```bash
+curl -X POST http://localhost:4000/graphql \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ order(id: \"123\") { user { name } items { product { name } } } }"}' \
+  -H "Apollo-Query-Plan-Experimental: true"
+```
+
+Tối ưu hóa các kế hoạch truy vấn bằng cách:
+- **Giảm các bước nhảy thực thể**: Thiết kế lược đồ sao cho các truy vấn phổ biến cần ít bước nhảy giữa các subgraph hơn
+- **Đặt dữ liệu được kết hợp thường xuyên cùng vị trí**: Nếu `order.user` luôn được tìm nạp cùng nhau, hãy cân nhắc thêm các trường `User` trực tiếp vào subgraph Orders thay vào đó
+- **Sử dụng `@interfaceObject`**: Đối với các loại đa hình trải rộng trên các subgraph (Federation v2.3+)
+
+## Quản trị lược đồ ở quy mô lớn
+
+Với nhiều nhóm sở hữu các subgraph, quản trị lược đồ ngăn chặn sự sai lệch và các thay đổi gây lỗi:
+
+1. **Phát hiện thay đổi gây lỗi** — Các kiểm tra lược đồ của Apollo Studio chặn các triển khai gây lỗi cho các hoạt động hiện có
+2. **Đề xuất lược đồ** — Sử dụng Đề xuất lược đồ Apollo cho việc xem xét kiểu RFC giữa các nhóm đối với các thay đổi lớn
+3. **Lược đồ theo nhu cầu** — Mỗi nhóm sở hữu các loại phù hợp với miền dịch vụ của họ; không có các thay đổi giữa các nhóm
+4. **Hợp đồng** — Định nghĩa các chế độ xem lược đồ được lọc cho mỗi client (di động, web, API đối tác) bằng cách sử dụng Hợp đồng Apollo
+
+## Các câu hỏi thường gặp
+
+**Federation v1 so với v2 — tôi có nên di chuyển không?**
+Có, nếu có thể. Federation v2 bổ sung `@interfaceObject`, `@authenticated`, `@requiresScopes`, `@override` được cải thiện cho các lần di chuyển dần dần và các thông báo lỗi thành phần tốt hơn. Apollo Gateway (thời gian chạy v1) đang ở chế độ bảo trì; Apollo Router là tiêu chuẩn hiện tại.
+
+**Tôi có thể sử dụng Federation mà không cần Apollo Studio không?**
+Có. Rover CLI tạo các lược đồ cục bộ. Apollo Router chạy mà không cần kết nối Apollo Studio. Studio bổ sung tính năng quản lý federation (đẩy lược đồ subgraph, cập nhật router tự động) rất hữu ích ở quy mô lớn nhưng không bắt buộc.
+
+**Làm cách nào để xử lý xác thực trên các subgraph?**
+Truyền tiêu đề `Authorization` từ router đến tất cả các subgraph (cấu hình `headers.all.request.propagate`). Mỗi subgraph xác thực mã thông báo độc lập, hoặc bạn có thể sử dụng thư viện xác thực dùng chung. Không bao giờ tin tưởng các yêu cầu `userId` trong phần thân yêu cầu — luôn xác thực JWT.
+
+**Chi phí hiệu suất của federation so với một monolith là gì?**
+Hãy mong đợi độ trễ bổ sung 5–15ms cho mỗi bước nhảy subgraph đối với các truy vấn đơn giản (RTT mạng bên trong cụm của bạn). Đối với các truy vấn đa subgraph phức tạp, việc thực thi song song giảm thiểu điều này. Bộ lập kế hoạch truy vấn Rust của Apollo Router bổ sung chi phí <1ms. Ở quy mô lớn, lợi ích về mặt tổ chức (quyền tự chủ của nhóm, triển khai độc lập) vượt xa chi phí độ trễ.
+
+## Tổng kết
+
+GraphQL Federation không chỉ là một mẫu kỹ thuật — đó là một chiến lược mở rộng quy mô tổ chức. Các nhóm thành thạo nó có thể triển khai các thay đổi subgraph một cách độc lập, lặp lại trên lược đồ của họ mà không cần chi phí phối hợp và phát triển phần API của họ theo tốc độ riêng.
+
+Các nguyên tắc chính: sở hữu các thực thể của bạn một cách rõ ràng, triển khai `__resolveReference` với DataLoaders, khai báo các phụ thuộc `@requires` một cách rõ ràng và để router xử lý việc ghép nối. Xác thực thành phần trong CI ngăn chặn các lỗi phổ biến nhất giữa các nhóm.
+
+## Bạn cũng có thể thích
+
+- [Các mẫu TypeScript nâng cao cho ứng dụng doanh nghiệp](/en/blog/ts-advanced-patterns)
+- [TypeScript Generics: Các mẫu nâng cao cho API an toàn kiểu](/en/blog/typescript-generics-advanced-patterns)
+- [Xây dựng Monorepo TypeScript hiện đại](/en/blog/typescript-monorepo-guide)
+- [Tối ưu hóa hiệu suất kiểm thử đơn vị Vitest Monorepo](/en/blog/vitest-monorepo-unit-testing-performance)

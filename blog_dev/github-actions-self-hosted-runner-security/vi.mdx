@@ -1,0 +1,306 @@
+---
+title: "Tăng cường bảo mật cho GitHub Actions Self-Hosted Runner"
+images:
+  - '/static/images/github-actions-self-hosted-runner-security-featured.jpg'
+  - '/static/images/github-actions-self-hosted-runner-security-threat-model.jpg'
+  - '/static/images/github-actions-self-hosted-runner-security-arc-ephemeral.jpg'
+  - '/static/images/github-actions-self-hosted-runner-security-network-isolation.jpg'
+  - '/static/images/github-actions-self-hosted-runner-security-rootless-container.jpg'
+  - '/static/images/github-actions-self-hosted-runner-security-oidc-tokens.jpg'
+date: '2026-07-29'
+tags: ["github-actions", "security", "devops", "kubernetes", "ci-cd"]
+draft: false
+summary: "Tăng cường bảo mật cho GitHub Actions runner tự host bằng Actions Runner Controller (ARC), cô lập mạng, container không root và OIDC token có thời hạn ngắn."
+authors: ['default']
+category: Tech
+---
+
+
+Chúng tôi cần thêm sức mạnh tính toán cho các pipeline CI của mình, vì vậy chúng tôi đã triển khai một số runner GitHub Actions tự host. Cảm giác thật tuyệt vời—các bản build nhanh chóng và chúng tôi có quyền truy cập trực tiếp vào VPC của mình. Sau đó, đội ngũ bảo mật của chúng tôi đã kiểm tra thiết lập này.
+
+Hóa ra, việc triển khai các runner tự host liên tục mà không có ranh giới nghiêm ngặt về cơ bản là trao chìa khóa vào mạng nội bộ của bạn. Nếu một PR không đáng tin cậy thực thi mã độc hại bên trong một runner không được bảo vệ, bạn đang phơi bày các microservice nội bộ và thông tin xác thực AWS của mình. Sau nhiều tuần khóa chặt hạ tầng của mình, đây là cách chúng tôi thực sự bảo mật các runner của mình bằng cách sử dụng các pod tạm thời, container không có quyền root, kiểm soát egress mạng nghiêm ngặt và OIDC.
+
+<AudioPlayer src="/static/audio/github-actions-self-hosted-runner-security.mp3" title="Tóm tắt âm thanh dành cho điều hành" />
+
+## Vấn đề với các Runner liên tục
+
+Sai lầm lớn nhất mà chúng tôi mắc phải ban đầu là coi các runner như các máy chủ liên tục. Khi nhiều workflow CI/CD chia sẻ một máy ảo duy nhất, một script build độc hại (hoặc thậm chí chỉ có lỗi) có thể để lại các tiến trình backdoor, sửa đổi các dependency được lưu trong bộ nhớ cache hoặc đọc các biến môi trường còn sót lại từ một pipeline trước đó.
+
+Nếu ai đó gửi một PR chứa một lệnh build độc hại, runner sẽ thực thi nó với các đặc quyền mặc định của nó. Đột nhiên, script đó có khả năng xâm phạm hệ điều hành máy chủ.
+
+![Mô hình mối đe dọa của Runner tự host](/static/images/github-actions-self-hosted-runner-security-threat-model.jpg)
+
+Tài liệu chính thức của GitHub cảnh báo rõ ràng về việc sử dụng các runner tự host cho các kho lưu trữ công khai vì các pull request từ các fork bên ngoài có thể chạy mã workflow tùy ý. Ngay cả trong các kho lưu trữ doanh nghiệp riêng tư hoặc nội bộ, bất kỳ nhà phát triển nào có quyền đọc và mở một pull request đều có thể thực thi các tệp workflow đã sửa đổi trên các runner tự host mục tiêu. Các vector tấn công như đầu độc chuỗi cung ứng (được thấy trong các sự cố nổi tiếng như chiến dịch Shai-Hulud và các lỗ hổng hành động tj-actions) khai thác sự cô lập runner yếu để trích xuất các bí mật kho lưu trữ và di chuyển ngang vào hạ tầng AWS hoặc Kubernetes nội bộ.
+
+Một vector đe dọa lớn khác là sự tồn tại của thông tin xác thực trên bộ nhớ đĩa của runner. Các thiết lập runner truyền thống lưu trữ các khóa truy cập AWS tĩnh, mã thông báo truy cập cá nhân GitHub hoặc khóa SSH riêng tư bên trong các tệp môi trường hoặc các mount volume đĩa. Khi một workflow bị xâm phạm thực thi các lệnh với các đặc quyền nâng cao, nó có thể đổ nội dung đĩa, truy cập các socket daemon Docker xung quanh hoặc giao tiếp với các dịch vụ siêu dữ liệu đám mây như `169.254.169.254` để đánh cắp thông tin xác thực vai trò IAM của instance.
+```
++------------------------+           1. Malicious PR           +-----------------------+
+| External Attacker /    | ----------------------------------> | GitHub Repository     |
+| Forked Repository      |                                     | (Workflow Trigger)    |
++------------------------+                                     +-----------------------+
+                                                                           |
+                                                                           | 2. Schedules Work
+                                                                           v
++------------------------+           4. Exfiltrate Secrets     +-----------------------+
+| Attacker Command Server| <---------------------------------- | Self-Hosted Runner    |
+| (Exfiltration Vector)  |                                     | (Persistent Instance) |
++------------------------+                                     +-----------------------+
+                                                                           |
+                                                                           | 3. Lateral Movement
+                                                                           v
+                                                               +-----------------------+
+                                                               | Internal VPC Services |
+                                                               | (Databases / Metadata)|
+                                                               +-----------------------+
+```
+
+## Sử dụng ARC để cô lập tạm thời
+
+Chúng tôi đã khắc phục vấn đề liên tục bằng cách chuyển sang Actions Runner Controller (ARC). Thay vì các VM tĩnh, ARC tự động tạo ra các pod Kubernetes dùng một lần tự hủy ngay sau khi xử lý một công việc workflow duy nhất.
+
+Vì mỗi pod runner kết thúc hoàn toàn khi công việc hoàn thành, không có trạng thái nào còn lại. Mã độc hại không thể tồn tại trên đĩa hoặc lây nhiễm các bản build tiếp theo.
+
+![Tự động điều chỉnh quy mô Pod tạm thời của ARC](/static/images/github-actions-self-hosted-runner-security-arc-ephemeral.jpg)
+
+Bằng cách đặt `ephemeral: true` trong cấu hình ARC của bạn, bạn buộc mỗi container runner phải thực thi chính xác một công việc trước khi Kubernetes hủy pod. Bất kỳ tệp tạm thời nào được ghi vào `/tmp` hoặc các tạo phẩm bộ nhớ xung quanh đều bị xóa ngay lập tức. Nó chuyển đổi hạ tầng của bạn thành một môi trường tính toán sạch sẽ, giống như các runner do GitHub host, nhưng theo các điều khoản của riêng bạn.
+
+Hãy để tôi chỉ cho bạn một cấu hình Helm cấp sản xuất để triển khai Actions Runner Controller với các bộ tự động điều chỉnh quy mô tạm thời:
+
+```yaml
+githubWebhookServer:
+  enabled: true
+
+autoscalingRunnerSets:
+  - name: hardened-k8s-runner
+    githubConfigUrl: "https://github.com/company-org"
+    minReplicas: 2
+    maxReplicas: 50
+    ephemeral: true
+    template:
+      spec:
+        containers:
+          - name: runner
+            image: ghcr.io/actions/actions-runner:latest
+            command: ["/home/runner/run.sh"]
+            resources:
+              limits:
+                cpu: "4"
+                memory: "8Gi"
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 1001
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: false
+              capabilities:
+                drop:
+                  - ALL
+```
+
+Trong cấu hình ARC này, `minReplicas: 2` duy trì một nhóm nhỏ các pod sẵn sàng để loại bỏ độ trễ khởi động lạnh, trong khi `maxReplicas: 50` cho phép các đợt build đột ngột mở rộng quy mô một cách an toàn. Vì `ephemeral: true` được thực thi ở cấp định nghĩa tài nguyên tùy chỉnh, ứng dụng runner GitHub chuyển cờ `--ephemeral` trong quá trình đăng ký. Sau khi workflow đang hoạt động hoàn thành bước cuối cùng, tác nhân runner tự hủy đăng ký khỏi GitHub và chấm dứt container, nhắc toán tử ARC tạo một pod thay thế mới.
+
+## Làm thế nào để áp dụng lọc egress mạng và tường lửa cho các node Runner?
+
+Bạn áp dụng lọc egress mạng cho các node runner bằng cách triển khai Kubernetes NetworkPolicies, cấu hình các quy tắc firewalld cấp máy chủ và định tuyến lưu lượng runner ra ngoài thông qua các máy chủ proxy egress hạn chế. Theo mặc định, các pod trong các cụm Kubernetes có thể giao tiếp tự do với bất kỳ địa chỉ IP nào bên trong VPC của cụm, bao gồm các endpoint cơ sở dữ liệu nội bộ, bộ nhớ cache Redis và giao diện siêu dữ liệu của nhà cung cấp đám mây. Việc triển khai các ranh giới mạng zero-trust hạn chế các runner tự host để chúng chỉ có thể kết nối với các API bên ngoài được ủy quyền và các endpoint GitHub cần thiết.
+
+![Lọc egress mạng và tường lửa](/static/images/github-actions-self-hosted-runner-security-network-isolation.jpg)
+
+Bước đầu tiên trong việc bảo vệ mạng là chặn quyền truy cập vào các dịch vụ siêu dữ liệu đám mây. Các dịch vụ siêu dữ liệu instance đám mây (IMDSv1) chạy tại `169.254.169.254` cho phép bất kỳ tiến trình cục bộ nào tìm nạp thông tin xác thực vai trò IAM của node mà không cần xác thực. Nếu một script build độc hại thực thi bên trong pod runner của bạn, nó có thể truy vấn IMDS để lấy thông tin xác thực đám mây tạm thời với các quyền được gắn vào node worker cơ bản. Các chính sách mạng phải rõ ràng loại bỏ tất cả lưu lượng truy cập hướng đến các địa chỉ IP siêu dữ liệu cục bộ không thể định tuyến.
+
+Dưới đây là một manifest Kubernetes NetworkPolicy cấp sản xuất cô lập các pod runner tự host:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-runner-egress
+  namespace: actions-runners
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hardened-k8s-runner
+  policyTypes:
+    - Egress
+  egress:
+    # 1. Allow CoreDNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+    # 2. Allow outbound HTTPS to GitHub API and package registries
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+```
+
+Lưu ý cách `ipBlock.except` chặn tất cả các không gian địa chỉ IPv4 riêng tư (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) cùng với `169.254.169.254/32`. Chính sách này ngăn các pod runner bị xâm phạm quét các mạng công ty nội bộ hoặc kết nối với các cơ sở dữ liệu staging nội bộ. Nếu workflow build của bạn yêu cầu truy cập vào một registry container nội bộ hoặc kho lưu trữ tạo phẩm cụ thể, hãy thêm rõ ràng khối CIDR IP của dịch vụ mục tiêu vào mảng quy tắc egress được phép.
+
+Đối với các môi trường doanh nghiệp yêu cầu kiểm toán cấp miền nghiêm ngặt, hãy triển khai proxy Squid outbound hoặc Cilium Network Policy với lọc FQDN. Cấu hình các biến môi trường `HTTPS_PROXY` bên trong các thông số kỹ thuật của pod runner buộc tất cả lưu lượng web đi qua lớp proxy, nơi các quy tắc danh sách trắng miền chỉ cho phép kết nối đến `github.com`, `api.github.com`, `npm.pkg.github.com` và các mirror dependency được phê duyệt.
+
+## Làm thế nào để thực thi cô lập sandbox không có quyền root cho các workflow Docker-in-Docker?
+
+Bạn thực thi cô lập sandbox không có quyền root cho các workflow Docker-in-Docker bằng cách chạy các daemon container trong các không gian tên người dùng, triển khai các runtime container gVisor hoặc thay thế các mount socket Docker bằng Kaniko và Buildah cho các bản build hình ảnh container. Các thiết lập Docker-in-Docker (DinD) truyền thống yêu cầu mount `/var/run/docker.sock` từ VM máy chủ vào các container runner hoặc chạy các pod với `privileged: true`. Cấp quyền root hoặc phơi bày socket Docker của máy chủ cung cấp cho các workflow được container hóa quyền truy cập root đầy đủ vào máy chủ, cho phép khai thác thoát container hoàn toàn.
+
+![Cô lập Sandbox Container không có quyền root](/static/images/github-actions-self-hosted-runner-security-rootless-container.jpg)
+
+Việc phơi bày `/var/run/docker.sock` cho phép bất kỳ tiến trình nào bên trong container runner thực thi `docker run -v /:/host alpine` và giành quyền truy cập đọc-ghi root vào hệ thống tệp gốc của máy chủ. Để loại bỏ mối nguy hiểm bảo mật này, bạn nên di chuyển các pipeline build sang các công cụ container không có quyền root như Podman, Buildah hoặc chế độ Docker Rootless. Các công cụ container không có quyền root chạy hoàn toàn trong các không gian tên người dùng không có đặc quyền, đảm bảo rằng ngay cả khi kẻ tấn công giành quyền root bên trong container build, chúng vẫn là người dùng không có đặc quyền (UID 10001) trên hệ điều hành máy chủ.
+
+Đối với các khối lượng công việc yêu cầu nghiêm ngặt việc xây dựng hình ảnh container OCI bên trong các pipeline CI, hãy sử dụng Kaniko thay vì các daemon Docker. Kaniko thực thi các bản build hình ảnh container trong không gian người dùng mà không yêu cầu các daemon Docker hoặc các ngữ cảnh bảo mật có đặc quyền.
+
+Dưới đây là một ví dụ về bước workflow GitHub Actions thực thi các bản build container không có quyền root bằng Kaniko:
+
+```yaml
+name: Build Hardened Container Image
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: self-hosted-ephemeral
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build and Push Image with Kaniko
+        run: |
+          /kaniko/executor             --context=dir://.             --dockerfile=Dockerfile             --destination=ghcr.io/company-org/api-service:${{ github.sha }}             --cache=true             --single-snapshot
+```
+
+Khi cô lập bảo mật cao là bắt buộc, hãy cấu hình các node worker Kubernetes của bạn để chạy các pod runner dưới gVisor (`runsc`). gVisor hoạt động như một kernel ứng dụng chặn các lệnh gọi hệ thống container, tạo ra một ranh giới ảo hóa mạnh mẽ giữa script build và kernel Linux của máy chủ. Nếu một dependency độc hại cố gắng khai thác lỗ hổng kernel (như lỗi dirty COW hoặc use-after-free), sandbox gVisor sẽ chặn lệnh gọi hệ thống, ngăn chặn việc xâm phạm kernel máy chủ.
+
+## Làm thế nào để quản lý thông tin xác thực ngắn hạn bằng cách sử dụng mã thông báo GitHub OIDC?
+
+Bạn quản lý thông tin xác thực ngắn hạn bằng cách cấu hình liên kết danh tính GitHub OpenID Connect (OIDC) với các nhà cung cấp đám mây để trao đổi JSON Web Tokens (JWT) lấy thông tin xác thực phiên IAM ngắn hạn. Việc lưu trữ thông tin xác thực đám mây dài hạn như `AWS_ACCESS_KEY_ID` và `AWS_SECRET_ACCESS_KEY` trong các bí mật GitHub tạo ra rủi ro vĩnh viễn nếu các giá trị bí mật bị rò rỉ hoặc in ra nhật ký workflow. Liên kết OIDC cho phép các runner tự host xác thực động mà không cần lưu trữ các chuỗi bí mật tĩnh.
+
+![Quản lý thông tin xác thực OIDC ngắn hạn](/static/images/github-actions-self-hosted-runner-security-oidc-tokens.jpg)
+
+Khi một bước workflow yêu cầu xác thực OIDC, tác nhân runner GitHub Actions sẽ tìm nạp mã thông báo OIDC JWT trực tiếp từ dịch vụ mã thông báo GitHub. Mã thông báo này chứa các tuyên bố đã ký xác minh danh tính kho lưu trữ, sự kiện kích hoạt workflow, nhánh mục tiêu và ngữ cảnh thực thi công việc. Runner chuyển mã thông báo JWT này đến các endpoint STS của nhà cung cấp đám mây (như AWS STS `AssumeRoleWithWebIdentity`), nơi xác thực chữ ký dựa trên các khóa OIDC công khai của GitHub và cấp một thông tin xác thực đám mây tạm thời có giá trị trong một giờ.
+
+Dưới đây là một chính sách tin cậy vai trò AWS IAM được bảo vệ nghiêm ngặt hạn chế việc giả định vai trò OIDC cho các kho lưu trữ và nhánh cụ thể:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:company-org/production-service:ref:refs/heads/main"
+        }
+      }
+    }
+  ]
+}
+```
+
+Lưu ý điều kiện kiểm tra `token.actions.githubusercontent.com:sub` nghiêm ngặt. Điều kiện này đảm bảo rằng chỉ các workflow chạy từ nhánh `main` của kho lưu trữ `company-org/production-service` mới có thể giả định vai trò IAM. Nếu một nhà phát triển mở một pull request từ một nhánh tính năng hoặc fork bên ngoài, AWS STS sẽ từ chối yêu cầu giả định vai trò vì tuyên bố `sub` của mã thông báo không khớp với mẫu nhánh yêu cầu.
+
+Cấu hình tệp workflow GitHub Actions của bạn để yêu cầu các quyền tối thiểu bằng cách sử dụng khối `permissions`:
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: self-hosted-ephemeral
+    steps:
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-actions-runner-role
+          aws-region: us-east-1
+```
+
+Việc đặt `id-token: write` cấp cho công việc quyền tìm nạp mã thông báo OIDC JWT, trong khi đặt `contents: read` hạn chế quyền truy cập kho lưu trữ ở chế độ chỉ đọc. Việc đặt các quyền rõ ràng nghiêm ngặt trên mỗi workflow ngăn chặn việc gán phạm vi mã thông báo rộng mặc định.
+
+## Làm thế nào để kiểm tra và giám sát hoạt động thực thi Runner tự host?
+
+Bạn kiểm tra hoạt động của runner tự host bằng cách bật Nhật ký kiểm toán tổ chức GitHub, thu thập dữ liệu từ xa runtime container thông qua các cảm biến eBPF như Falco và tập trung nhật ký stdout của pod runner vào các nền tảng SIEM. Giám sát bảo mật liên tục đảm bảo rằng việc thực thi tiến trình đáng ngờ, các kết nối mạng ra ngoài không mong muốn hoặc các nỗ lực leo thang đặc quyền được phát hiện và cảnh báo trong thời gian thực.
+
+Các công cụ giám sát eBPF như Sysdig Falco cài đặt trực tiếp trên các node worker Kubernetes để quan sát các lệnh gọi hệ thống được thực hiện bởi các tiến trình runner. Các quy tắc Falco phát hiện hành vi bất thường như tạo các phiên shell tương tác trái phép bên trong các pod runner, thực thi các công cụ biên dịch nhị phân bên trong các thư mục không mong muốn hoặc đọc các tệp cấu hình máy chủ nhạy cảm.
+
+Dưới đây là một quy tắc bảo mật Falco cấp sản xuất được thiết kế để phát hiện việc thực thi shell trái phép bên trong các container runner tự host:
+
+```yaml
+- rule: Unauthorized Shell Spawn in Runner Pod
+  desc: Detect unexpected interactive shell processes spawned inside Actions Runner containers
+  condition: >
+    container.image.repository contains "actions-runner" and
+    evt.type = execve and
+    proc.name in (bash, sh, zsh, ksh) and
+    not proc.pname in (run.sh, Runner.Listener)
+  output: >
+    Unexpected shell execution detected inside runner container
+    (user=%user.name command=%proc.cmdline pod=%container.name image=%container.image.repository)
+  priority: WARNING
+  tags: [ci_cd, container, security]
+```
+
+Ngoài việc giám sát eBPF runtime, hãy cấu hình các webhook trong GitHub để theo dõi đăng ký runner và các sự kiện vòng đời thực thi. Đăng ký các sự kiện webhook `workflow_job` ghi lại thời điểm các công việc bắt đầu, nhóm runner nào đã xử lý việc thực thi và thời gian thực thi. Việc đối chiếu nhật ký kiểm toán webhook GitHub với dấu thời gian tạo pod Kubernetes cung cấp khả năng truy xuất nguồn gốc đầy đủ cho các cuộc điều tra phản ứng sự cố.
+
+Cuối cùng, hạn chế phạm vi runner của tổ chức bằng cách sử dụng Runner Groups. Trong cài đặt tổ chức GitHub, gán các nhóm runner tự host cho các Runner Groups chuyên dụng với danh sách truy cập kho lưu trữ rõ ràng. Việc hạn chế các runner sản xuất nhạy cảm để chúng chỉ có thể được nhắm mục tiêu bởi các kho lưu trữ hạ tầng được phê duyệt ngăn chặn các ứng dụng trái phép lên lịch khối lượng công việc trên phần cứng runner chuyên dụng.
+
+## Các câu hỏi thường gặp về bảo mật Runner tự host là gì?
+
+### Có an toàn khi sử dụng các runner tự host cho các kho lưu trữ GitHub mã nguồn mở công khai không?
+
+Không, việc sử dụng các runner tự host cho các kho lưu trữ công khai cực kỳ nguy hiểm và bị GitHub rõ ràng không khuyến khích. Các kho lưu trữ công khai chấp nhận các pull request từ bất kỳ ai trên internet, cho phép các tác nhân độc hại gửi các workflow pull request thực thi mã tùy ý trên hạ tầng runner của bạn. Nếu bạn phải sử dụng phần cứng tự host cho các dự án công khai, hãy sử dụng các runner Kubernetes tạm thời kết hợp với các yêu cầu phê duyệt pull request thủ công nghiêm ngặt cho tất cả các cộng tác viên bên ngoài.
+
+### Actions Runner Controller xử lý việc dọn dẹp như thế nào nếu một pod runner gặp sự cố giữa chừng công việc?
+
+Khi một pod runner gặp sự cố hoặc mất kết nối node giữa chừng công việc, toán tử ARC sẽ phát hiện lỗi trạng thái pod thông qua các watch API Kubernetes và đánh dấu instance runner là ngoại tuyến. Bộ điều khiển gửi yêu cầu dọn dẹp đến API GitHub để hủy đăng ký runner ngoại tuyến, xóa tài nguyên pod bị lỗi và tạo một pod thay thế mới để duy trì số lượng `minReplicas` đã cấu hình. Vòng lặp tự phục hồi tự động này ngăn các pod cũ, bị hỏng vẫn còn trong các nhóm dịch vụ.
+
+### Sự khác biệt giữa các bộ quy mô Actions Runner Controller (ARC) và các triển khai runner cũ là gì?
+
+Các bộ quy mô ARC đại diện cho kiến trúc hiện đại để quản lý các runner tự host trong Kubernetes, thay thế các tài nguyên tùy chỉnh RunnerDeployment và RunnerReplicaSet cũ. Các bộ quy mô giao tiếp với GitHub qua WebSockets thay vì thăm dò liên tục, dẫn đến độ trễ gửi công việc nhanh hơn và tiêu thụ giới hạn tốc độ API thấp hơn. Các bộ quy mô cũng cung cấp hỗ trợ gốc cho chế độ runner `ephemeral` và tự động điều chỉnh quy mô dựa trên độ sâu hàng đợi công việc GitHub theo thời gian thực.
+
+### Làm thế nào để ngăn các runner tự host truy cập máy chủ API Kubernetes của máy chủ?
+
+Bạn ngăn các runner tự host truy cập máy chủ API Kubernetes của máy chủ bằng cách đặt `automountServiceAccountToken: false` trong thông số kỹ thuật của pod runner và thực thi các chính sách mạng egress chặn lưu lượng truy cập đến cổng 443 trên IP dịch vụ API Kubernetes. Theo mặc định, Kubernetes mount các mã thông báo tài khoản dịch vụ vào mọi pod tại `/var/run/secrets/kubernetes.io/serviceaccount`. Việc tắt tự động mount mã thông báo đảm bảo rằng các tiến trình runner bị xâm phạm không thể truy vấn tài nguyên cụm hoặc leo thang đặc quyền trong cụm Kubernetes của máy chủ.
+
+### Các quyền nào nên được cấp cho GitHub PAT hoặc App được sử dụng bởi Actions Runner Controller?
+
+Ứng dụng GitHub được sử dụng bởi Actions Runner Controller nên được cấp các quyền tổ chức tối thiểu cần thiết, cụ thể là `Organization Self-hosted runners: Read and Write` và `Actions: Read-only`. Nếu triển khai các runner ở cấp kho lưu trữ thay vì cấp tổ chức, hãy cấp `Repository Self-hosted runners: Read and Write`. Tránh sử dụng Personal Access Tokens (PATs) được gắn vào các tài khoản nhà phát triển cá nhân vì PATs cấp các quyền tài khoản rộng và thiếu phạm vi quyền chi tiết.
+
+### Làm thế nào để lưu trữ các dependency build một cách an toàn trên các pod runner tự host tạm thời?
+
+Bạn lưu trữ các dependency build một cách an toàn trên các pod runner tạm thời bằng cách mount các volume mạng chia sẻ chỉ đọc (như AWS EFS hoặc NFS) hoặc sử dụng các backend lưu trữ cache từ xa như MinIO hoặc AWS S3. Tránh sử dụng các mount volume chia sẻ đọc-ghi trên nhiều pod vì một pod runner bị xâm phạm có thể tiêm mã độc hại vào các kho lưu trữ cache chia sẻ được sử dụng bởi các pipeline build khác. Luôn băm các tệp khóa dependency để xây dựng các tiền tố khóa cache xác định.
+
+### Bạn có nên chạy các runner tự host trên các instance đám mây chuyên dụng hay các node Kubernetes được chia sẻ?
+
+Bạn nên chạy các runner tự host trên các nhóm node worker chuyên dụng được cô lập khỏi các khối lượng công việc ứng dụng sản xuất cốt lõi bằng cách sử dụng các node taint và toleration của Kubernetes. Chạy mã build không đáng tin cậy trên các node được chia sẻ cùng với các microservice hướng tới khách hàng tạo ra rủi ro nghiêm trọng nếu xảy ra lỗ hổng thoát container. Việc cung cấp các nhóm node worker chuyên dụng, cô lập cho các khối lượng công việc runner đảm bảo rằng bất kỳ sự xâm phạm cấp node nào vẫn được chứa trong tầng build CI.
+
+## Bạn cũng có thể thích
+
+- [Triển khai bảo mật Zero-Trust trong Kubernetes: Hướng dẫn sản xuất hoàn chỉnh](/en/blog/zero-trust-architecture-kubernetes)
+- [Triển khai kiến trúc Zero Trust vào năm 2026](/en/blog/zero-trust-arch)
+- [Kiến trúc mạng Zero Trust](/en/blog/zero-trust-network)
+- [Sự phát triển của bảo mật Cloud Native vào năm 2026](/en/blog/cloud-native-security)

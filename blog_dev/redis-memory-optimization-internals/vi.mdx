@@ -1,0 +1,370 @@
+---
+title: "Tối ưu hóa bộ nhớ Redis: Nội bộ, mã hóa cấu trúc dữ liệu và lập hồ sơ bộ nhớ"
+date: '2026-09-23'
+summary: "Giảm tới 70% mức sử dụng RAM Redis của bạn bằng cách tìm hiểu sâu về ziplists, listpacks, quicklists, chi phí SDS của chuỗi và giảm thiểu phân mảnh bộ nhớ tự động."
+tags:
+  - redis
+  - caching
+  - performance
+  - backend
+  - architecture
+draft: false
+featured: true
+category: Tech
+images: ['/static/images/redis-memory-optimization-internals.png']
+---
+
+Phiên bản Redis của bạn là một cỗ máy được tinh chỉnh kỹ lưỡng, nhưng khi ứng dụng của bạn mở rộng quy mô, mức tiêu thụ bộ nhớ của nó bắt đầu trông giống một đoàn tàu chở hàng hơn là một chiếc xe thể thao. Hóa đơn điện toán đám mây tăng vọt, cảnh báo OOM-killer tràn ngập nhật ký của bạn, và bạn đang đối mặt với một ngã ba đường kỹ thuật cổ điển: chi thêm tiền cho một phiên bản lớn hơn, hoặc bắt tay vào một dự án phân mảnh phức tạp. Có một con đường thứ ba, thanh lịch hơn: tối ưu hóa sâu, phẫu thuật việc sử dụng bộ nhớ của Redis. Đây không phải là về các chính sách loại bỏ khóa đơn giản; đó là về việc hiểu cách Redis *thực sự* lưu trữ dữ liệu của bạn ở cấp độ thấp và thao túng hành vi của nó để đạt được tiết kiệm bộ nhớ đáng kể—thường lên tới hơn 70%—mà không làm giảm hiệu suất cốt lõi.
+
+<AudioPlayer src="/static/audio/redis-memory-optimization-internals.mp3" title="Tóm tắt âm thanh điều hành" />
+
+## Giải phẫu một khóa Redis: Hơn cả dữ liệu của bạn
+
+Khi bạn `SET mykey "hello"`, Redis không chỉ lưu trữ 5 byte của "hello". Mỗi khóa trong Redis được liên kết với một cấu trúc siêu dữ liệu cơ bản, và bản thân giá trị đó cũng có chi phí riêng. Hiểu được chi phí này là bước đầu tiên để giảm thiểu nó.
+
+### Cấu trúc `redisObject`: Gốc rễ của tất cả các khóa
+
+Mỗi khóa trong từ điển Redis chính (`dict`) không trỏ trực tiếp đến dữ liệu của bạn (chuỗi, danh sách, v.v.). Nó trỏ đến một cấu trúc `redisObject`, vùng chứa phổ quát cho tất cả các loại dữ liệu. Trong C, nó trông giống như thế này:
+
+```c
+// A simplified representation of the redisObject struct
+typedef struct redisObject {
+    unsigned type:4;        // Type of the object (String, List, Hash, etc.)
+    unsigned encoding:4;    // Internal representation (raw, embstr, listpack, etc.)
+    unsigned lru:24;        // LRU/LFU clock value for eviction
+    int refcount;           // Reference count for shared objects
+    void *ptr;              // Pointer to the actual data
+} robj;
+```
+
+Trên hệ thống 64-bit, cấu trúc này một mình tốn `4 + 4 + 4 + 8 = 20` byte, nhưng do căn chỉnh bộ nhớ, nó thường chiếm **24 byte**. Đây là một chi phí cố định, trên mỗi khóa mà bạn không thể tránh khỏi. Thêm vào đó là chi phí từ từ điển không gian khóa chính (`dictEntry`), bao gồm các con trỏ đến khóa, giá trị (`redisObject`) và mục tiếp theo trong chuỗi băm, thêm **24 byte** nữa.
+
+**Kết luận:** Mỗi khóa đơn lẻ, bất kể giá trị của nó nhỏ đến mức nào, đều có chi phí cơ bản khoảng 48 byte trước khi bạn lưu trữ một byte dữ liệu. Lưu trữ hàng triệu khóa nhỏ (ví dụ: `SET user:123:online 1`) là một công thức dẫn đến việc phình to bộ nhớ do khoản thuế siêu dữ liệu cố định này.
+
+### Mã hóa chuỗi: SDS, `embstr` và `raw`
+
+Redis không sử dụng các chuỗi kết thúc bằng null chuẩn của C. Nó sử dụng một cấu trúc tùy chỉnh được gọi là Simple Dynamic String (SDS). Cấu trúc này rất quan trọng đối với hiệu suất và an toàn, nhưng nó có những tác động đến bộ nhớ.
+
+Một tiêu đề SDS (`sdshdr`) được thêm vào trước dữ liệu chuỗi thực tế:
+
+```c
+// Simplified sdshdr8 for strings up to 2^8-1=255 bytes long
+struct __attribute__ ((__packed__)) sdshdr8 {
+    uint8_t len;     /* used */
+    uint8_t alloc;   /* excluding the header and null terminator */
+    unsigned char flags; /* 3 lsb of type, 5 lsb of unused bits */
+    char buf[];      /* the actual string data */
+};
+```
+`len` theo dõi độ dài chuỗi (làm cho `STRLEN` là một thao tác O(1)), và `alloc` theo dõi bộ nhớ được cấp phát, cho phép nối thêm hiệu quả mà không cần cấp phát lại mỗi lần.
+
+Redis có một tối ưu hóa quan trọng về cách nó lưu trữ `redisObject` và chuỗi SDS cùng nhau:
+
+1.  **`OBJ_ENCODING_EMBSTR` (Chuỗi nhúng):** Đối với các chuỗi nhỏ (theo mặc định, 44 byte trở xuống), Redis cấp phát một khối bộ nhớ duy nhất, liền kề cho cả `redisObject` và chuỗi SDS. Điều này cải thiện tính cục bộ và giảm phân mảnh, tiết kiệm một lệnh gọi `malloc` và chi phí siêu dữ liệu liên quan (thường là 8 byte).
+
+2.  **`OBJ_ENCODING_RAW`:** Đối với các chuỗi lớn hơn 44 byte, Redis thực hiện hai cấp phát riêng biệt: một cho `redisObject` và một cho chuỗi SDS (`sdshdr` + dữ liệu). Trường `redisObject` của `ptr` trỏ đến khối bộ nhớ thứ hai này.
+
+Hãy so sánh bộ nhớ cho một chuỗi 10 byte như `"locionic"`:
+
+*   **Mã hóa `embstr`:**
+    *   `redisObject` + `sdshdr8` + "locionic" + `\0` = khối liền kề
+    *   Tổng kích thước ≈ 24 (kích thước `robj` được căn chỉnh) + 10 (chuỗi) + 1 (null) ≈ **~35 byte** (bộ cấp phát làm tròn lên).
+*   **Mã hóa `raw` (nếu `embstr` không tồn tại):**
+    *   `redisObject` = 24 byte
+    *   Chi phí `malloc` cho `ptr` = 8 byte
+    *   `sdshdr8` + "locionic" + `\0` = 1 + 1 + 1 + 10 + 1 = 14 byte, được bộ cấp phát làm tròn lên 16.
+    *   Tổng kích thước = 24 + 8 + 16 = **48 byte**.
+
+Mã hóa `embstr` cung cấp mức tiết kiệm ~27% trong trường hợp này. Bạn có thể cấu hình giới hạn `embstr` trong các phiên bản Redis mới hơn, nhưng giá trị mặc định 44 được chọn cẩn thận để phù hợp với kích thước khối của bộ cấp phát.
+
+## Vượt xa Raw: Mã hóa cấu trúc dữ liệu nhỏ gọn
+
+Tiết kiệm bộ nhớ đáng kể nhất trong Redis đến từ việc sử dụng các mã hóa chuyên biệt, tối ưu hóa bộ nhớ cho Hashes, Lists, Sets và Sorted Sets. Khi các bộ sưu tập này nhỏ, Redis tránh sử dụng các cấu trúc dữ liệu ngốn bộ nhớ như bảng băm và skiplists để ưu tiên các bố cục bộ nhớ phẳng, liền kề.
+
+### Người kế nhiệm: Listpacks (Redis 7.0+)
+
+Trong nhiều thập kỷ, `ziplist` là công cụ chính để tối ưu hóa bộ nhớ. Tuy nhiên, nó có một lỗi nghiêm trọng: cập nhật theo tầng. Một thao tác chèn hoặc xóa ở giữa một ziplist lớn có thể yêu cầu tất cả các mục tiếp theo phải được dịch chuyển, dẫn đến độ phức tạp O(N²) trong trường hợp xấu nhất.
+
+Hãy đến với **listpack**, mã hóa mặc định cho các Hash và Zset nhỏ kể từ Redis 7.0. Một listpack là một chuỗi các mục được lưu trữ trong một khối bộ nhớ liền kề duy nhất, được thiết kế để loại bỏ vấn đề cập nhật theo tầng.
+
+Một listpack có cấu trúc đơn giản:
+*   Một tiêu đề 6 byte: 4 byte cho tổng số byte, 2 byte cho số lượng phần tử.
+*   Một chuỗi các mục.
+*   Một dấu hiệu kết thúc listpack 1 byte (`0xFF`).
+
+Điều kỳ diệu nằm bên trong mỗi mục. Một mục lưu trữ:
+1.  **Loại mã hóa & Dữ liệu:** Bản thân dữ liệu, được tiền tố bằng các bit chỉ ra loại và độ dài của nó.
+2.  **Tổng độ dài mục:** Một mã hóa có độ dài thay đổi của tổng kích thước của mục này.
+
+Cấu trúc này cho phép lặp lại tiến hoặc lùi qua danh sách. Quan trọng là, vì mỗi mục biết tổng độ dài của chính nó, việc cập nhật một mục tại chỗ (nếu nó phù hợp) hoặc thay thế nó bằng một mục mới không yêu cầu bất kỳ thay đổi nào đối với các mục tiếp theo. Điều này giải quyết vấn đề cập nhật theo tầng của ziplists.
+
+```mermaid
+graph TD
+    subgraph Listpack Structure
+        direction LR
+        Header["Header (6 bytes)<br/>total_bytes, num_elems"] --> Entry1["Entry 1<br/>data, total_len"]
+        Entry1 --> Entry2["Entry 2<br/>data, total_len"]
+        Entry2 --> ...
+        ... --> EntryN["Entry N<br/>data, total_len"]
+        EntryN --> EndMarker["End (1 byte)<br/>0xFF"]
+    end
+
+    subgraph Hash Data: user:100
+        A[field: name<br>value: "alice"]
+        B[field: plan<br>value: "pro"]
+        C[field: score<br>value: 95]
+    end
+
+    subgraph Hash as Hashtable (High Memory)
+        direction LR
+        Dict["dict struct"] --> Ptr1("ptr to entry1")
+        Dict --> Ptr2("ptr to entry2")
+        Dict --> Ptr3("ptr to entry3")
+
+        subgraph Allocations
+          Entry1_obj["redisObject (name)"]
+          Entry1_val["redisObject (alice)"]
+          Entry2_obj["redisObject (plan)"]
+          Entry2_val["redisObject (pro)"]
+          Entry3_obj["redisObject (score)"]
+          Entry3_val["redisObject (95)"]
+        end
+    end
+
+    subgraph Hash as Listpack (Low Memory)
+        direction LR
+        LP["[Header | name | alice | plan | pro | score | 95 | End]"]
+    end
+
+    A & B & C -- Stored as --> Hash
+    Hash -- Large Hash --> Hash_as_Hashtable
+    Hash -- Small Hash --> Hash_as_Listpack
+```
+
+### Chuyển đổi: Từ Listpack sang Hashtable
+
+Một Hash sẽ được lưu trữ dưới dạng `listpack` miễn là nó đáp ứng hai tiêu chí:
+1.  Số lượng cặp trường-giá trị nhỏ hơn `hash-max-listpack-entries` (mặc định 512).
+2.  Kích thước của mục lớn nhất (trường hoặc giá trị) nhỏ hơn `hash-max-listpack-value` (mặc định 64 byte).
+
+Nếu một trong hai ngưỡng này bị vượt qua, Redis sẽ tự động chuyển đổi `listpack` thành một `hashtable` tiêu chuẩn (`OBJ_ENCODING_HT`). Việc chuyển đổi này là một chiều.
+
+Hãy xem tác động với một tập lệnh Python và lệnh `MEMORY USAGE`.
+
+```python
+# populate_redis.py
+import redis
+
+# Connect to a local Redis instance
+r = redis.Redis(decode_responses=True)
+
+# Small hash, will be stored as a listpack
+small_hash_key = "user:101:small"
+r.delete(small_hash_key)
+r.hset(small_hash_key, mapping={
+    "name": "Bob Smith",
+    "email": "bob.smith@example.com",
+    "city": "New York",
+    "status": "active"
+})
+
+# Large hash, will be forced into hashtable encoding by number of entries
+large_hash_key = "user:102:large"
+r.delete(large_hash_key)
+# Default hash-max-listpack-entries is 512, so 513 will trigger conversion
+large_hash_data = {f"field_{i}": f"value_{i}" for i in range(513)}
+r.hset(large_hash_key, mapping=large_hash_data)
+
+print(f"Profiling key: {small_hash_key}")
+print(f"Profiling key: {large_hash_key}")
+```
+
+Bây giờ, hãy chạy lệnh này và kiểm tra bộ nhớ trong `redis-cli`:
+
+```bash
+$ python populate_redis.py
+Profiling key: user:101:small
+Profiling key: user:102:large
+
+$ redis-cli
+127.0.0.1:6379> OBJECT ENCODING user:101:small
+"listpack"
+127.0.0.1:6379> MEMORY USAGE user:101:small
+(integer) 166
+
+# Now for the large one, which just barely crossed the threshold
+127.0.0.1:6379> OBJECT ENCODING user:102:large
+"hashtable"
+127.0.0.1:6379> MEMORY USAGE user:102:large
+(integer) 44104
+```
+
+Hash nhỏ với 4 trường chỉ sử dụng 166 byte. Hash lớn, với 513 trường, tiêu thụ hơn 44 KB! Đây không phải là một sự tăng tuyến tính. Sự nhảy vọt này là do việc chuyển đổi sang một bảng băm đầy đủ chức năng, liên quan đến việc tạo các cấu trúc `dict` và `dictEntry`, `redisObject` cho mỗi trường và giá trị, và chi phí con trỏ đáng kể.
+
+### Các trường hợp đặc biệt: Intsets và Quicklists
+
+**Intsets (`OBJ_ENCODING_INTSET`):**
+Khi một Set chỉ chứa các số nguyên có dấu 64-bit, Redis sử dụng mã hóa `intset` cực kỳ nhỏ gọn. Đây về cơ bản là một mảng số nguyên được sắp xếp. Nó cực kỳ hiệu quả về bộ nhớ. Tuy nhiên, ngay khi bạn thêm một phần tử không phải số nguyên vào tập hợp, nó sẽ được chuyển đổi vĩnh viễn thành một bảng băm tiêu chuẩn.
+*   **Ngưỡng:** `set-max-intset-entries` (mặc định 512).
+
+**Quicklists (cho Lists):**
+Một Redis List không phải là một danh sách liên kết đơn giản. Nó là một `quicklist`: một danh sách liên kết của `listpacks`. Mỗi nút trong quicklist (`quicklistNode`) chứa một `listpack` có thể chứa nhiều phần tử danh sách. Đây là một sự thỏa hiệp tuyệt vời. Nó tránh được chi phí của một danh sách liên kết trong đó mỗi phần tử là một cấp phát bộ nhớ riêng biệt, nhưng nó cũng tránh có một khối liền kề lớn cho toàn bộ danh sách.
+
+Bạn có thể điều chỉnh hành vi này bằng hai cài đặt chính:
+*   `list-max-listpack-size`: Kiểm soát kích thước tối đa của mỗi `listpack` nội bộ. Một giá trị âm đặt giới hạn byte (ví dụ: `-2` cho 8KB mỗi nút). Đây là cách được khuyến nghị để cấu hình nó.
+*   `list-compress-depth`: Một tối ưu hóa hấp dẫn. Điều này cho phép bạn nén các nút `listpack` ở đầu và cuối quicklist mà không được truy cập thường xuyên. `0` tắt nén. `1` có nghĩa là các nút ngoài cùng (đầu và cuối) không được nén, cấp độ tiếp theo được nén, v.v. Điều này có thể tiết kiệm bộ nhớ đáng kể cho các danh sách rất dài mà bạn thường chỉ truy cập các đầu (ví dụ: sử dụng Redis làm hàng đợi).
+
+## Từ lý thuyết đến thực hành: Lập hồ sơ và tinh chỉnh
+
+Với kiến thức nội bộ này, giờ đây chúng ta có thể thực hiện các bước cụ thể để tối ưu hóa phiên bản của mình.
+
+### Bước 1: Lập hồ sơ với lệnh `MEMORY`
+
+Lệnh `MEMORY` là công cụ chính của bạn để điều tra các vấn đề về bộ nhớ.
+
+*   `MEMORY USAGE <key>`: Như đã trình bày ở trên, cung cấp tổng số byte được cấp phát cho một khóa cụ thể. Đây là công cụ bạn nên dùng để kiểm tra xem một khóa có đang sử dụng mã hóa nhỏ gọn hay không.
+*   `MEMORY STATS`: Cung cấp phân tích chi tiết về việc sử dụng bộ nhớ của máy chủ, bao gồm `keys.count`, `keys.bytes-per-key` và phân tích chi tiết theo loại dữ liệu.
+*   `MEMORY DOCTOR`: Một công cụ chẩn đoán tích hợp. Redis sẽ phân tích trạng thái của nó và báo cáo các vấn đề tiềm ẩn, chẳng hạn như phân mảnh cao hoặc cấu trúc dữ liệu không hiệu quả. Đây là một điểm khởi đầu tuyệt vời.
+
+Một nhiệm vụ phổ biến là tìm các khóa lớn nhất hoặc có vấn đề nhất của bạn. Bạn có thể làm điều này bằng một tập lệnh đơn giản:
+
+```bash
+# WARNING: The --bigkeys scan can cause a small latency spike.
+# Use it with caution on a production primary.
+# It is safer to run on a replica.
+
+redis-cli --bigkeys
+
+# --- Sample Output ---
+# ...
+# [00.00%] Biggest zset found so far: 'my_leaderboard' with 100002 members
+# [00.00%] Biggest hash found so far: 'user:session:fat' with 513 fields
+# ...
+#
+# Summary:
+# Sampled 123456 keys in the keyspace.
+#
+# Biggest zset: 'my_leaderboard' (100002 members)
+# Biggest hash: 'user:session:fat' (513 fields)
+#
+# 98765 strings with 1.23 GB
+# 12345 lists with 50.44 MB
+# 5432 hashes with 2.10 GB
+# 1234 zsets with 450.12 MB
+# 1 set with 12 bytes
+```
+
+Điều này ngay lập tức chỉ ra các khóa có khả năng đã thoát khỏi mã hóa nhỏ gọn của chúng.
+
+### Bước 2: Tinh chỉnh ngưỡng mã hóa
+
+Nếu việc lập hồ sơ của bạn cho thấy một mẫu truy cập dữ liệu phổ biến, bạn có thể tinh chỉnh các ngưỡng mã hóa trong `redis.conf` của mình hoặc thông qua `CONFIG SET`.
+
+**Kịch bản:** Bạn lưu trữ dữ liệu phiên người dùng trong các hash. Hầu hết các phiên có khoảng 60-70 trường, nhưng đôi khi một số vượt quá giới hạn `hash-max-listpack-value` 64 byte cho một trường duy nhất, buộc toàn bộ hash phải chuyển sang mã hóa `hashtable` không hiệu quả.
+
+**Hành động:** Phân tích dữ liệu. Nếu các trường lớn hiếm khi xảy ra và không quan trọng về hiệu suất, bạn có thể cân nhắc tăng giới hạn giá trị.
+
+```yaml
+# In your redis.conf
+
+# Default: 64. Let's increase it to allow slightly larger values in our hashes.
+hash-max-listpack-value 128
+
+# Default: 512. If your hashes are consistently just over this limit,
+# and write performance isn't the absolute top priority for them,
+# a modest increase can save a lot of memory.
+hash-max-listpack-entries 1024
+```
+
+**Cảnh báo:** Có một sự đánh đổi giữa CPU và bộ nhớ. `listpacks` lớn hơn hiệu quả hơn về bộ nhớ, nhưng việc tìm kiếm một phần tử trong đó là một thao tác O(N). Đối với một hash có 1000 mục, việc tìm một khóa có thể yêu cầu quét tất cả 1000 mục. Một `hashtable` cung cấp quyền truy cập O(1). Điều chỉnh các giá trị này dựa trên các mẫu đọc/ghi và yêu cầu độ trễ của khối lượng công việc cụ thể của bạn.
+
+### Bước 3: Kiểm soát phân mảnh bộ nhớ
+
+Phân mảnh bộ nhớ là một kẻ giết bộ nhớ thầm lặng trong các phiên bản Redis chạy dài. Redis liên tục cấp phát và giải phóng bộ nhớ. Bộ cấp phát bộ nhớ (mặc định là `jemalloc`) có thể không thể giải phóng bộ nhớ đã giải phóng trở lại hệ điều hành, dẫn đến sự khác biệt giữa những gì Redis báo cáo (`used_memory`) và những gì hệ điều hành thấy tiến trình đang sử dụng (`RSS - Resident Set Size`).
+
+Bạn có thể kiểm tra tỷ lệ phân mảnh của mình thông qua `INFO MEMORY`:
+
+```
+127.0.0.1:6379> INFO MEMORY
+...
+used_memory:104857600       # 100 MB used by Redis data
+used_memory_rss:136314880    # 130 MB from OS perspective
+...
+mem_fragmentation_ratio:1.30
+...
+```
+
+Tỷ lệ trên `1.5` là cao và cho thấy sự phân mảnh đáng kể. Tỷ lệ dưới `1.0` có nghĩa là Redis đang hoán đổi, đây là một vấn đề nghiêm trọng.
+
+Redis 4.0+ đã giới thiệu **Active Defragmentation**, một tính năng cho phép Redis tự động chống phân mảnh trong nền.
+
+```yaml
+# In your redis.conf - safe starting values
+activedefrag yes
+
+# Don't start defragging unless fragmentation is at least 100MB
+active-defrag-ignore-bytes 100mb
+
+# Start defragging when fragmentation ratio reaches 1.1 (10%)
+active-defrag-threshold-lower 10
+
+# Stop defragging when the CPU usage for defrag hits 5%
+# to minimize impact on the main thread.
+active-defrag-cycle-max 5
+```
+
+Khi được bật, Redis sẽ sử dụng các chu kỳ CPU rảnh rỗi để quét bộ nhớ, xác định các giá trị bị phân mảnh và di chuyển chúng đến các khối bộ nhớ liền kề, cho phép bộ cấp phát thu hồi không gian bị phân mảnh hiện đã trống. Đối với bất kỳ hệ thống sản xuất nào có tải ghi không nhỏ, việc bật chống phân mảnh chủ động rất được khuyến nghị.
+
+<FAQ title="Các câu hỏi thường gặp">
+  <Question>Tốt hơn là nên sử dụng một hash lớn (ví dụ: `HSET user:123 name "John" age 30`) hay nhiều khóa cấp cao nhỏ (ví dụ: `SET user:123:name "John"`, `SET user:123:age 30`)?</Question>
+  <Answer>
+    Đối với dữ liệu liên quan, một hash duy nhất gần như luôn hiệu quả hơn về bộ nhớ, **miễn là nó nằm trong giới hạn mã hóa nhỏ gọn**.
+
+    Hãy phân tích nó. Sử dụng các khóa riêng biệt (`SET user:123:name "John"`) phát sinh chi phí ~48 byte *cho mỗi trường* từ `redisObject` và `dictEntry` cấp cao nhất. Đối với 10 trường, đó là gần 500 byte chỉ siêu dữ liệu trước khi dữ liệu của bạn được tính.
+
+    Một hash duy nhất (`HSET user:123 ...`) chỉ có một khóa cấp cao nhất, vì vậy nó chỉ phải trả khoản thuế ~48 byte đó một lần. Nếu nó được lưu trữ dưới dạng `listpack`, các trường và giá trị được đóng gói chặt chẽ với nhau với chi phí tối thiểu. Việc tiết kiệm bộ nhớ có thể rất lớn. Một hash với 10 trường có thể chỉ mất ~200 byte dưới dạng `listpack`, so với ~700+ byte cho 10 khóa riêng biệt.
+
+    Sự đánh đổi là tính nguyên tử và TTL. Bạn không thể đặt TTL khác nhau cho từng trường trong một hash. Nếu bạn cần hết hạn giá trị `last_seen` của người dùng nhưng không phải `email` của họ, bạn buộc phải sử dụng các khóa riêng biệt.
+  </Answer>
+  <Question>`used_memory` của Redis của tôi thấp, nhưng RSS của tiến trình cao. Chuyện gì đang xảy ra?</Question>
+  <Answer>
+    Đây là triệu chứng cổ điển của phân mảnh bộ nhớ. `used_memory` là những gì Redis *nghĩ* nó đang tích cực sử dụng cho các khóa của bạn. `used_memory_rss` (Resident Set Size) là những gì hệ điều hành đã cấp phát cho tiến trình Redis. Khi `mem_fragmentation_ratio` (`used_memory_rss` / `used_memory`) cao (ví dụ: > 1.5), điều đó có nghĩa là `jemalloc` (bộ cấp phát) đang giữ rất nhiều bộ nhớ chứa "lỗ hổng" từ các khóa đã xóa và nó không thể giải phóng bộ nhớ này trở lại hệ điều hành.
+
+    Giải pháp chính là bật và cấu hình **chống phân mảnh chủ động** như được mô tả trong bài viết. Các nguyên nhân khác, ít phổ biến hơn cho RSS cao mặc dù `used_memory` thấp có thể bao gồm:
+    *   **Bộ đệm đầu ra của máy khách:** Nếu bạn có máy khách pub/sub hoặc người tiêu dùng chậm của `MONITOR`, bộ đệm đầu ra phía máy chủ có thể phát triển rất lớn. Sử dụng `CLIENT LIST` để kiểm tra kích thước bộ đệm.
+    *   **Bộ nhớ cache tập lệnh Lua:** Redis lưu trữ các tập lệnh Lua đã biên dịch. Một `SCRIPT FLUSH` có thể xóa điều này, nhưng nó hiếm khi là nguyên nhân chính.
+    *   **Dữ liệu sao chép tồn đọng:** Đối với các bản sao, một lượng lớn dữ liệu sao chép tồn đọng có thể tiêu tốn bộ nhớ đáng kể.
+  </Answer>
+  <Question>Khi nào tôi *không nên* sử dụng mã hóa nhỏ gọn? Có nhược điểm về hiệu suất không?</Question>
+  <Answer>
+    Có, sự đánh đổi cơ bản của mã hóa nhỏ gọn là **CPU cho Bộ nhớ**. Các thao tác trên `listpacks` (và `ziplists` cũ hơn) thường chậm hơn đối với các thao tác ghi và đọc ngẫu nhiên so với các đối tác `hashtable` hoặc `skiplist` của chúng, đặc biệt khi chúng lớn hơn.
+
+    Hãy xem xét một `HSET` trên một hash với 500 trường. Nếu đó là một `hashtable`, thao tác là O(1). Nếu đó là một `listpack`, Redis có thể phải quét tới 500 mục để tìm trường cần cập nhật, làm cho nó trở thành một thao tác O(N). Xóa hoặc cập nhật một mục gây ra thay đổi kích thước cũng tốn kém hơn so với trong một bảng băm.
+
+    Bạn nên cân nhắc tránh chúng (hoặc sử dụng các ngưỡng rất nhỏ) trong các trường hợp:
+    1.  Bộ sưu tập có nhiều thao tác ghi.
+    2.  Bạn có các yêu cầu độ trễ P99 rất nghiêm ngặt đối với các bản cập nhật cho các bộ sưu tập này.
+    3.  Các bộ sưu tập phát triển và thu nhỏ nhanh chóng xung quanh ngưỡng, điều này sẽ gây ra các chuyển đổi lặp đi lặp lại, tốn kém từ `listpack` sang `hashtable`.
+
+    Trong những trường hợp như vậy, có thể tốt hơn là chấp nhận chi phí bộ nhớ cao hơn của mã hóa `hashtable` để đổi lấy hiệu suất ghi O(1) nhanh chóng, có thể dự đoán được. Bạn có thể buộc điều này bằng cách đặt ngưỡng rất thấp, như `hash-max-listpack-entries 8`.
+  </Answer>
+</FAQ>
+
+## Kết luận và Kế hoạch hành động
+
+Tối ưu hóa bộ nhớ Redis không phải là một nghệ thuật đen tối; đó là một ngành kỹ thuật dựa trên việc hiểu các cấu trúc dữ liệu nội bộ của nó. Bằng cách chuyển từ lý thuyết sang thực hành, bạn có thể thu hồi một lượng lớn RAM và chạy một hệ thống ổn định, tiết kiệm chi phí hơn.
+
+1.  **Kiểm tra mô hình dữ liệu của bạn:** Bạn có đang sử dụng nhiều khóa nhỏ trong khi một hash duy nhất sẽ làm được không? Nhóm dữ liệu liên quan là lợi thế tiềm năng lớn nhất của bạn.
+2.  **Lập hồ sơ các khóa của bạn:** Sử dụng `MEMORY USAGE` và `--bigkeys` để xác định các khóa đã chuyển đổi không hiệu quả sang mã hóa `hashtable` hoặc `skiplist`.
+3.  **Tinh chỉnh `redis.conf` của bạn:** Điều chỉnh các chỉ thị `*-max-listpack-*` dựa trên các mẫu dữ liệu của ứng dụng của bạn. Một sự tăng nhỏ có thể ngăn chặn việc chuyển đổi sớm và tiết kiệm gigabyte.
+4.  **Áp dụng chống phân mảnh chủ động:** Bật `activedefrag` trên bất kỳ phiên bản Redis chạy dài, có nhiều thao tác ghi nào. Đây là công cụ tốt nhất để quản lý tình trạng bộ nhớ của máy chủ của bạn theo thời gian.
+5.  **Giám sát phân mảnh:** Theo dõi `mem_fragmentation_ratio`. Nếu nó vẫn cao một cách cứng đầu ngay cả với `activedefrag`, nó có thể chỉ ra một vấn đề sâu sắc hơn với các mẫu cấp phát hoặc nhu cầu khởi động lại theo kế hoạch trong cửa sổ bảo trì.
+
+Bằng cách áp dụng các nguyên tắc này, bạn không chỉ cắt giảm chi phí; bạn đang xây dựng một kiến trúc mạnh mẽ và có khả năng mở rộng hơn.
+
+### Đọc thêm
+
+*   [Tài liệu Redis về Tối ưu hóa bộ nhớ](https://redis.io/docs/manual/memory-optimization/)
+*   [Bài đăng của Salvatore Sanfilippo (antirez) về SDS](http://antirez.com/post/sds-the-simplest-dynamic-string-library-ever.html)
+*   [Tìm hiểu `quicklist` của Redis](https://engineering.fb.com/2015/08/13/web/under-the-hood-the-internals-of-our-new-persistent-key-value-store/) (Lưu ý: Bài viết được liên kết thảo luận về việc RocksDB sử dụng một khái niệm tương tự, nhưng các chi tiết triển khai của Redis nằm trong mã nguồn Redis).
+*   [Tài liệu Jemalloc](http://jemalloc.net/) - Dành cho những người thực sự tò mò về bộ cấp phát bộ nhớ cơ bản.

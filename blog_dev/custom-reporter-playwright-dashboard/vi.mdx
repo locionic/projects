@@ -1,0 +1,356 @@
+---
+draft: false
+title: "Cách xây dựng Playwright Reporter tùy chỉnh cho Next.js Dashboards"
+category: Tech
+date: "2026-07-28"
+lastUpdated: '2026-09-22'
+tags: ["playwright", "testing", "automation", "nextjs"]
+summary: "Hướng dẫn từng bước về cách viết Playwright reporter JSON tùy chỉnh và truyền trực tuyến kết quả thực thi kiểm thử end-to-end theo thời gian thực đến dashboard Next.js với phân tích độ ổn định, hỗ trợ CI sharding và lưu trữ PostgreSQL."
+images: ['https://imgbed.locionic.com/file/1785258991842_custom_reporter_playwright_1785258937235.jpg']
+---
+
+Xây dựng một reporter tùy chỉnh cho Playwright là cách hiệu quả nhất để truyền trực tiếp kết quả tự động hóa kiểm thử vào bảng điều khiển Next.js của riêng bạn. Thay vì dựa vào các báo cáo HTML tĩnh hoặc trả tiền cho các dịch vụ của bên thứ ba, bạn có thể viết một reporter chuyên dụng để thu thập các số liệu kiểm thử chính xác và đăng chúng trực tiếp lên backend của bạn, cung cấp cho nhóm của bạn một nền tảng phân tích riêng tư, tự lưu trữ mà không bị khóa nhà cung cấp.
+
+Trong hướng dẫn này, bạn sẽ tìm hiểu chính xác cách triển khai một JSON reporter tùy chỉnh trong Playwright, xây dựng một tuyến API nhận trong Next.js, thêm tính năng theo dõi độ không ổn định, hỗ trợ phân chia CI trên nhiều trình chạy và lưu trữ kết quả vào PostgreSQL thông qua Prisma.
+
+<AudioPlayer src="/static/audio/custom-reporter-playwright-dashboard.mp3" title="Tóm tắt âm thanh điều hành" />
+
+## Tại sao báo cáo HTML tiêu chuẩn không đáp ứng đủ
+
+Các báo cáo HTML tiêu chuẩn của Playwright chỉ phục vụ một mục đích duy nhất: hiển thị kết quả pass/fail cho một lần chạy kiểm thử duy nhất. Chúng không cung cấp tính năng theo dõi lịch sử, không phát hiện độ không ổn định qua các lần chạy, không có bảng điều khiển toàn nhóm và không tích hợp với các hệ thống cảnh báo của bạn.
+
+Khi bạn có một nhóm chạy hàng nghìn kiểm thử hàng ngày trên nhiều pipeline CI, bạn cần:
+
+- **Dữ liệu xu hướng lịch sử** — Tính ổn định của kiểm thử có cải thiện sau khi tái cấu trúc không?
+- **Bảng xếp hạng độ không ổn định** — Kiểm thử nào chỉ pass khi thử lại?
+- **Khả năng hiển thị theo từng nhánh** — PR này có gây ra lỗi mới không?
+- **Truyền trực tiếp theo thời gian thực** — Các nhà phát triển có thể xem kết quả khi chúng đang chạy, chứ không phải sau đó không?
+
+Một Playwright reporter tùy chỉnh giải quyết tất cả những vấn đề này bằng cách triển khai giao diện `Reporter` tích hợp của Playwright và đăng dữ liệu có cấu trúc lên API của riêng bạn.
+
+## Triển khai giao diện Playwright Reporter
+
+Playwright cung cấp một giao diện `Reporter` với các hook vòng đời được kích hoạt vào những thời điểm chính xác trong quá trình chạy kiểm thử. Các hook chính là:
+
+- `onBegin(config, suite)` — được gọi một lần khi quá trình chạy kiểm thử bắt đầu
+- `onTestBegin(test, result)` — được gọi trước mỗi kiểm thử riêng lẻ
+- `onTestEnd(test, result)` — được gọi sau khi mỗi kiểm thử hoàn thành (pass, fail hoặc skip)
+- `onEnd(result)` — được gọi một lần khi toàn bộ quá trình chạy kết thúc
+
+Tạo `dashboard-reporter.ts` trong thư mục gốc dự án Playwright của bạn:
+
+```typescript
+import type {
+  Reporter,
+  TestCase,
+  TestResult,
+  FullResult,
+  Suite,
+  FullConfig,
+} from '@playwright/test/reporter';
+
+interface TestPayload {
+  testId: string;
+  title: string;
+  fullTitle: string;
+  filePath: string;
+  status: 'passed' | 'failed' | 'flaky' | 'skipped' | 'timedOut';
+  retryCount: number;
+  durationMs: number;
+  workerIndex: number;
+  errorMessage: string | null;
+  errorStack: string | null;
+  attachmentUrls: string[];
+}
+
+interface RunPayload {
+  runId: string;
+  branch: string;
+  commitSha: string;
+  status: FullResult['status'];
+  startedAt: string;
+  finishedAt: string;
+  totalTests: number;
+  passedTests: number;
+  failedTests: number;
+  flakyTests: number;
+  skippedTests: number;
+  tests: TestPayload[];
+}
+
+class NextjsDashboardReporter implements Reporter {
+  private results: TestPayload[] = [];
+  private startedAt: string = '';
+  private runId: string;
+  private dashboardUrl: string;
+
+  constructor(options: { dashboardUrl?: string } = {}) {
+    this.runId = process.env.CI_RUN_ID ?? crypto.randomUUID();
+    this.dashboardUrl =
+      options.dashboardUrl ??
+      process.env.DASHBOARD_URL ??
+      'http://localhost:3000';
+  }
+
+  onBegin(_config: FullConfig, _suite: Suite) {
+    this.startedAt = new Date().toISOString();
+    console.log(`[Reporter] Run ${this.runId} started at ${this.startedAt}`);
+  }
+
+  onTestEnd(test: TestCase, result: TestResult) {
+    // A test that passed but only after retries is flaky
+    const isFlaky = result.status === 'passed' && result.retry > 0;
+
+    this.results.push({
+      testId: test.id,
+      title: test.title,
+      fullTitle: test.titlePath().join(' > '),
+      filePath: test.location.file,
+      status: isFlaky ? 'flaky' : result.status,
+      retryCount: result.retry,
+      durationMs: result.duration,
+      workerIndex: result.workerIndex ?? -1,
+      errorMessage: result.errors[0]?.message?.slice(0, 2000) ?? null,
+      errorStack: result.errors[0]?.stack?.slice(0, 4000) ?? null,
+      // Attachments are uploaded to S3/R2 separately; we store only URLs
+      attachmentUrls: result.attachments
+        .filter((a) => a.path)
+        .map((a) => `${this.dashboardUrl}/artifacts/${this.runId}/${a.name}`),
+    });
+  }
+
+  async onEnd(result: FullResult) {
+    const payload: RunPayload = {
+      runId: this.runId,
+      branch: process.env.GITHUB_REF_NAME ?? 'local',
+      commitSha: process.env.GITHUB_SHA ?? 'unknown',
+      status: result.status,
+      startedAt: this.startedAt,
+      finishedAt: new Date().toISOString(),
+      totalTests: this.results.length,
+      passedTests: this.results.filter((t) => t.status === 'passed').length,
+      failedTests: this.results.filter((t) => t.status === 'failed').length,
+      flakyTests: this.results.filter((t) => t.status === 'flaky').length,
+      skippedTests: this.results.filter((t) => t.status === 'skipped').length,
+      tests: this.results,
+    };
+
+    try {
+      const response = await fetch(`${this.dashboardUrl}/api/reports`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-reporter-secret': process.env.REPORTER_SECRET ?? '',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        console.error(`[Reporter] Upload failed: ${response.status} ${await response.text()}`);
+      } else {
+        console.log(`[Reporter] Run ${this.runId} uploaded successfully.`);
+      }
+    } catch (err) {
+      // Never let reporter errors crash the CI process
+      console.error('[Reporter] Network error during upload:', err);
+    }
+  }
+}
+
+export default NextjsDashboardReporter;
+```
+
+Đăng ký reporter trong `playwright.config.ts`:
+
+```typescript
+import { defineConfig } from '@playwright/test';
+
+export default defineConfig({
+  reporter: [
+    ['list'],                                    // Console output during run
+    ['./dashboard-reporter.ts', {               // Custom dashboard reporter
+      dashboardUrl: process.env.DASHBOARD_URL,
+    }],
+  ],
+});
+```
+
+## Xây dựng bộ nhận API Next.js
+
+Tuyến API xác thực payload đến, ghi vào PostgreSQL và trả về ngay lập tức. Sử dụng App Router tại `app/api/reports/route.ts`:
+
+```typescript
+import { NextResponse } from 'next/server';
+import { prisma } from '@/lib/prisma';
+
+const REPORTER_SECRET = process.env.REPORTER_SECRET;
+
+export async function POST(request: Request) {
+  // Validate the shared secret
+  if (REPORTER_SECRET) {
+    const secret = request.headers.get('x-reporter-secret');
+    if (secret !== REPORTER_SECRET) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+  }
+
+  const data = await request.json();
+
+  // Upsert the run record (idempotent for CI sharding where multiple workers post)
+  const run = await prisma.testRun.upsert({
+    where: { runId: data.runId },
+    create: {
+      runId: data.runId,
+      branch: data.branch,
+      commitSha: data.commitSha,
+      status: data.status,
+      startedAt: new Date(data.startedAt),
+      finishedAt: new Date(data.finishedAt),
+      totalTests: data.totalTests,
+      passedTests: data.passedTests,
+      failedTests: data.failedTests,
+      flakyTests: data.flakyTests,
+      skippedTests: data.skippedTests,
+    },
+    update: {
+      // Merge shard results: aggregate counts
+      totalTests: { increment: data.totalTests },
+      passedTests: { increment: data.passedTests },
+      failedTests: { increment: data.failedTests },
+      flakyTests: { increment: data.flakyTests },
+      skippedTests: { increment: data.skippedTests },
+      status: data.status === 'failed' ? 'failed' : undefined,
+      finishedAt: new Date(data.finishedAt),
+    },
+  });
+
+  // Batch-insert all individual test results
+  await prisma.testResult.createMany({
+    data: data.tests.map((t: any) => ({
+      runId: run.id,
+      testId: t.testId,
+      title: t.title,
+      fullTitle: t.fullTitle,
+      filePath: t.filePath,
+      status: t.status,
+      retryCount: t.retryCount,
+      durationMs: t.durationMs,
+      workerIndex: t.workerIndex,
+      errorMessage: t.errorMessage,
+    })),
+    skipDuplicates: true,
+  });
+
+  return NextResponse.json({ success: true, runId: run.runId });
+}
+```
+
+## Prisma Schema để lưu trữ kiểm thử
+
+```prisma
+model TestRun {
+  id          Int          @id @default(autoincrement())
+  runId       String       @unique
+  branch      String
+  commitSha   String
+  status      String
+  startedAt   DateTime
+  finishedAt  DateTime
+  totalTests  Int          @default(0)
+  passedTests Int          @default(0)
+  failedTests Int          @default(0)
+  flakyTests  Int          @default(0)
+  skippedTests Int         @default(0)
+  results     TestResult[]
+  createdAt   DateTime     @default(now())
+
+  @@index([branch])
+  @@index([commitSha])
+}
+
+model TestResult {
+  id           Int     @id @default(autoincrement())
+  run          TestRun @relation(fields: [runId], references: [id])
+  runId        Int
+  testId       String
+  title        String
+  fullTitle    String
+  filePath     String
+  status       String
+  retryCount   Int     @default(0)
+  durationMs   Int
+  workerIndex  Int
+  errorMessage String?
+
+  @@index([testId])
+  @@index([status])
+  @@index([filePath])
+}
+```
+
+## Truy vấn bảng điều khiển độ không ổn định
+
+Với kết quả đã được lưu trữ, bạn có thể tính toán tỷ lệ độ không ổn định trên mỗi kiểm thử trên các nhánh bằng một truy vấn duy nhất:
+
+```typescript
+// Top 10 flaky tests in the last 30 days
+const flakyLeaderboard = await prisma.testResult.groupBy({
+  by: ['testId', 'fullTitle', 'filePath'],
+  where: {
+    run: { startedAt: { gte: new Date(Date.now() - 30 * 86400_000) } },
+  },
+  _count: { testId: true },
+  _sum: { retryCount: true },
+  having: { retryCount: { _sum: { gt: 0 } } },
+  orderBy: { _sum: { retryCount: 'desc' } },
+  take: 10,
+});
+```
+
+## Hỗ trợ phân chia CI
+
+Phân chia CI của Playwright chia bộ kiểm thử của bạn trên nhiều trình chạy để tăng tốc độ. Mỗi phân đoạn chạy độc lập và đăng kết quả của nó lên cùng một endpoint. Vì tuyến API sử dụng `upsert` được khóa trên `runId` (được đặt qua `CI_RUN_ID`), tất cả các phân đoạn sẽ hợp nhất thành một bản ghi chạy thống nhất duy nhất:
+
+```yaml
+# .github/workflows/e2e.yml
+strategy:
+  matrix:
+    shardIndex: [1, 2, 3, 4]
+    shardTotal: [4]
+env:
+  CI_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+  DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
+  REPORTER_SECRET: ${{ secrets.REPORTER_SECRET }}
+```
+
+Mỗi trong số 4 phân đoạn đăng `CI_RUN_ID` của nó, và các số đếm tổng hợp tích lũy chính xác trong cơ sở dữ liệu thông qua logic tăng `upsert`.
+
+---
+
+## Câu hỏi thường gặp
+
+<FAQ>
+  <Question>Chi phí để chạy một bảng điều khiển Playwright tùy chỉnh là bao nhiêu?</Question>
+  <Answer>Chi phí để chạy một bảng điều khiển tùy chỉnh rất thấp. Nếu bạn triển khai bộ nhận của mình lên Vercel và lưu trữ dữ liệu đo từ xa trong Supabase hoặc Neon PostgreSQL không máy chủ, chi phí vận hành gần như bằng không đối với các nhóm kỹ thuật vừa và nhỏ.</Answer>
+
+  <Question>Tôi có thể gửi các tệp đính kèm như ảnh chụp màn hình và tệp zip theo dõi đến Next.js không?</Question>
+  <Answer>Có. Thay vì gửi các tệp nhị phân lớn bên trong payload JSON, hãy tải các artifact trực tiếp lên Cloudflare R2 hoặc Amazon S3 bằng cách sử dụng các URL được ký trước trong quá trình thực thi kiểm thử, và chỉ bao gồm các URL artifact đã ký trong payload của reporter. Điều này giúp payload JSON nhỏ gọn và tránh các vấn đề về thời gian chờ.</Answer>
+
+  <Question>Một reporter tùy chỉnh có làm chậm quá trình thực thi kiểm thử Playwright không?</Question>
+  <Answer>Không. Playwright thực thi các hook vòng đời kiểm thử không đồng bộ. Việc tổng hợp dữ liệu trong bộ nhớ diễn ra ở chế độ nền, và payload mạng được gửi trong hook onEnd sau khi tất cả các kiểm thử hoàn thành. Chi phí duy nhất là HTTP POST cuối cùng, thường dưới 500ms.</Answer>
+
+  <Question>Reporter tùy chỉnh này có tương thích với phân chia CI của Playwright không?</Question>
+  <Answer>Có. Truyền một biến môi trường CI_RUN_ID được chia sẻ cho tất cả các phân đoạn trình chạy. Mỗi phân đoạn worker đăng lô của nó lên API Next.js với cùng một ID chạy, và logic upsert trong cơ sở dữ liệu tổng hợp chúng thành một chế độ xem chạy kiểm thử thống nhất với các số đếm tổng hợp chính xác.</Answer>
+
+  <Question>Làm cách nào để cảnh báo về các lỗi kiểm thử mới trong Slack hoặc PagerDuty?</Question>
+  <Answer>Trong trình xử lý onEnd của tuyến API, sau khi lưu trữ kết quả, hãy kiểm tra xem `data.failedTests > 0` và `data.branch === 'main'`. Nếu có, hãy thực hiện một lệnh gọi fetch bổ sung đến webhook của Slack hoặc PagerDuty Events API v2. Điều này cung cấp cho bạn cảnh báo theo thời gian thực mà không cần một bước CI riêng biệt.</Answer>
+</FAQ>
+
+---
+
+## Bạn cũng có thể thích
+
+- [Đánh giá hiệu suất chuyên sâu Playwright vs Cypress vào năm 2026](/en/blog/playwright-vs-cypress-performance-benchmark)
+- [Kiểm thử hồi quy hình ảnh Playwright: Hướng dẫn doanh nghiệp đầy đủ](/en/blog/playwright-visual-regression-testing-guide)
+- [Next.js Middleware: Xây dựng xác thực và ủy quyền mạnh mẽ](/en/blog/nextjs-middleware-authentication)
+- [Vitest trong các Monorepo lớn: Hướng dẫn tối ưu hóa hiệu suất](/en/blog/vitest-monorepo-unit-testing-performance)

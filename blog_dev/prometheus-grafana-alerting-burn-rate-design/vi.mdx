@@ -1,0 +1,320 @@
+---
+title: "Thiết kế cảnh báo Prometheus Grafana và Burn Rate"
+images:
+  - '/static/images/prometheus-grafana-alerting-burn-rate-design-featured.jpg'
+  - '/static/images/prometheus-grafana-alerting-burn-rate-design-sli-slo.jpg'
+  - '/static/images/prometheus-grafana-alerting-burn-rate-design-multi-window.jpg'
+  - '/static/images/prometheus-grafana-alerting-burn-rate-design-promql-rules.jpg'
+  - '/static/images/prometheus-grafana-alerting-burn-rate-design-alertmanager.jpg'
+  - '/static/images/prometheus-grafana-alerting-burn-rate-design-grafana-dashboard.jpg'
+date: '2026-07-29'
+tags: ["prometheus", "grafana", "devops"]
+draft: false
+summary: "Thiết kế cảnh báo Prometheus và Grafana cho môi trường sản xuất bằng cách sử dụng các quy tắc PromQL multi-window multi-burn-rate cho mục tiêu mức dịch vụ (SLO) và ngân sách lỗi."
+authors: ['default']
+category: Tech
+---
+
+
+Tất cả chúng ta đều đã trải qua điều này: bị gọi dậy lúc 3 giờ sáng vì CPU của máy chủ đạt 85% trong hai phút, chỉ để đăng nhập và thấy mọi thứ hoàn toàn ổn. Các cảnh báo ngưỡng tĩnh như vậy là cách nhanh nhất để làm kiệt sức một ca trực. Chúng tạo ra sự mệt mỏi cảnh báo vô tận, đánh thức các kỹ sư vì những sự cố nhỏ không cần hành động, và – tệ nhất – thường bỏ lỡ hoàn toàn những sự suy giảm độ trễ chậm, âm ỉ thực sự ảnh hưởng đến người dùng. Giải pháp là gì? Ngừng cảnh báo dựa trên các chỉ số tài nguyên và bắt đầu cảnh báo dựa trên các triệu chứng. Bằng cách áp dụng phương pháp cảnh báo Multi-Window Multi-Burn-Rate (được phổ biến bởi các nhóm SRE của Google), bạn có thể cấu hình Prometheus và Grafana để gọi bạn *chỉ* khi ngân sách lỗi thời gian thực của bạn thực sự đang cạn kiệt.
+
+<AudioPlayer src="/static/audio/prometheus-grafana-alerting-burn-rate-design.mp3" title="Executive Audio Briefing" />
+
+## SLI, SLO và Ngân sách lỗi trong Kiến trúc cảnh báo SRE là gì?
+
+SLI, SLO và Ngân sách lỗi tạo thành khuôn khổ nền tảng của cảnh báo Kỹ thuật Độ tin cậy Trang web bằng cách xác định các chỉ số hiệu suất có thể đo lường, mục tiêu khả dụng và mức độ lỗi chấp nhận được cho các ứng dụng sản xuất. Chỉ số Mức độ Dịch vụ (SLI) là một chỉ số có thể định lượng để đo lường chất lượng thời gian thực của một dịch vụ, chẳng hạn như tỷ lệ yêu cầu HTTP thành công so với tổng số yêu cầu hoặc độ trễ yêu cầu ở phân vị thứ 99. Mục tiêu Mức độ Dịch vụ (SLO) đặt ngưỡng mục tiêu cho một SLI trong một khoảng thời gian tuân thủ luân phiên như ba mươi ngày, tuyên bố rằng dịch vụ phải đáp ứng các mục tiêu hiệu suất cho một tỷ lệ phần trăm cụ thể của tổng số yêu cầu.
+
+![SLI SLO Error Budget Fundamentals](/static/images/prometheus-grafana-alerting-burn-rate-design-sli-slo.jpg)
+
+Ngân sách lỗi đại diện cho nghịch đảo toán học của SLO của bạn, xác định độ không tin cậy tối đa cho phép mà ứng dụng của bạn có thể gặp phải trong khoảng thời gian tuân thủ. Ví dụ, nếu một dịch vụ API định nghĩa SLO khả dụng là `99.9%` trong ba mươi ngày, ngân sách lỗi của nó là `0.1%` (`100% - 99.9%`). Nếu dịch vụ nhận được mười triệu tổng số yêu cầu trong ba mươi ngày đó, nhóm kỹ thuật có thể gặp phải tối đa mười nghìn yêu cầu không thành công trước khi vi phạm thỏa thuận mức độ dịch vụ của họ.
+
+Ngân sách lỗi thiết lập một ranh giới định lượng rõ ràng để cân bằng tốc độ phát triển tính năng với sự ổn định của hệ thống. Khi một dịch vụ duy trì nhiều ngân sách lỗi, các nhóm phát triển có thể đẩy các triển khai phần mềm mới một cách mạnh mẽ. Ngược lại, khi ngân sách lỗi giảm xuống gần bằng không, việc đóng băng triển khai sẽ có hiệu lực cho đến khi hệ thống ổn định trở lại.
+```
++-----------------------------------------------------------------------------------+
+| 30-Day Rolling Window (Total Requests: 10,000,000)                               |
++-----------------------------------------------------------------------------------+
+| Target Availability SLO: 99.9%  =====>  Successful Requests Goal: 9,990,000     |
+| Total Error Budget:      0.1%   =====>  Max Allowed Failed Requests: 10,000        |
++-----------------------------------------------------------------------------------+
+| Burn Rate 1x   =====> Consumes 100% Error Budget exactly in 30 days (13.8 req/hr)  |
+| Burn Rate 14.4x ====> Consumes  2% Error Budget in 1 Hour (Urgent Page Alert)     |
++-----------------------------------------------------------------------------------+
+```
+
+## Cảnh báo Multi-Window Multi-Burn-Rate ngăn chặn sự mệt mỏi cảnh báo như thế nào?
+
+Cảnh báo Multi-Window Multi-Burn-Rate ngăn chặn sự mệt mỏi cảnh báo bằng cách yêu cầu tỷ lệ lỗi phải vượt quá ngưỡng tiêu thụ đồng thời trên cả cửa sổ đánh giá thời gian ngắn và dài trước khi kích hoạt cảnh báo. Các cảnh báo một cửa sổ truyền thống gặp phải những đánh đổi cố hữu: cửa sổ đánh giá ngắn (như năm phút) kích hoạt các cảnh báo sai về các đợt tăng lưu lượng tạm thời tự giải quyết, trong khi cửa sổ đánh giá dài (như sáu giờ) trì hoãn các thông báo quan trọng trong các sự cố nghiêm trọng và đặt lại chậm sau khi các vấn đề được giải quyết.
+
+![Multi-Window Multi-Burn-Rate Architecture](/static/images/prometheus-grafana-alerting-burn-rate-design-multi-window.jpg)
+
+Thiết kế đa tốc độ tiêu thụ (multi-burn-rate) giải quyết những hạn chế này bằng cách đo tốc độ tiêu thụ ngân sách lỗi trên nhiều khoảng thời gian. Tốc độ tiêu thụ `1x` có nghĩa là ứng dụng của bạn sẽ tiêu thụ chính xác một trăm phần trăm ngân sách lỗi của nó trong khoảng thời gian tuân thủ ba mươi ngày. Tốc độ tiêu thụ `14.4x` cho thấy ứng dụng của bạn đang tiêu thụ ngân sách lỗi nhanh hơn mười bốn lần so với bình thường, tiêu tốn hai phần trăm tổng ngân sách lỗi chỉ trong một giờ.
+
+Để đảm bảo độ chính xác cảnh báo cao, phương pháp đa cửa sổ yêu cầu hai điều kiện phải được đáp ứng đồng thời: cửa sổ dài xác minh rằng một lượng đáng kể ngân sách lỗi đã được tiêu thụ, trong khi cửa sổ ngắn xác minh rằng sự kiện lỗi đang diễn ra tích cực. Việc yêu cầu cả hai điều kiện này ngăn chặn việc gửi thông báo phân trang cho các lỗi thoáng qua ngắn đã dừng.
+
+Dưới đây là ma trận Multi-Burn-Rate SRE tiêu chuẩn ánh xạ các tuyến mức độ nghiêm trọng đến các ngưỡng tốc độ tiêu thụ:
+
+| Mức độ nghiêm trọng cảnh báo | Ngân sách lỗi đã tiêu thụ | Kích thước cửa sổ dài | Kích thước cửa sổ ngắn | Hệ số tốc độ tiêu thụ | Tuyến thông báo mục tiêu |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Trang quan trọng** | 2% Ngân sách lỗi | 1 Giờ | 5 Phút | 14.4x Tốc độ tiêu thụ | PagerDuty / SRE trực |
+| **Trang cảnh báo** | 5% Ngân sách lỗi | 6 Giờ | 30 Phút | 6.0x Tốc độ tiêu thụ | PagerDuty / Phụ |
+| **Vé / Cảnh báo** | 10% Ngân sách lỗi | 3 ngày | 6 Giờ | 1.0x Tốc độ tiêu thụ | Vé Jira / Kênh Slack |
+
+## Làm thế nào để bạn viết các quy tắc PromQL cho độ trễ và tốc độ tiêu thụ tỷ lệ lỗi?
+
+Bạn viết các quy tắc PromQL cho độ trễ và tốc độ tiêu thụ tỷ lệ lỗi bằng cách định nghĩa các quy tắc ghi để tính toán trước tỷ lệ yêu cầu trên các khoảng thời gian khác nhau, sau đó là các quy tắc cảnh báo đánh giá các hệ số tốc độ tiêu thụ so với ngân sách lỗi mục tiêu. Việc tính toán trước tỷ lệ yêu cầu thô bằng cách sử dụng các quy tắc ghi của Prometheus giúp giảm chi phí truy vấn CPU trên máy chủ Prometheus của bạn trong các vòng lặp đánh giá cảnh báo.
+
+![PromQL Alerting Rule Definitions](/static/images/prometheus-grafana-alerting-burn-rate-design-promql-rules.jpg)
+
+Bước đầu tiên trong việc triển khai cảnh báo tốc độ tiêu thụ là tính toán tỷ lệ các sự kiện xấu so với tổng số sự kiện. Đối với SLI khả dụng, các sự kiện xấu đại diện cho các phản hồi HTTP với mã trạng thái `5xx`. Đối với SLI độ trễ, các sự kiện xấu đại diện cho các yêu cầu HTTP có độ trễ phản hồi vượt quá ngưỡng mục tiêu đã xác định của bạn (ví dụ: các yêu cầu mất hơn `500ms`).
+
+Hãy để tôi chỉ cho bạn một tệp cấu hình quy tắc ghi Prometheus hoàn chỉnh định nghĩa các chỉ số tỷ lệ lỗi trên nhiều khoảng thời gian:
+
+```yaml
+groups:
+  - name: service_sli_recording_rules
+    rules:
+      # 5-minute error rate ratio
+      - record: job:http_requests_error_rate:ratio_rate5m
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+          /
+          sum(rate(http_requests_total[5m])) by (job)
+
+      # 1-hour error rate ratio
+      - record: job:http_requests_error_rate:ratio_rate1h
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[1h])) by (job)
+          /
+          sum(rate(http_requests_total[1h])) by (job)
+
+      # 30-minute error rate ratio
+      - record: job:http_requests_error_rate:ratio_rate30m
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[30m])) by (job)
+          /
+          sum(rate(http_requests_total[30m])) by (job)
+
+      # 6-hour error rate ratio
+      - record: job:http_requests_error_rate:ratio_rate6h
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[6h])) by (job)
+          /
+          sum(rate(http_requests_total[6h])) by (job)
+```
+
+Khi các quy tắc ghi này tồn tại trong Prometheus, hãy xây dựng các quy tắc cảnh báo của bạn để đánh giá các biểu thức đa cửa sổ đa tốc độ tiêu thụ:
+
+```yaml
+  - name: service_slo_burn_rate_alerts
+    rules:
+      # Critical Page: 14.4x burn rate over 1h and 5m windows (2% budget in 1 hour)
+      - alert: APIAvailabilityErrorBudgetBurnCritical
+        expr: |
+          (job:http_requests_error_rate:ratio_rate1h > (14.4 * 0.001))
+          and
+          (job:http_requests_error_rate:ratio_rate5m > (14.4 * 0.001))
+        for: 2m
+        labels:
+          severity: critical
+          tier: platform
+        annotations:
+          summary: "API Service consuming error budget rapidly (14.4x burn rate)"
+          description: "API Service error rate is {{ $value | printf "%.4f" }} over 1 hour, consuming 2% of 30-day error budget."
+
+      # Warning Ticket: 6x burn rate over 6h and 30m windows (5% budget in 6 hours)
+      - alert: APIAvailabilityErrorBudgetBurnWarning
+        expr: |
+          (job:http_requests_error_rate:ratio_rate6h > (6.0 * 0.001))
+          and
+          (job:http_requests_error_rate:ratio_rate30m > (6.0 * 0.001))
+        for: 15m
+        labels:
+          severity: warning
+          tier: platform
+        annotations:
+          summary: "API Service consuming error budget steadily (6x burn rate)"
+          description: "API Service error rate is {{ $value | printf "%.4f" }} over 6 hours, consuming 5% of 30-day error budget."
+```
+
+Lưu ý cách `14.4 * 0.001` chuyển đổi hệ số tốc độ tiêu thụ thành ngưỡng lỗi rõ ràng cho SLO khả dụng `99.9%` (`error_budget = 0.001`). Nếu SLO mục tiêu của bạn là `99.5%` (`error_budget = 0.005`), hãy cập nhật hệ số PromQL thành `14.4 * 0.005` (ngưỡng tỷ lệ lỗi `0.072`).
+
+## Làm thế nào để bạn cấu hình định tuyến Alertmanager cho việc leo thang cảnh báo động?
+
+Bạn cấu hình định tuyến Alertmanager cho việc leo thang cảnh báo động bằng cách định nghĩa một cây định tuyến phân cấp trong `alertmanager.yml` khớp với các nhãn cảnh báo như `severity` và `tier` để định tuyến thông báo đến các bộ nhận được chỉ định. Alertmanager hoạt động như công cụ thông báo trung tâm cho Prometheus, xử lý việc loại bỏ trùng lặp cảnh báo, nhóm, ngăn chặn và định tuyến trên các bộ nhận thông báo bên ngoài như PagerDuty, Opsgenie và Slack.
+
+![Alertmanager Routing and Severity Controls](/static/images/prometheus-grafana-alerting-burn-rate-design-alertmanager.jpg)
+
+Cây định tuyến sử dụng các mảng `matchers` để lọc các cảnh báo đến dựa trên các cặp khóa-giá trị nhãn. Cấu hình các tham số `group_by` cho phép Alertmanager hợp nhất nhiều cảnh báo đồng thời bắt nguồn từ cùng một tầng dịch vụ thành một thông báo tóm tắt duy nhất, ngăn chặn lũ thông báo trong các sự cố cơ sở hạ tầng lớn.
+
+Dưới đây là cấu hình `alertmanager.yml` hoàn chỉnh minh họa định tuyến leo thang đa kênh:
+
+```yaml
+global:
+  resolve_timeout: 5m
+  pagerduty_url: 'https://events.pagerduty.com/v2/enqueue'
+
+route:
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'slack-default'
+  routes:
+    - matchers:
+        - severity = critical
+      receiver: 'pagerduty-oncall'
+      continue: true
+    - matchers:
+        - severity = warning
+      receiver: 'slack-warnings'
+
+inhibit_rules:
+  - source_matchers:
+      - alertname = NodeNetworkDown
+    target_matchers:
+      - alertname = APIAvailabilityErrorBudgetBurnCritical
+    equal: ['cluster', 'instance']
+
+receivers:
+  - name: 'slack-default'
+    slack_configs:
+      - channel: '#devops-alerts'
+        send_resolved: true
+        text: "Alert: {{ .CommonAnnotations.summary }}
+Description: {{ .CommonAnnotations.description }}"
+
+  - name: 'pagerduty-oncall'
+    pagerduty_configs:
+      - service_key: 'pd-integration-key-production'
+        severity: 'critical'
+
+  - name: 'slack-warnings'
+    slack_configs:
+      - channel: '#sre-warning-tickets'
+        send_resolved: true
+```
+
+Phần `inhibit_rules` cung cấp các khả năng ngăn chặn cảnh báo quan trọng. Trong cấu hình này, nếu toàn bộ một nút Kubernetes gặp sự cố mạng (`NodeNetworkDown`), Alertmanager sẽ tự động ngăn chặn các cảnh báo dịch vụ con như `APIAvailabilityErrorBudgetBurnCritical` trên nút đó. Việc ngăn chặn các triệu chứng hạ nguồn giúp các kỹ sư trực không nhận được hàng chục trang trùng lặp cho một lỗi nguyên nhân gốc duy nhất.
+
+## Làm thế nào để bạn xây dựng Bảng điều khiển cảnh báo Grafana để hiển thị SLO theo thời gian thực?
+
+Bạn xây dựng bảng điều khiển cảnh báo Grafana để hiển thị SLO theo thời gian thực bằng cách tạo các bảng điều khiển trực quan hóa số dư ngân sách lỗi hiện tại, tốc độ tiêu thụ lịch sử và ngưỡng trạng thái cảnh báo đang hoạt động. Các bảng điều khiển đóng vai trò là không gian làm việc hoạt động chính trong quá trình ứng phó sự cố, cho phép các kỹ sư xác minh liệu thông báo cảnh báo có tương ứng với tác động thực tế của khách hàng hay không và ước tính còn bao nhiêu giờ ngân sách lỗi trước khi vi phạm SLO.
+
+![Grafana Alert Dashboard and SLO Visuals](/static/images/prometheus-grafana-alerting-burn-rate-design-grafana-dashboard.jpg)
+
+Một bảng điều khiển SRE được thiết kế tốt có ba vùng trực quan chính: một hàng tóm tắt điều hành hiển thị tỷ lệ phần trăm tuân thủ SLO cấp cao nhất, một hàng giữa vẽ các đường cong tốc độ tiêu thụ ngân sách lỗi đa cửa sổ và một hàng dưới cùng hiển thị các phiên bản cảnh báo Prometheus đang hoạt động và các chỉ số hệ thống. Sử dụng trực quan hóa bảng điều khiển Stat của Grafana cho phép bạn mã hóa màu các giá trị ngân sách lỗi còn lại, hiển thị màu xanh lá cây khi ngân sách vượt quá năm mươi phần trăm, màu vàng khi ngân sách giảm xuống dưới hai mươi phần trăm và màu đỏ khi ngân sách đã cạn kiệt.
+
+Dưới đây là một ví dụ về định nghĩa JSON bảng điều khiển Grafana theo dõi tỷ lệ phần trăm ngân sách lỗi còn lại trong 30 ngày:
+
+```json
+{
+  "type": "stat",
+  "title": "30-Day Remaining Error Budget",
+  "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+  "targets": [
+    {
+      "datasource": "Prometheus",
+      "expr": "(1 - (sum(increase(http_requests_total{status=~"5.."}[30d])) / sum(increase(http_requests_total[30d])))) / 0.001 * 100",
+      "format": "time_series",
+      "legendFormat": "Remaining Budget %"
+    }
+  ],
+  "fieldConfig": {
+    "defaults": {
+      "unit": "percent",
+      "thresholds": {
+        "mode": "absolute",
+        "steps": [
+          { "color": "red", "value": null },
+          { "color": "yellow", "value": 20 },
+          { "color": "green", "value": 50 }
+        ]
+      }
+    }
+  }
+}
+```
+
+Ngoài các bảng trực quan hóa tĩnh, Grafana Unified Alerting cho phép bạn tạo các quy tắc cảnh báo trực tiếp trong giao diện người dùng Grafana bằng cách sử dụng các truy vấn đa nguồn dữ liệu. Grafana Alerting hỗ trợ các điểm liên hệ, chính sách thông báo và tắt tiếng giống hệt Alertmanager, cho phép các nhóm nền tảng quản lý các chính sách cảnh báo cùng với các trực quan hóa bảng điều khiển trong các quy trình làm việc người dùng thống nhất.
+
+## Làm thế nào để bạn điều chỉnh ngưỡng cảnh báo và kiểm tra các quy tắc tốc độ tiêu thụ?
+
+Bạn điều chỉnh ngưỡng cảnh báo và kiểm tra các quy tắc tốc độ tiêu thụ bằng cách mô phỏng các lỗi lưu lượng tổng hợp bằng cách sử dụng các trình tạo tải như k6, xem xét dữ liệu chỉ số lịch sử và chạy các đánh giá quy tắc PromQL thử nghiệm trên dữ liệu lịch sử Prometheus. Trước khi triển khai các quy tắc cảnh báo tốc độ tiêu thụ mới vào sản xuất, bạn phải xác thực rằng các quy tắc kích hoạt đáng tin cậy trong các điều kiện lỗi thực tế mà không kích hoạt cảnh báo sai trong các thay đổi lưu lượng bình thường.
+
+Kiểm thử tổng hợp bao gồm việc tạo lưu lượng HTTP nhân tạo bằng các công cụ kiểm thử tải trong khi đưa vào các lỗi được kiểm soát (chẳng hạn như buộc một tập hợp con các yêu cầu API trả về lỗi HTTP 500). Việc giám sát tốc độ Prometheus đánh giá các quy tắc ghi và kích hoạt cảnh báo `APIAvailabilityErrorBudgetBurnCritical` xác minh rằng các khoảng thời gian đánh giá cửa sổ ngắn hoạt động chính xác dưới khối lượng lưu lượng thực tế.
+
+Để thực hiện kiểm thử quy tắc thử nghiệm trên các chỉ số Prometheus lịch sử, hãy sử dụng `promtool`, tiện ích CLI kiểm thử quy tắc Prometheus chính thức:
+
+```bash
+# 1. Validate syntax of Prometheus alerting rules file
+promtool check rules rules/slo_alerts.yml
+
+# 2. Run unit test suite against synthetic time-series test data
+promtool test rules tests/slo_alerts_test.yml
+```
+
+Kiểm thử đơn vị các quy tắc cảnh báo với `promtool` bao gồm việc định nghĩa các đầu vào chuỗi thời gian tổng hợp trong một tệp kiểm thử YAML và khai báo các trạng thái kích hoạt cảnh báo dự kiến tại các khoảng thời gian cụ thể.
+
+```yaml
+# Unit test file: tests/slo_alerts_test.yml
+rule_files:
+  - ../rules/slo_alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="api", status="200"}'
+        values: '1000+1000x60'
+      - series: 'http_requests_total{job="api", status="500"}'
+        values: '0+50x60'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: APIAvailabilityErrorBudgetBurnCritical
+        exp_alerts:
+          - labels:
+              severity: critical
+              tier: platform
+            annotations:
+              summary: "API Service consuming error budget rapidly (14.4x burn rate)"
+```
+
+Chạy kiểm thử đơn vị trong quy trình CI/CD của bạn đảm bảo rằng các sửa đổi đối với các quy tắc cảnh báo PromQL hoặc lược đồ nhãn chỉ số không làm hỏng logic cảnh báo hoặc đưa cú pháp PromQL không hợp lệ vào các cụm giám sát sản xuất. Kết hợp các quy tắc backend Prometheus cho các trang SRE quan trọng với cảnh báo Grafana cho các thông báo của nhóm vận hành mang lại một kiến trúc giám sát vững chắc.
+
+## Các câu hỏi thường gặp về Tốc độ tiêu thụ cảnh báo Prometheus là gì?
+
+### Tại sao bạn không nên sử dụng các chỉ số CPU hoặc bộ nhớ cho các cảnh báo phân trang chính?
+
+Bạn không nên sử dụng các chỉ số CPU hoặc bộ nhớ cho các cảnh báo phân trang chính vì việc sử dụng tài nguyên cao không trực tiếp tương ứng với sự suy giảm ứng dụng đối với khách hàng. Các ứng dụng hiện đại được thiết kế để sử dụng tài nguyên CPU và bộ nhớ có sẵn một cách hiệu quả dưới lưu lượng truy cập lớn. Kích hoạt phân trang khi sử dụng CPU cao gây ra sự mệt mỏi cảnh báo khi các ứng dụng chạy trơn tru mặc dù tiêu thụ tài nguyên cao. Các cảnh báo phân trang nên tập trung nghiêm ngặt vào các SLI như độ trễ, tỷ lệ lỗi và khả dụng để đo lường trải nghiệm người dùng thực.
+
+### Sự khác biệt giữa cảnh báo tốc độ tiêu thụ 14.4x và cảnh báo tốc độ tiêu thụ 6x là gì?
+
+Sự khác biệt nằm ở tốc độ tiêu thụ ngân sách lỗi của bạn và mức độ khẩn cấp của thông báo kết quả. Tốc độ tiêu thụ `14.4x` tiêu thụ hai phần trăm tổng ngân sách lỗi ba mươi ngày của bạn trong một giờ, báo hiệu một sự cố nghiêm trọng đòi hỏi phải leo thang trang ngay lập tức cho một kỹ sư trực. Tốc độ tiêu thụ `6x` tiêu thụ năm phần trăm ngân sách lỗi của bạn trong sáu giờ, cho thấy một sự suy giảm chậm hơn đòi hỏi sự chú ý trong vòng vài giờ thông qua các thông báo cảnh báo hoặc kênh tạo vé.
+
+### Làm thế nào để bạn xử lý các dịch vụ lưu lượng thấp nơi số lượng lỗi nhỏ gây ra các đợt tăng tốc độ tiêu thụ lớn?
+
+Bạn xử lý các dịch vụ lưu lượng thấp bằng cách kết hợp các ngưỡng số lượng yêu cầu tối thiểu vào các biểu thức cảnh báo PromQL của bạn hoặc mở rộng kích thước cửa sổ đánh giá ngắn. Trên các dịch vụ lưu lượng thấp chỉ nhận được mười yêu cầu mỗi phút, một yêu cầu không thành công duy nhất đại diện cho tỷ lệ lỗi mười phần trăm, kích hoạt các đợt tăng tốc độ tiêu thụ sai. Thêm `and sum(rate(http_requests_total[5m])) > 5` đảm bảo rằng các cảnh báo tốc độ tiêu thụ chỉ được đánh giá khi tổng thông lượng yêu cầu đủ để mang lại kết quả có giá trị thống kê.
+
+### Làm thế nào để bạn cảnh báo về SLO độ trễ bằng cách sử dụng biểu đồ Prometheus?
+
+Bạn cảnh báo về SLO độ trễ bằng cách sử dụng biểu đồ Prometheus bằng cách theo dõi tỷ lệ yêu cầu được phục vụ nhanh hơn ngưỡng độ trễ của bạn bằng cách sử dụng nhãn nhóm `le`. Ví dụ, nếu SLO của bạn yêu cầu 95% yêu cầu phải hoàn thành dưới 200ms, truy vấn PromQL tỷ lệ sự kiện xấu của bạn là `1 - (sum(rate(http_request_duration_seconds_bucket{le="0.2"}[5m])) / sum(rate(http_request_duration_seconds_count[5m])))`. Truy vấn này đánh giá tỷ lệ phần trăm yêu cầu vi phạm mục tiêu 200ms của bạn.
+
+### Mục đích của mệnh đề for trong các quy tắc cảnh báo Prometheus là gì?
+
+Mệnh đề `for` (ví dụ `for: 2m`) hướng dẫn Prometheus đợi cho đến khi một biểu thức cảnh báo vẫn đúng liên tục trong khoảng thời gian được chỉ định trước khi chuyển trạng thái cảnh báo từ `Pending` sang `Firing`. Sử dụng mệnh đề `for` ngắn ngăn chặn các sự cố chỉ số thoáng qua hoặc các bất thường truy vấn một lần quét gửi cảnh báo sớm đến Alertmanager trong khi vẫn cho phép các sự kiện lỗi kéo dài thực sự được kích hoạt kịp thời.
+
+### Làm thế nào để bạn quản lý các cửa sổ bảo trì theo lịch trình để ngăn chặn cảnh báo trong quá trình triển khai?
+
+Bạn quản lý các cửa sổ bảo trì theo lịch trình bằng cách tạo Silences trong Alertmanager hoặc Grafana Alerting trong các hoạt động bảo trì đã lên kế hoạch. Một Silence của Alertmanager khớp với các nhãn cảnh báo (ví dụ `service="payment-api"`) và ngăn chặn thông báo trong một khoảng thời gian xác định. Silences có thể được tạo tương tác thông qua giao diện người dùng web của Alertmanager hoặc tự động thông qua các lệnh gọi API từ các tập lệnh triển khai CI/CD trước khi thực hiện các tác vụ bảo trì.
+
+### Bạn nên cấu hình các quy tắc cảnh báo trong Prometheus hay trong Grafana Unified Alerting?
+
+Cấu hình cơ sở hạ tầng cốt lõi và các cảnh báo ngân sách lỗi SRE trực tiếp trong các tệp quy tắc Prometheus được khuyến nghị để có tính khả dụng cao vì Prometheus đánh giá các biểu thức cảnh báo cục bộ bên cạnh cơ sở dữ liệu chuỗi thời gian của nó. Grafana Unified Alerting lý tưởng cho các cảnh báo bảng điều khiển cấp nhóm, tương quan đa nguồn dữ liệu và quy trình làm việc giao diện người dùng quản lý cảnh báo thân thiện với người dùng. Kết hợp các quy tắc backend Prometheus cho các trang SRE quan trọng với cảnh báo Grafana cho các thông báo của nhóm vận hành mang lại một kiến trúc giám sát đáng tin cậy.
+
+## Bạn cũng có thể thích
+
+- [k6 Grafana Distributed Load Testing & performance Profiling](/en/blog/k6-grafana-distributed-load-testing)
+- [Microservices Contract Testing with Pact & Node.js](/en/blog/contract-testing-pact-nodejs-microservices)
+- [Playwright E2E Testing: 4 Rules for Zero Flaky Tests](/en/blog/getting-started-with-playwright-for-e2e-testing)
+- [Best Playwright Alternatives for Enterprise Automation](/en/blog/best-playwright-alternatives)

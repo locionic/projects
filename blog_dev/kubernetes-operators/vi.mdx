@@ -1,0 +1,365 @@
+---
+title: "Kubernetes Operators và Custom Resources: Tự động hóa mọi thứ"
+date: "2026-09-13"
+lastmod: "2026-09-22"
+summary: "Mở rộng mặt phẳng điều khiển Kubernetes với Operators và Custom Resource Definitions (CRD) để tự động hóa quản lý vòng đời cho các ứng dụng có trạng thái phức tạp, tìm hiểu về vòng lặp đối chiếu, RBAC, kiểm thử và các mẫu sản xuất."
+tags: ["kubernetes", "operators", "devops", "cloud-native", "golang"]
+images: ["/static/images/kubernetes-operators.png"]
+draft: false
+---
+
+Kubernetes rất xuất sắc trong việc quản lý các ứng dụng phi trạng thái. Nếu một pod phi trạng thái chết, một ReplicaSet sẽ khởi tạo một pod mới — không cần sự can thiệp của con người. Nhưng việc quản lý các ứng dụng có trạng thái phức tạp như cơ sở dữ liệu, hàng đợi tin nhắn hoặc bộ nhớ đệm phân tán đòi hỏi **kiến thức vận hành chuyên biệt theo miền** mà Kubernetes không có theo mặc định.
+
+Hãy cùng tìm hiểu về mẫu Operator.
+
+<AudioPlayer src="/static/audio/kubernetes-operators.mp3" title="Tóm tắt âm thanh điều hành" />
+
+## Kubernetes Operator là gì?
+
+Kubernetes Operator là một phương pháp đóng gói, triển khai và quản lý một ứng dụng Kubernetes. Nó lấy kiến thức vận hành của con người — *cách sao lưu một cụm Postgres*, *cách nâng cấp Kafka mà không bị gián đoạn*, *cách xử lý chuyển đổi dự phòng bản sao* — và mã hóa nó thành phần mềm chạy nguyên bản bên trong mặt phẳng điều khiển Kubernetes.
+
+Về mặt vận hành, một Operator chỉ là một **controller** theo dõi một hoặc nhiều **Custom Resources** và phản ứng với các thay đổi. Nó chạy như một Pod tiêu chuẩn bên trong cụm của bạn và giao tiếp với máy chủ API Kubernetes giống như bất kỳ thành phần nào khác.
+
+Khái niệm này được CoreOS giới thiệu vào năm 2016 và kể từ đó đã trở thành một mẫu cơ bản. Ngày nay, [OperatorHub.io](https://operatorhub.io/) liệt kê hàng trăm Operator của cộng đồng và nhà cung cấp cho mọi thứ từ cert-manager đến Prometheus đến CockroachDB.
+
+## Custom Resource Definitions (CRDs)
+
+Các Operator dựa vào **Custom Resource Definitions** (CRDs) để mở rộng bề mặt API của Kubernetes. Một CRD đăng ký một loại tài nguyên mới trong cụm của bạn. Thay vì chỉ quản lý `Pods`, `Deployments` và `Services`, bạn có thể định nghĩa các loại tài nguyên hoàn toàn mới như `PostgresCluster`, `KafkaTopic` hoặc `RedisFailover`.
+
+Đây là một định nghĩa CRD tối thiểu:
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: postgresclusters.db.example.com
+spec:
+  group: db.example.com
+  scope: Namespaced
+  names:
+    plural: postgresclusters
+    singular: postgrescluster
+    kind: PostgresCluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                replicas:
+                  type: integer
+                  minimum: 1
+                version:
+                  type: string
+```
+
+Sau khi CRD này được áp dụng, người dùng có thể tạo các đối tượng `PostgresCluster` bằng cách sử dụng các lệnh `kubectl` tiêu chuẩn:
+
+```yaml
+apiVersion: db.example.com/v1alpha1
+kind: PostgresCluster
+metadata:
+  name: my-db
+  namespace: production
+spec:
+  replicas: 3
+  version: "16.2"
+```
+
+Operator theo dõi các đối tượng này và hành động — cấp phát PVC, khởi động các pod Postgres, cấu hình sao chép và quản lý toàn bộ vòng đời.
+
+## Vòng lặp hòa giải (Reconciliation Loop)
+
+Trái tim của mọi Kubernetes Operator là **vòng lặp hòa giải** (còn được gọi là vòng lặp điều khiển hoặc reconciler). Vòng lặp tuân theo một mẫu đơn giản:
+
+1. **Quan sát** — Theo dõi các thay đổi đối với Custom Resource (hoặc bất kỳ tài nguyên liên quan nào như Pods hoặc ConfigMaps).
+2. **So sánh** — So sánh *trạng thái mong muốn* (được khai báo trong đặc tả CR) với *trạng thái hiện tại* (những gì đang thực sự chạy).
+3. **Hành động** — Thực hiện tập hợp các hành động tối thiểu cần thiết để đưa trạng thái hiện tại về trạng thái mong muốn.
+4. **Lặp lại** — Vòng lặp là bất biến và chạy lại khi có bất kỳ thay đổi liên quan nào hoặc sau khi đồng bộ hóa định kỳ.
+
+Đây là vòng lặp tương tự mà Kubernetes tự sử dụng nội bộ cho các controller tích hợp sẵn (controller Deployment, controller ReplicaSet, v.v.). Operator của bạn chỉ đơn giản là thêm các mục mới vào vòng lặp này cho các tài nguyên tùy chỉnh của bạn.
+
+```go
+func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    log := log.FromContext(ctx)
+
+    // 1. Fetch the PostgresCluster resource
+    var cluster dbv1.PostgresCluster
+    if err := r.Get(ctx, req.NamespacedName, &cluster); err != nil {
+        if errors.IsNotFound(err) {
+            // Resource was deleted — clean up external resources
+            return ctrl.Result{}, nil
+        }
+        return ctrl.Result{}, err
+    }
+
+    // 2. Reconcile StatefulSet
+    if err := r.reconcileStatefulSet(ctx, &cluster); err != nil {
+        log.Error(err, "Failed to reconcile StatefulSet")
+        return ctrl.Result{RequeueAfter: time.Second * 30}, err
+    }
+
+    // 3. Reconcile Service
+    if err := r.reconcileService(ctx, &cluster); err != nil {
+        log.Error(err, "Failed to reconcile Service")
+        return ctrl.Result{RequeueAfter: time.Second * 30}, err
+    }
+
+    // 4. Update status
+    cluster.Status.ReadyReplicas = r.countReadyReplicas(ctx, &cluster)
+    if err := r.Status().Update(ctx, &cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
+}
+```
+
+Các điểm chính trong reconciler ở trên:
+- **Trả về `ctrl.Result{}`** mà không có lỗi khi không tìm thấy tài nguyên — nó đã bị xóa.
+- **Trả về `ctrl.Result{RequeueAfter: ...}`** để lên lịch hòa giải tiếp theo mà không bị lỗi.
+- **Luôn cập nhật subresource trạng thái** để phản ánh những gì đang thực sự chạy.
+- Reconciler phải **bất biến** — gọi nó 10 lần liên tiếp phải tạo ra cùng một kết quả như gọi nó một lần.
+
+## Xây dựng một Operator: Operator SDK so với controller-runtime
+
+Bạn có hai cách tiếp cận chính để xây dựng Operator:
+
+### 1. Operator SDK (được khuyến nghị cho hầu hết các trường hợp)
+
+[Operator SDK](https://sdk.operatorframework.io/) cung cấp giàn giáo, tạo mã và quản lý vòng đời cho các Operator. Nó hỗ trợ ba cách tiếp cận xây dựng:
+
+- **Go** — Kiểm soát hoàn toàn, hiệu suất tốt nhất, tiêu chuẩn cho các Operator sản xuất.
+- **Helm** — Đóng gói một biểu đồ Helm hiện có vào một Operator. Tốt cho các ứng dụng đơn giản.
+- **Ansible** — Sử dụng các playbook Ansible làm logic hòa giải. Tốt cho các nhóm nặng về vận hành.
+
+Khởi tạo một Operator Go mới:
+
+```bash
+operator-sdk init --domain=example.com --repo=github.com/example/postgres-operator
+operator-sdk create api --group=db --version=v1alpha1 --kind=PostgresCluster --resource --controller
+```
+
+Điều này tạo ra:
+- `api/v1alpha1/postgrescluster_types.go` — Các loại CRD Go của bạn
+- `controllers/postgrescluster_controller.go` — Reconciler của bạn
+- `config/crd/` — CRD YAML được tạo
+- `config/rbac/` — Các quy tắc RBAC được tạo
+
+### 2. controller-runtime trực tiếp
+
+Để kiểm soát tối đa, bạn có thể sử dụng [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime) trực tiếp mà không cần giàn giáo SDK. Đây là những gì Operator SDK sử dụng bên dưới:
+
+```go
+mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+    Scheme: scheme,
+    Metrics: server.Options{BindAddress: ":8080"},
+    HealthProbeBindAddress: ":8081",
+    LeaderElection: true,
+    LeaderElectionID: "postgres-operator.example.com",
+})
+
+if err := (&controllers.PostgresClusterReconciler{
+    Client: mgr.GetClient(),
+    Scheme: mgr.GetScheme(),
+}).SetupWithManager(mgr); err != nil {
+    setupLog.Error(err, "unable to create controller")
+    os.Exit(1)
+}
+```
+
+**Leader election** (`LeaderElection: true`) rất quan trọng trong sản xuất — nó đảm bảo chỉ một bản sao của Operator của bạn đang tích cực hòa giải tại bất kỳ thời điểm nào, ngăn chặn các kịch bản phân tách não.
+
+## RBAC và Bảo mật
+
+Các Operator cần quyền RBAC để theo dõi và sửa đổi tài nguyên. Operator SDK tự động tạo ra các quyền này, nhưng bạn nên hiểu chúng cấp những gì:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: postgres-operator-role
+rules:
+  # Watch and manage PostgresCluster CRs
+  - apiGroups: ["db.example.com"]
+    resources: ["postgresclusters", "postgresclusters/status", "postgresclusters/finalizers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Manage underlying resources
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps", "secrets", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read Pod status for health checks
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+```
+
+**Nguyên tắc đặc quyền tối thiểu**: Chỉ cấp các động từ và tài nguyên mà Operator của bạn thực sự cần. Tránh các ràng buộc `cluster-admin`.
+
+## Finalizers: Dọn dẹp khi tài nguyên bị xóa
+
+Khi người dùng xóa một CR `PostgresCluster`, Kubernetes sẽ xóa CR khỏi etcd — nhưng các tài nguyên bên ngoài như nhóm lưu trữ đám mây, bộ cân bằng tải hoặc bản ghi DNS bên ngoài sẽ không được dọn dẹp tự động.
+
+**Finalizers** giải quyết vấn đề này. Chúng là các dấu hiệu chuỗi trong trường `metadata.finalizers` của tài nguyên. Kubernetes sẽ không xóa vĩnh viễn một tài nguyên cho đến khi tất cả các finalizer của nó được loại bỏ:
+
+```go
+const finalizerName = "db.example.com/cleanup"
+
+func (r *PostgresClusterReconciler) handleFinalizer(ctx context.Context, cluster *dbv1.PostgresCluster) error {
+    if cluster.DeletionTimestamp.IsZero() {
+        // Resource is NOT being deleted — ensure finalizer is registered
+        if !controllerutil.ContainsFinalizer(cluster, finalizerName) {
+            controllerutil.AddFinalizer(cluster, finalizerName)
+            return r.Update(ctx, cluster)
+        }
+    } else {
+        // Resource IS being deleted — run cleanup
+        if controllerutil.ContainsFinalizer(cluster, finalizerName) {
+            if err := r.cleanupExternalResources(ctx, cluster); err != nil {
+                return err
+            }
+            // Remove finalizer — allows Kubernetes to complete deletion
+            controllerutil.RemoveFinalizer(cluster, finalizerName)
+            return r.Update(ctx, cluster)
+        }
+    }
+    return nil
+}
+```
+
+Luôn triển khai finalizer nếu Operator của bạn tạo tài nguyên bên ngoài cụm Kubernetes (nhóm S3, bản ghi Route53, giám sát Datadog, v.v.).
+
+## Điều kiện trạng thái: Truyền đạt trạng thái Operator
+
+Thay vì sử dụng các trường trạng thái không rõ ràng, hãy tuân theo quy ước Kubernetes về **điều kiện trạng thái** — các thông báo trạng thái có cấu trúc, có thể đọc được bằng máy:
+
+```go
+meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+    Type:               "Ready",
+    Status:             metav1.ConditionTrue,
+    ObservedGeneration: cluster.Generation,
+    Reason:             "ReconciliationSucceeded",
+    Message:            fmt.Sprintf("PostgresCluster with %d replicas is ready", cluster.Spec.Replicas),
+})
+```
+
+Điều này tạo ra một đầu ra `kubectl describe` mà các operator (con người) có thể nhanh chóng quét:
+
+```
+Conditions:
+  Type    Status  Reason                    Message
+  ----    ------  ------                    -------
+  Ready   True    ReconciliationSucceeded   PostgresCluster with 3 replicas is ready
+```
+
+## Kiểm tra Operator của bạn
+
+### Kiểm thử đơn vị Reconciler
+
+Sử dụng `controller-runtime`'s `fake.NewClientBuilder()` để kiểm tra logic hòa giải mà không cần cụm trực tiếp:
+
+```go
+func TestReconcile_CreatesStatefulSet(t *testing.T) {
+    cluster := &dbv1.PostgresCluster{
+        ObjectMeta: metav1.ObjectMeta{Name: "test-db", Namespace: "default"},
+        Spec:       dbv1.PostgresClusterSpec{Replicas: 3, Version: "16.2"},
+    }
+
+    r := &PostgresClusterReconciler{
+        Client: fake.NewClientBuilder().
+            WithScheme(scheme).
+            WithObjects(cluster).
+            Build(),
+        Scheme: scheme,
+    }
+
+    result, err := r.Reconcile(context.Background(), ctrl.Request{
+        NamespacedName: types.NamespacedName{Name: "test-db", Namespace: "default"},
+    })
+
+    assert.NoError(t, err)
+    assert.Equal(t, time.Minute*5, result.RequeueAfter)
+
+    // Verify StatefulSet was created
+    var sts appsv1.StatefulSet
+    err = r.Get(context.Background(), types.NamespacedName{Name: "test-db", Namespace: "default"}, &sts)
+    assert.NoError(t, err)
+    assert.Equal(t, int32(3), *sts.Spec.Replicas)
+}
+```
+
+### Kiểm thử tích hợp với envtest
+
+Gói `envtest` chạy một máy chủ API và etcd thực tế cục bộ, cho phép bạn kiểm tra toàn bộ luồng hòa giải:
+
+```go
+var testEnv *envtest.Environment
+
+func TestMain(m *testing.M) {
+    testEnv = &envtest.Environment{
+        CRDDirectoryPaths: []string{filepath.Join("..", "config", "crd", "bases")},
+    }
+    cfg, _ := testEnv.Start()
+    // ... setup manager and run tests
+    testEnv.Stop()
+}
+```
+
+## Danh sách kiểm tra triển khai sản xuất
+
+Trước khi triển khai một Operator vào sản xuất:
+
+- [ ] **Leader election được bật** — ngăn chặn phân tách não trong các triển khai đa bản sao
+- [ ] **Health probes được cấu hình** — `/healthz` liveness, `/readyz` readiness
+- [ ] **Metrics được hiển thị** — Prometheus metrics tại `/metrics` (controller-runtime tự động thực hiện điều này)
+- [ ] **Finalizers được triển khai** — cho bất kỳ việc dọn dẹp tài nguyên bên ngoài nào
+- [ ] **Điều kiện trạng thái** — các trường trạng thái có cấu trúc, có thể đọc được bằng máy
+- [ ] **RBAC đặc quyền tối thiểu** — không có `cluster-admin`, không có động từ ký tự đại diện
+- [ ] **Xác thực CRD** — lược đồ OpenAPI v3 với các trường bắt buộc và giá trị mặc định
+- [ ] **Giới hạn tốc độ** — cấu hình `RateLimiter` trên controller để ngăn chặn tràn máy chủ API
+- [ ] **Kiểm thử tích hợp `envtest`** vượt qua
+- [ ] **OLM bundle** — nếu phân phối qua OperatorHub
+
+## Các Operator thực tế đáng nghiên cứu
+
+| Operator | Nó quản lý gì | Tại sao nên nghiên cứu nó |
+|---|---|---|
+| [Prometheus Operator](https://github.com/prometheus-operator/prometheus-operator) | Prometheus + Alertmanager | Thiết kế CRD xuất sắc, các mẫu trạng thái |
+| [Cert-Manager](https://github.com/cert-manager/cert-manager) | Chứng chỉ TLS | Các mẫu finalizer phức tạp, tích hợp ACME |
+| [Strimzi](https://strimzi.io/) | Apache Kafka trên Kubernetes | Quản lý vòng đời trạng thái đầy đủ |
+| [CloudNativePG](https://cloudnative-pg.io/) | Cụm PostgreSQL | Operator Postgres cấp sản xuất |
+
+## Các câu hỏi thường gặp
+
+**Tôi nên viết một Operator hay chỉ sử dụng Helm?**
+Helm rất tuyệt vời cho các triển khai đơn giản, phi trạng thái. Sử dụng một Operator khi ứng dụng của bạn có logic vận hành cần chạy liên tục — các quyết định chuyển đổi dự phòng, di chuyển lược đồ, lên lịch sao lưu, chính sách mở rộng cụm. Nếu nó yêu cầu một cron job hoặc một người để quản lý, đó là một ứng cử viên cho một Operator.
+
+**Tôi có thể viết một Operator mà không cần Go không?**
+Có. Operator SDK hỗ trợ Helm và Ansible làm ngôn ngữ backend. Đối với Python, [kopf](https://kopf.readthedocs.io/) là một framework phổ biến. Tuy nhiên, Go mang lại cho bạn hiệu suất, công cụ và sự phù hợp tốt nhất với phần còn lại của hệ sinh thái Kubernetes.
+
+**Một Operator nên quản lý bao nhiêu CRD?**
+Hãy tập trung. Một Operator quản lý một miền được xác định rõ (ví dụ: một cơ sở dữ liệu cụ thể) dễ bảo trì và kiểm tra hơn một God-Operator quản lý mọi thứ. [Nguyên tắc trách nhiệm duy nhất](https://en.wikipedia.org/wiki/Single-responsibility_principle) áp dụng ở đây.
+
+**Sự khác biệt giữa Operator và controller là gì?**
+Về mặt kỹ thuật, mọi Operator đều là một controller, nhưng không phải mọi controller đều là một Operator. Thuật ngữ "Operator" đặc biệt đề cập đến các controller mã hóa **kiến thức miền vận hành** về một ứng dụng cụ thể. Một controller quản lý cơ sở hạ tầng chung thường chỉ được gọi là một controller.
+
+## Tổng kết
+
+Kubernetes Operators biến cụm của bạn từ một bộ lập lịch container thành một nền tảng tự phục hồi hoàn toàn cho các khối lượng công việc phức tạp. Mẫu này mở rộng từ các Operator dựa trên Helm đơn giản đến các controller Go tinh vi quản lý chuyển đổi dự phòng cơ sở dữ liệu, xoay vòng chứng chỉ và sao chép đa cụm một cách tự động.
+
+Việc đầu tư vào việc viết một Operator sẽ mang lại lợi ích khi bạn quản lý hơn 10 phiên bản của một ứng dụng có trạng thái và công việc vận hành của con người trở thành nút thắt cổ chai. Ở quy mô đó, kiến thức vận hành được mã hóa chạy 24/7 bên trong cụm đáng tin cậy hơn vô cùng so với các runbook và kỹ sư trực.
+
+## Bạn cũng có thể thích
+
+- [Xây dựng Kubernetes Operators bằng Go: Quản lý các ứng dụng có trạng thái](/en/blog/kubernetes-operators-golang)
+- [Kubernetes Custom Resource Definitions](/en/blog/kubernetes-custom-resources)
+- [Các chiến lược tối ưu hóa chi phí Kubernetes vào năm 2026](/en/blog/k8s-cost-optimization)
+- [GitOps với Flux: Cơ sở hạ tầng khai báo cho Kubernetes](/en/blog/devops-2026-08-07)

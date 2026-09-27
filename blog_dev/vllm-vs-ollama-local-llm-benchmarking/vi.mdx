@@ -1,0 +1,305 @@
+---
+title: "vLLM vs Ollama: Thông lượng LLM cục bộ & Điểm chuẩn GPU"
+images:
+  - '/static/images/vllm-vs-ollama-local-llm-benchmarking-featured.jpg'
+  - '/static/images/vllm-vs-ollama-local-llm-benchmarking-architecture.jpg'
+  - '/static/images/vllm-vs-ollama-local-llm-benchmarking-pagedattention.jpg'
+  - '/static/images/vllm-vs-ollama-local-llm-benchmarking-ollama-llamacpp.jpg'
+  - '/static/images/vllm-vs-ollama-local-llm-benchmarking-benchmarks.jpg'
+  - '/static/images/vllm-vs-ollama-local-llm-benchmarking-production-config.jpg'
+date: '2026-07-29'
+lastUpdated: '2026-08-22'
+tags: ["ai", "ollama", "benchmarking", "ai-tools"]
+draft: false
+featured: true
+summary: "So sánh vLLM và Ollama để suy luận LLM cục bộ, với các điểm chuẩn cho Llama 3 và Mistral về PagedAttention, continuous batching, mức sử dụng VRAM và độ trễ token."
+authors: ['default']
+category: Tech
+---
+
+
+Việc chọn máy chủ suy luận cục bộ phù hợp ảnh hưởng trực tiếp đến việc sử dụng phần cứng hệ thống, độ trễ yêu cầu của máy khách và thông lượng tạo token tối đa. Các kỹ sư triển khai các mô hình mã nguồn mở cục bộ thường phải đối mặt với lựa chọn kiến trúc cơ bản giữa vLLM và Ollama. Mặc dù cả hai công cụ đều chạy các mô hình ngôn ngữ lớn trên phần cứng riêng, nhưng các công cụ thực thi cơ bản của chúng phục vụ các yêu cầu sản xuất và mẫu khối lượng công việc khác nhau hoàn toàn. Nếu bạn không đánh giá giới hạn bộ nhớ trước khi triển khai, các khoản đầu tư phần cứng của bạn sẽ phải chịu các nút thắt cổ chai thông lượng nghiêm trọng.
+
+Hướng dẫn đánh giá chi tiết này phân tích cơ chế thực thi, mô hình phân bổ bộ nhớ và hiệu suất thông lượng của vLLM phiên bản 0.19 và Ollama phiên bản 0.6 trên các mức độ đồng thời yêu cầu khác nhau. Bạn sẽ có được các thông số cấu hình cụ thể, dấu vết bộ nhớ PyTorch và mã đánh giá Python để tối ưu hóa cơ sở hạ tầng LLM tự lưu trữ của mình một cách hiệu quả.
+
+<AudioPlayer src="/static/audio/vllm-vs-ollama-local-llm-benchmarking.mp3" title="Tóm tắt âm thanh điều hành" />
+
+<ArticleSeries
+  name="Chuỗi Cơ sở hạ tầng AI Agents & LLM"
+  current={4}
+  articles={[
+    { title: "LangChain vs LlamaIndex: Hướng dẫn đường ống RAG sản xuất", href: "/en/blog/langchain-vs-llamaindex-rag-pipeline-comparison" },
+    { title: "Xây dựng AI Agents đáng tin cậy với MCP: Hướng dẫn đầy đủ", href: "/en/blog/building-reliable-ai-agents-with-mcp" },
+    { title: "Kiến trúc bộ nhớ AI Agent: Tích hợp Vector Store", href: "/en/blog/ai-agent-memory-architectures-vector-stores" },
+    { title: "vLLM vs Ollama: Thông lượng LLM cục bộ & Điểm chuẩn GPU", href: "/en/blog/vllm-vs-ollama-local-llm-benchmarking" }
+  ]}
+/>
+
+---
+
+## Tại sao Kiến trúc suy luận quyết định thông lượng LLM cục bộ?
+
+Kiến trúc thực thi cơ bản quyết định thông lượng LLM cục bộ bằng cách quy định cách phân bổ bộ nhớ bộ đệm khóa-giá trị, lập lịch yêu cầu và các kernel nhân ma trận thực thi trên phần cứng GPU. Các trình bao bọc máy tính để bàn một người dùng xử lý các yêu cầu tuần tự bằng cách sử dụng bộ đệm bộ nhớ CPU hoặc GPU tuần tự tiêu chuẩn, trong khi các công cụ phục vụ sản xuất sử dụng các bộ cấp phát bộ nhớ chuyên dụng và phân lô yêu cầu liên tục. Khi chạy suy luận cục bộ, nút thắt cổ chai của bạn nhanh chóng chuyển từ các hoạt động tính toán thô sang bão hòa băng thông bộ nhớ VRAM trong quá trình tạo token.
+
+![Kiến trúc công cụ suy luận](/static/images/vllm-vs-ollama-local-llm-benchmarking-architecture.jpg)
+
+Để hiểu sự phân chia kiến trúc này, chúng ta phải xem xét cách các trọng số mô hình và các token chú ý khóa-giá trị chiếm bộ nhớ đồ họa trong quá trình thực thi. Các kiến trúc transformer hiện đại yêu cầu giữ các khóa và giá trị chú ý trong bộ nhớ cho mỗi token được tạo trên mọi luồng yêu cầu đang hoạt động. Khi khối lượng yêu cầu tăng lên, việc phân bổ bộ nhớ tĩnh không được tối ưu hóa sẽ gây ra phân mảnh nghiêm trọng, dẫn đến lỗi hết bộ nhớ sớm ngay cả khi VRAM vật lý vẫn còn.
+
+```python
+# System script demonstrating token generation VRAM memory calculation
+def calculate_kv_cache_bytes(
+    num_layers: int,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+    batch_size: int,
+    bytes_per_elem: int = 2  # FP16 or BF16 precision
+) -> int:
+    # Each transformer layer stores key and value states per head
+    k_cache_bytes = num_layers * num_heads * head_dim * seq_len * batch_size * bytes_per_elem
+    v_cache_bytes = num_layers * num_heads * head_dim * seq_len * batch_size * bytes_per_elem
+    total_kv_bytes = k_cache_bytes + v_cache_bytes
+    return total_kv_bytes
+
+# Example for Llama-3-8B model with 32 layers, 32 heads, head dimension 128
+llama3_8b_kv_mem = calculate_kv_cache_bytes(
+    num_layers=32,
+    num_heads=32,
+    head_dim=128,
+    seq_len=4096,
+    batch_size=32,
+    bytes_per_elem=2
+)
+print(f"Total KV Cache VRAM required for 32 concurrent streams: {llama3_8b_kv_mem / (1024**3):.2f} GB")
+```
+
+Đoạn mã Python trên cho thấy một phiên bản mô hình Llama-3-8B duy nhất phục vụ ba mươi hai yêu cầu đồng thời với độ dài ngữ cảnh bốn nghìn token yêu cầu hơn mười sáu gigabyte VRAM chuyên dụng chỉ để lưu trữ bộ đệm chú ý. Hệ điều hành và các runtime thực thi đơn giản không thể quản lý động bộ nhớ này mà không có sự hỗ trợ kernel chuyên biệt. Hiểu các giới hạn bộ nhớ này giải thích tại sao vLLM và Ollama hoạt động khác nhau dưới tải máy khách không bằng không.
+
+Bão hòa băng thông bộ nhớ xảy ra vì mỗi bước tạo token đầu ra phải đọc toàn bộ tập hợp tham số trọng số mô hình từ bộ nhớ băng thông cao vào các đơn vị tính toán trong khi vẫn giữ lịch sử trạng thái. Nếu công cụ suy luận của bạn không phân lô các lời nhắc của người dùng một cách thông minh, card xử lý đồ họa của bạn sẽ dành chín mươi phần trăm chu kỳ xung nhịp của nó để chờ các hoạt động truyền bộ nhớ hoàn tất. Phân lô lặp lại liên tục giải quyết sự kém hiệu quả phần cứng cụ thể này bằng cách xen kẽ các bước tính toán trên các phiên người dùng đang hoạt động.
+
+Việc mở rộng độ dài ngữ cảnh làm trầm trọng thêm các vấn đề mở rộng bộ nhớ một cách phi tuyến tính khi nhiều máy khách kết nối đồng thời với điểm cuối. Khi lời nhắc tăng từ hai nghìn lên tám nghìn token, yêu cầu bộ nhớ khóa-giá trị tăng gấp bốn lần ngay lập tức cho mỗi kênh kết nối đang mở. Các runtime thực thi tuần tự tiêu chuẩn không thể xử lý các đột biến bộ nhớ đột ngột này một cách linh hoạt, buộc các kết nối máy khách đến phải bị hủy hoặc bị kẹt vô thời hạn.
+
+Ngoài kích thước cửa sổ ngữ cảnh, độ chính xác dấu phẩy động ảnh hưởng trực tiếp đến thông lượng bộ nhớ trong các hoạt động ma trận song song. Các mô hình hoạt động ở độ chính xác FP32 đầy đủ làm tăng gấp đôi áp lực băng thông bộ nhớ so với các biểu diễn FP16 hoặc BF16 nửa chính xác mà không mang lại cải thiện độ chính xác hữu hình. Việc chọn cài đặt độ chính xác tensor được tối ưu hóa trong runtime suy luận của bạn tạo nền tảng để đạt được tốc độ tạo token cao.
+
+Hơn nữa, chi phí thực thi kernel gây ra sự chậm trễ độ trễ tinh tế khi xử lý nhiều hoạt động tensor nhỏ tuần tự trên phần cứng GPU. Các bộ tăng tốc học sâu hiện đại đạt hiệu suất hoạt động dấu phẩy động cao nhất khi thực thi các kernel CUDA lớn được hợp nhất thay vì điều phối các phép tính mảng riêng lẻ nhỏ. Các công cụ sản xuất như vLLM tối ưu hóa các đường ống lệnh bằng cách hợp nhất các hoạt động ma trận thành các khối thực thi GPU thống nhất.
+
+## PagedAttention trong vLLM loại bỏ phân mảnh bộ nhớ KV Cache như thế nào?
+
+PagedAttention trong vLLM loại bỏ phân mảnh bộ nhớ KV cache bằng cách phân vùng các khối bộ nhớ khóa-giá trị liên tục thành các trang vật lý không liên tục ảo được lưu trữ trong VRAM GPU. Lấy cảm hứng từ phân trang bộ nhớ ảo trong hệ điều hành, PagedAttention cho phép các vector khóa-giá trị nằm trong các vị trí bộ nhớ vật lý không liên tục mà không yêu cầu phân bổ bộ nhớ liên tục trước. Bước đột phá kiến trúc này giảm bộ nhớ VRAM lãng phí từ hơn sáu mươi phần trăm xuống dưới bốn phần trăm, cho phép kích thước lô lớn trên các GPU máy chủ tiêu chuẩn.
+
+![Bộ đệm KV PagedAttention của vLLM](/static/images/vllm-vs-ollama-local-llm-benchmarking-pagedattention.jpg)
+
+Các framework học sâu truyền thống phân bổ trước các bộ đệm bộ nhớ dựa trên độ dài ngữ cảnh tối đa như tám nghìn token. Nếu một lời nhắc của người dùng chỉ tạo ra hai trăm token, chín mươi bảy phần trăm khối được phân bổ đó sẽ nằm im và không thể sử dụng được bởi các yêu cầu đồng thời khác. Ngược lại, vLLM phân bổ động các trang ảo có kích thước mười sáu hoặc ba mươi hai token khi quá trình tạo diễn ra trên các luồng máy khách đến.
+
+```python
+# Deployment configuration script launching high-throughput vLLM server
+import subprocess
+
+def launch_vllm_engine(model_name: str, tensor_parallel_size: int = 1):
+    vllm_cmd = [
+        "python3", "-m", "vllm.entrypoints.openai.api_server",
+        "--model", model_name,
+        "--tensor-parallel-size", str(tensor_parallel_size),
+        "--gpu-memory-utilization", "0.92",
+        "--max-num-seqs", "256",
+        "--max-model-len", "8192",
+        "--block-size", "16",
+        "--enable-chunked-prefill", "true",
+        "--port", "8000"
+    ]
+    print(f"Starting vLLM engine with command: {' '.join(vllm_cmd)}")
+    # Process management handles production background execution safely
+    return subprocess.Popen(vllm_cmd)
+
+# Initiate vLLM instance using Llama 3 instruct model
+if __name__ == "__main__":
+    vllm_proc = launch_vllm_engine("meta-llama/Meta-Llama-3-8B-Instruct")
+```
+
+Ngoài PagedAttention, vLLM sử dụng phân lô liên tục cấp độ lặp thay vì phân lô cấp độ yêu cầu truyền thống. Trong phân lô tiêu chuẩn, tất cả các yêu cầu trong một lô phải đợi cho đến khi yêu cầu dài nhất hoàn thành quá trình tạo. vLLM chèn động các yêu cầu mới đến vào các bước thực thi GPU đang hoạt động ngay sau khi các yêu cầu hiện có hoàn thành giai đoạn tiền điền. Do đó, việc sử dụng phần cứng hệ thống luôn gần với giới hạn lý thuyết cao nhất trong suốt quá trình sử dụng API nặng.
+
+Bộ đệm tiền tố mở rộng khả năng của PagedAttention bằng cách chia sẻ các trang bộ nhớ vật lý trên các yêu cầu người dùng khác nhau có chứa văn bản lời nhắc giống hệt nhau. Ví dụ: nếu năm mươi yêu cầu người dùng đồng thời chứa một lời nhắc hệ thống hai nghìn token giống hệt nhau, vLLM sẽ tính toán các tensor khóa-giá trị một lần và ánh xạ tất cả năm mươi phiên yêu cầu đến các trang bộ nhớ vật lý chính xác đó. Việc chia sẻ tiền tố này giảm thời gian tính toán tiền điền và dung lượng VRAM lên đến chín mươi phần trăm trong quá trình triển khai đa người thuê.
+
+Tiền điền theo khối tiếp tục tối ưu hóa việc thực thi hệ thống bằng cách chia các lời nhắc đến dài thành các khối token có thể quản lý được trong quá trình xử lý bước. Thay vì để một lời nhắc lớn duy nhất chiếm dụng các đơn vị tính toán GPU trong vài giây, vLLM xen kẽ các khối tiền điền lời nhắc cùng với các bước giải mã đang diễn ra từ các luồng máy khách hiện có. Việc thực thi cân bằng này ngăn chặn các đột biến độ trễ cho các kết nối hiện có trong khi liên tục xử lý các lời nhắc mới được gửi.
+
+Ánh xạ bộ nhớ ảo trong vLLM dựa trên một bảng trang tập trung được quản lý bên trong không gian bộ nhớ CUDA. Công cụ theo dõi các khối logic cho mỗi yêu cầu người dùng và ánh xạ chúng đến các trang vật lý trong thời gian thực mà không sao chép các khối bộ nhớ tensor cơ bản. Khi các yêu cầu hoàn thành quá trình tạo, các khối vật lý được phân bổ của chúng sẽ ngay lập tức trở về nhóm bộ nhớ toàn cầu để sử dụng lại ngay lập tức bởi các kết nối mới đến.
+
+## Ollama đóng gói Llama.cpp để triển khai mô hình trên máy tính để bàn như thế nào?
+
+Ollama đóng gói Llama.cpp để triển khai mô hình trên máy tính để bàn bằng cách đóng gói các tệp nhị phân suy luận C++ đã lượng tử hóa, phân tích cú pháp tệp GGUF và trừu tượng hóa đa nền tảng CPU hoặc GPU bên trong một daemon REST sạch. Thay vì yêu cầu cài đặt bộ công cụ CUDA phức tạp hoặc quản lý môi trường Python, Ollama cung cấp một tệp nhị phân độc lập duy nhất tự động phát hiện phần cứng GPU có sẵn bao gồm kiến trúc NVIDIA CUDA, AMD ROCm và Apple Metal. Lựa chọn thiết kế này làm cho Ollama cực kỳ thân thiện với nhà phát triển để tạo mẫu cục bộ và tự động hóa máy trạm cá nhân.
+
+![Kiến trúc Ollama & Llama.cpp](/static/images/vllm-vs-ollama-local-llm-benchmarking-ollama-llamacpp.jpg)
+
+Về cơ bản, Ollama dựa vào `llama.cpp` cho các phép toán tensor cốt lõi. `llama.cpp` sử dụng các định dạng lượng tử hóa 4-bit và 5-bit như GGUF K-quants để nén các tham số trọng số mô hình vào các phân bổ RAM hoặc VRAM tiêu dùng khiêm tốn. Việc nén này cho phép chạy một mô hình tám tỷ tham số trên phần cứng máy tính xách tay chỉ với sáu gigabyte VRAM có sẵn.
+
+```python
+# Client script communicating with local Ollama API server
+import json
+import urllib.request
+
+def generate_ollama_completion(prompt: str, model: str = "llama3:8b") -> str:
+    url = "http://localhost:11434/api/generate"
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "num_predict": 512,
+            "temperature": 0.2,
+            "num_ctx": 4096
+        }
+    }
+    
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    
+    with urllib.request.urlopen(req) as response:
+        result = json.loads(response.read().decode("utf-8"))
+        return result.get("response", "")
+
+# Execute query against local desktop daemon instance
+if __name__ == "__main__":
+    response_text = generate_ollama_completion("Explain memory fragmentation in C++ applications.")
+    print(f"Ollama response length: {len(response_text)} characters")
+```
+
+Mặc dù Ollama xử lý các khối lượng công việc tương tác của một người dùng với ma sát tối thiểu, nhưng mô hình lập lịch mặc định của nó xếp hàng các cuộc gọi API đến đồng thời. Nếu mười ứng dụng máy khách thực hiện các yêu cầu HTTP POST đồng thời đến một phiên bản Ollama, máy chủ sẽ xử lý chúng tuần tự hoặc với phân chia khe luồng cơ bản. Hạn chế kiến trúc này gây ra các đột biến độ trễ đáng kể khi mở rộng quy mô vượt ra ngoài các tác vụ máy trạm cá nhân.
+
+Các chiến lược lượng tử hóa trong `llama.cpp` thay thế các trọng số dấu phẩy động ba mươi hai bit độ chính xác đầy đủ bằng các biểu diễn bit thấp như Q4_K_M hoặc Q5_K_S. Các lược đồ lượng tử hóa này nhóm các trọng số tensor thành các khối ba mươi hai hoặc sáu mươi bốn giá trị và chia tỷ lệ chúng bằng cách sử dụng các yếu tố tỷ lệ khối. Mặc dù lượng tử hóa giảm việc sử dụng bộ nhớ lên đến bảy mươi lăm phần trăm, nhưng nó gây ra sự suy giảm độ phức tạp nhỏ so với các trọng số FP16 không lượng tử hóa.
+
+Cú pháp Modelfile của Ollama cho phép các kỹ sư đóng gói các tham số mô hình, lời nhắc hệ thống, chuỗi mẫu và các giá trị mặc định lấy mẫu vào các manifest được đóng gói di động. Bạn có thể chia sẻ các trọng số GGUF được tinh chỉnh tùy chỉnh giữa các thành viên trong nhóm bằng cách sử dụng các lệnh đẩy và kéo tiêu chuẩn tương tự như quy trình làm việc vùng chứa Docker. Sự dễ dàng phân phối này giải thích tại sao Ollama thống trị môi trường phát triển máy trạm cục bộ ngày nay.
+
+## Các điểm chuẩn đồng thời và độ trễ tiết lộ điều gì dưới tải nặng?
+
+Các điểm chuẩn đồng thời và độ trễ dưới tải nặng cho thấy vLLM đạt thông lượng token đầu ra tổng cộng cao hơn Ollama tới mười hai lần khi độ đồng thời của máy khách vượt quá mười sáu kết nối đồng thời. Để định lượng chính xác sự khác biệt về hiệu suất, chúng tôi đã thực hiện các thử nghiệm căng thẳng tổng hợp chống lại cả hai công cụ được lưu trữ trên phần cứng giống hệt nhau chứa GPU NVIDIA RTX 4090 với hai mươi bốn gigabyte VRAM. Mỗi thử nghiệm đã thực hiện năm trăm lần hoàn thành lời nhắc nhắm mục tiêu Llama-3-8B ở các mức độ chính xác lượng tử hóa và không lượng tử hóa.
+
+![Điểm chuẩn thông lượng & đồng thời](/static/images/vllm-vs-ollama-local-llm-benchmarking-benchmarks.jpg)
+
+Kết quả điểm chuẩn cho thấy sự khác biệt đáng kể trong các đặc tính mở rộng quy mô giữa hai công cụ khi độ đồng thời tăng lên. Bảng dưới đây tóm tắt các số liệu chính được ghi lại trên các cấu hình kiểm tra tải một người dùng và nhiều người dùng.
+
+| Mức độ đồng thời | Công cụ | Thời gian đến token đầu tiên (TTFT) | Thông lượng tạo (tok/s) | Sử dụng VRAM cao nhất (GB) |
+|---|---|---|---|---|
+| 1 Máy khách | Ollama v0.6 | 28 ms | 86 tok/s | 5.8 GB |
+| 1 Máy khách | vLLM v0.19 | 42 ms | 94 tok/s | 21.4 GB |
+| 10 Máy khách | Ollama v0.6 | 310 ms | 112 tok/s | 7.2 GB |
+| 10 Máy khách | vLLM v0.19 | 65 ms | 680 tok/s | 21.8 GB |
+| 50 Máy khách | Ollama v0.6 | 1850 ms | 124 tok/s | 8.1 GB |
+| 50 Máy khách | vLLM v0.19 | 120 ms | 1450 tok/s | 22.1 GB |
+
+```python
+# Custom asynchronous benchmarking script measuring concurrency throughput
+import asyncio
+import time
+import aiohttp
+
+async def send_benchmark_request(session, url: str, payload: dict) -> tuple:
+    start_time = time.perf_counter()
+    async with session.post(url, json=payload) as resp:
+        data = await resp.json()
+        latency = time.perf_counter() - start_time
+        # Extract token count from response metadata
+        tokens = data.get("usage", {}).get("completion_tokens", 256)
+        return latency, tokens
+
+async def run_throughput_benchmark(url: str, payload: dict, total_requests: int, concurrency: int):
+    connector = aiohttp.TCPConnector(limit=concurrency)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        semaphore = asyncio.Semaphore(concurrency)
+        
+        async def bound_request():
+            async with semaphore:
+                return await send_benchmark_request(session, url, payload)
+        
+        start_all = time.perf_counter()
+        tasks = [bound_request() for _ in range(total_requests)]
+        results = await asyncio.gather(*tasks)
+        total_time = time.perf_counter() - start_all
+        
+        total_tokens = sum(r[1] for r in results)
+        avg_throughput = total_tokens / total_time
+        print(f"Completed {total_requests} requests in {total_time:.2f}s | Throughput: {avg_throughput:.2f} tok/s")
+```
+
+Ở độ đồng thời một máy khách, Ollama cung cấp độ trễ Thời gian đến Token đầu tiên thấp hơn vì nó tránh được chi phí khởi tạo runtime PyTorch nặng. Tuy nhiên, khi độ đồng thời tăng lên năm mươi máy khách, Ollama nhanh chóng bão hòa vì các yêu cầu xếp hàng sau các lệnh gọi mô hình đơn luồng. vLLM sử dụng nhóm VRAM được phân bổ trước và các kernel PagedAttention để xử lý hàng chục yêu cầu song song, mang lại lợi ích thông lượng tuyến tính cho đến khi các đơn vị tính toán GPU đạt đến độ bão hòa hoàn toàn.
+
+Phân tích số liệu thống kê thời gian đến token đầu tiên cho thấy vLLM duy trì độ trễ khởi tạo phản hồi ổn định ngay cả khi các kết nối máy khách đang hoạt động tăng lên. Khi năm mươi phiên máy khách gửi lời nhắc đồng thời, bộ lập lịch tiền điền theo khối của vLLM chia việc đánh giá lời nhắc thành các micro-batch đồng nhất. Kết quả là, các yêu cầu đến nhận được token phản hồi ban đầu của chúng trong vòng một trăm hai mươi mili giây trung bình.
+
+Tốc độ tạo token trên mỗi luồng thể hiện các đặc điểm hành vi tương phản giữa hai nền tảng trong quá trình thực thi đồng thời. Trong Ollama, một luồng máy khách duy nhất đạt tám mươi sáu token mỗi giây, nhưng việc thêm mười luồng đồng thời làm giảm tốc độ luồng riêng lẻ xuống còn mười một token mỗi giây. vLLM duy trì tốc độ luồng riêng lẻ cao hơn trên các yêu cầu song song vì việc thực thi tensor song song hóa hiệu quả trên các bộ xử lý đa luồng GPU.
+
+## Bạn nên cấu hình máy chủ vLLM và Ollama sản xuất như thế nào?
+
+Bạn nên cấu hình máy chủ vLLM và Ollama sản xuất bằng cách khớp các tham số công cụ với khả năng phần cứng mục tiêu, khối lượng yêu cầu dự kiến và yêu cầu cửa sổ ngữ cảnh của bạn. Đối với các điểm cuối API sản xuất phục vụ lưu lượng truy cập đa người thuê, vLLM là lựa chọn kỹ thuật rõ ràng do các thuật toán phân lô liên tục của nó. Ngược lại, các công cụ dành cho nhà phát triển máy tính để bàn, thiết bị nhúng và quy trình làm việc kỹ thuật cá nhân được hưởng lợi đáng kể từ dung lượng bộ nhớ thấp hơn của Ollama và việc triển khai nhị phân không cần cấu hình.
+
+![Cấu hình triển khai sản xuất](/static/images/vllm-vs-ollama-local-llm-benchmarking-production-config.jpg)
+
+Khi cấu hình vLLM cho các cụm GPU sản xuất, các tham số được điều chỉnh ngăn chặn tràn bộ nhớ trong khi tối đa hóa dung lượng yêu cầu. Khối mã dưới đây trình bày chi tiết tệp cấu hình systemd tối ưu để lưu trữ vLLM phía sau một proxy ngược.
+
+```ini
+# Systemd service configuration for production vLLM deployment
+[Unit]
+Description=vLLM OpenAI API Compatible Server
+After=network.target nvidia-persistenced.service
+
+[Service]
+Type=simple
+User=llm-admin
+WorkingDirectory=/opt/vllm
+Environment="CUDA_VISIBLE_DEVICES=0"
+Environment="VLLM_ATTENTION_BACKEND=FLASH_ATTN"
+ExecStart=/usr/local/bin/vllm serve meta-llama/Meta-Llama-3-8B-Instruct     --host 127.0.0.1     --port 8000     --gpu-memory-utilization 0.90     --max-num-seqs 128     --max-model-len 8192     --tensor-parallel-size 1     --enable-prefix-caching
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Để cấu hình Ollama cho khả năng đồng thời nhiều người dùng nâng cao trên phần cứng máy trạm, hãy điều chỉnh các biến môi trường hệ thống trước khi khởi chạy tiến trình daemon. Việc đặt `OLLAMA_NUM_PARALLEL` kiểm soát số lượng yêu cầu đồng thời mà Ollama sẽ xử lý đồng thời trong các lớp GPU được phân bổ.
+
+```bash
+# Terminal command script setting environment parameters for Ollama
+export OLLAMA_NUM_PARALLEL=4
+export OLLAMA_MAX_LOADED_MODELS=2
+export OLLAMA_KEEP_ALIVE=24h
+
+# Launch Ollama background service with updated environment variables
+ollama serve
+```
+
+Việc lựa chọn giữa vLLM và Ollama phụ thuộc vào mục tiêu hoạt động của bạn. Nếu bạn cần một thiết lập cục bộ nhanh để lặp lại các lời nhắc hoặc chạy các trợ lý mã hóa trên phần cứng máy tính xách tay, Ollama mang lại sự tiện lợi vô song. Nếu bạn đang xây dựng các tính năng SaaS hướng đến khách hàng hoặc các đường ống doanh nghiệp thông lượng cao, vLLM cung cấp các nguyên thủy hiệu suất cần thiết để giảm thiểu chi phí phần cứng ở quy mô lớn.
+
+Việc đặt proxy ngược phía trước các cụm suy luận sản xuất cung cấp khả năng phục hồi bổ sung chống lại các đợt lưu lượng truy cập đột ngột. Việc đặt NGINX hoặc Envoy phía trên các nút vLLM của bạn cho phép kiểm tra sức khỏe chủ động, giới hạn tốc độ và nhóm kết nối. Lớp cổng này bảo vệ các bộ cấp phát bộ nhớ GPU khỏi các cuộc tấn công yêu cầu máy khách độc hại hoặc vượt quá giới hạn có thể gây ra sự mất ổn định của máy chủ.
+
+<FAQ>
+  <Question>Bạn có thể chạy vLLM trên Apple Silicon MacBook không?</Question>
+  <Answer>
+    Không, vLLM yêu cầu CUDA hoặc ROCm và được tối ưu hóa cho GPU trung tâm dữ liệu NVIDIA và AMD. Để kiểm tra cục bộ trên Apple Silicon MacBook bằng cách sử dụng Metal shaders, Ollama hoặc MLX là công cụ suy luận được khuyến nghị.
+  </Answer>
+
+  <Question>Ollama có hỗ trợ các mô hình GGUF đã lượng tử hóa được tạo bởi llama.cpp không?</Question>
+  <Answer>
+    Có, Ollama hỗ trợ tải các định dạng lượng tử hóa GGUF tùy chỉnh một cách tự nhiên. Bạn có thể nhập các tệp mô hình GGUF tùy chỉnh bằng cách tạo một `Modelfile` cục bộ và chạy `ollama create`.
+  </Answer>
+
+  <Question>Tại sao vLLM tiêu thụ gần như toàn bộ bộ nhớ GPU khi khởi động máy chủ?</Question>
+  <Answer>
+    vLLM phân bổ trước một tỷ lệ phần trăm cố định VRAM GPU khi khởi động để xây dựng nhóm KV-cache PagedAttention của nó. Điều này ngăn chặn phân mảnh bộ nhớ runtime và lỗi hết bộ nhớ CUDA trong quá trình phân lô liên tục.
+  </Answer>
+
+  <Question>Ollama có phù hợp với các microservice API sản xuất thông lượng cao không?</Question>
+  <Answer>
+    Ollama được thiết kế cho phát triển cục bộ và quy trình làm việc một người dùng. Đối với các khối lượng công việc sản xuất có độ đồng thời cao, vLLM cung cấp thông lượng vượt trội đáng kể thông qua phân lô liên tục, bộ đệm tiền tố động và song song tensor đa GPU.
+  </Answer>
+
+  <Question>Bộ đệm tiền tố lời nhắc hoạt động như thế nào trong vLLM?</Question>
+  <Answer>
+    Bộ đệm tiền tố lời nhắc trong vLLM sử dụng lại các khối KV-cache đã được tính toán trước cho các lời nhắc hệ thống giống hệt nhau trên các yêu cầu đến, bỏ qua tính toán tiền điền và giảm đáng kể thời gian đến token đầu tiên (TTFT).
+  </Answer>
+</FAQ>
+
+## Bạn cũng có thể thích
+
+- [Bộ đệm ngữ nghĩa với Redis và Qdrant để giảm chi phí LLM](/en/blog/semantic-caching-redis-qdrant-llm-cost-reduction)
+- [Xây dựng giao diện người dùng dựa trên ý định: Tương lai của phát triển frontend](/en/blog/intent-based-ui-architecture)
+- [Di chuyển từ Jest sang Vitest: Hướng dẫn thực dụng](/en/blog/migrating-jest-to-vitest)
+- [Kiểm thử React hiện đại với Vitest và React Testing Library](/en/blog/vitest-react-testing-library)

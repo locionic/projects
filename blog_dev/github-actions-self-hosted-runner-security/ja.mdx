@@ -1,0 +1,309 @@
+---
+title: "GitHubActionsセルフホストランナーのセキュリティ強化"
+images:
+  - '/static/images/github-actions-self-hosted-runner-security-featured.jpg'
+  - '/static/images/github-actions-self-hosted-runner-security-threat-model.jpg'
+  - '/static/images/github-actions-self-hosted-runner-security-arc-ephemeral.jpg'
+  - '/static/images/github-actions-self-hosted-runner-security-network-isolation.jpg'
+  - '/static/images/github-actions-self-hosted-runner-security-rootless-container.jpg'
+  - '/static/images/github-actions-self-hosted-runner-security-oidc-tokens.jpg'
+date: '2026-07-29'
+tags: ["github-actions", "security", "devops", "kubernetes", "ci-cd"]
+draft: false
+summary: "ActionsRunnerController(ARC)、ネットワーク分離、rootlessコンテナ、短命OIDCトークンを使用して、セルフホスト型GitHubActionsランナーを強化します。"
+authors: ['default']
+category: Tech
+---
+
+
+CIパイプラインの計算能力が不足していたため、セルフホスト型GitHub Actionsランナーをいくつか立ち上げました。ビルドは高速で、VPCに直接アクセスできるため、非常に快適でした。しかし、その後、セキュリティチームがセットアップを監査しました。
+
+その結果、厳密な境界なしに永続的なセルフホスト型ランナーをデプロイすることは、基本的に内部ネットワークへの鍵を渡すようなものであることが判明しました。信頼できないPRが強化されていないランナー内で悪意のあるコードを実行した場合、内部マイクロサービスやAWS認証情報が危険にさらされます。インフラストラクチャのロックダウンに数週間を費やした後、エフェメラルポッド、ルートレスコンテナ、厳格なネットワークエグレス、およびOIDCを使用してランナーを実際に保護した方法を以下に示します。
+
+<AudioPlayer src="/static/audio/github-actions-self-hosted-runner-security.mp3" title="Executive Audio Briefing" />
+
+## 永続的なランナーの問題点
+
+私たちが最初に行った最大の間違いは、ランナーを永続的なサーバーのように扱ったことでした。複数のCI/CDワークフローが単一の仮想マシンを共有している場合、悪意のある（あるいは単にバグのある）ビルドスクリプトがバックドアプロセスを残したり、キャッシュされた依存関係を変更したり、以前のパイプラインから残された環境変数を読み取ったりする可能性があります。
+
+誰かが悪意のあるビルドコマンドを含むPRを送信した場合、ランナーはデフォルトの権限でそれを実行します。突然、そのスクリプトはホストOSを侵害する力を持ちます。
+
+![Self-Hosted Runner Threat Model](/static/images/github-actions-self-hosted-runner-security-threat-model.jpg)
+
+公式のGitHubドキュメントでは、パブリックリポジトリにセルフホスト型ランナーを使用しないよう明示的に警告しています。これは、外部フォークからのプルリクエストが任意のワークフローコードを実行できるためです。プライベートまたは内部エンタープライズリポジトリであっても、読み取りアクセス権を持つ開発者であれば誰でも、プルリクエストを開くことで、ターゲットのセルフホスト型ランナー上で変更されたワークフローファイルを実行できます。サプライチェーン攻撃（Shai-Huludキャンペーンやtj-actionsアクションの脆弱性などの注目度の高いインシデントで見られる）のような攻撃ベクトルは、ランナーの隔離の弱さを悪用してリポジトリのシークレットを抽出し、内部のAWSまたはKubernetesインフラストラクチャに横展開します。
+
+もう1つの主要な脅威ベクトルは、ランナーのディスクストレージにおける認証情報の永続性です。従来のランナー設定では、静的なAWSアクセスキー、GitHub個人アクセストークン、またはプライベートSSHキーを環境ファイルまたはディスクボリュームマウント内に保存します。侵害されたワークフロー実行が高権限でコマンドを実行すると、ディスクの内容をダンプしたり、環境Dockerデーモンソケットにアクセスしたり、`169.254.169.254`のようなクラウドメタデータサービスと通信してインスタンスIAMロール認証情報を盗んだりする可能性があります。
+
+強化されていないセルフホスト型ランナーノードに影響を与える攻撃ベクトルの概要を以下に示します。
+
+```
++------------------------+           1. Malicious PR           +-----------------------+
+| External Attacker /    | ----------------------------------> | GitHub Repository     |
+| Forked Repository      |                                     | (Workflow Trigger)    |
++------------------------+                                     +-----------------------+
+                                                                           |
+                                                                           | 2. Schedules Work
+                                                                           v
++------------------------+           4. Exfiltrate Secrets     +-----------------------+
+| Attacker Command Server| <---------------------------------- | Self-Hosted Runner    |
+| (Exfiltration Vector)  |                                     | (Persistent Instance) |
++------------------------+                                     +-----------------------+
+                                                                           |
+                                                                           | 3. Lateral Movement
+                                                                           v
+                                                               +-----------------------+
+                                                               | Internal VPC Services |
+                                                               | (Databases / Metadata)|
+                                                               +-----------------------+
+```
+
+## エフェメラルな隔離のためのARCの使用
+
+永続性の問題は、Actions Runner Controller (ARC) に切り替えることで解決しました。静的なVMの代わりに、ARCは単一のワークフロージョブを処理した直後に自己破壊する単一用途のKubernetesポッドを動的に生成します。
+
+ジョブが完了すると各ランナーポッドは完全に終了するため、状態は残りません。悪意のあるコードがディスクに永続化したり、後続のビルドを感染させたりすることはありません。
+
+![ARC Ephemeral Pod Autoscaling](/static/images/github-actions-self-hosted-runner-security-arc-ephemeral.jpg)
+
+ARC設定で`ephemeral: true`を設定することで、すべてのランナーコンテナがKubernetesがポッドを破棄する前に正確に1つのジョブを実行するように強制します。`/tmp`に書き込まれた一時ファイルや環境メモリのアーティファクトは瞬時に消去されます。これにより、インフラストラクチャは、GitHubホスト型ランナーと同様に、しかし独自の条件で、クリーンな状態のコンピューティング環境に変換されます。
+
+Actions Runner Controllerをエフェメラルなオートスケーリングセットでデプロイするための、本番環境レベルのHelm設定を以下に示します。
+
+```yaml
+githubWebhookServer:
+  enabled: true
+
+autoscalingRunnerSets:
+  - name: hardened-k8s-runner
+    githubConfigUrl: "https://github.com/company-org"
+    minReplicas: 2
+    maxReplicas: 50
+    ephemeral: true
+    template:
+      spec:
+        containers:
+          - name: runner
+            image: ghcr.io/actions/actions-runner:latest
+            command: ["/home/runner/run.sh"]
+            resources:
+              limits:
+                cpu: "4"
+                memory: "8Gi"
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 1001
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: false
+              capabilities:
+                drop:
+                  - ALL
+```
+
+このARC設定では、`minReplicas: 2`がコールドスタートの遅延をなくすために準備されたポッドの小さなウォームプールを維持し、`maxReplicas: 50`が突然のビルドの急増を安全にスケールアウトできるようにします。`ephemeral: true`がカスタムリソース定義レベルで強制されるため、GitHubランナーアプリケーションは登録時に`--ephemeral`フラグを渡します。アクティブなワークフローが最終ステップを完了すると、ランナーエージェントはGitHubから登録解除し、コンテナを終了させ、ARCオペレーターに新しい代替ポッドを生成するように促します。
+
+## ランナーノードにネットワークエグレスフィルタリングとファイアウォールを適用する方法
+
+ランナーノードにネットワークエグレスフィルタリングを適用するには、Kubernetes NetworkPoliciesをデプロイし、ホストレベルのfirewalldルールを設定し、外部へのランナーのトラフィックを制限的なエグレスプロキシサーバー経由でルーティングします。デフォルトでは、Kubernetesクラスター内のポッドは、内部データベースエンドポイント、Redisキャッシュ、クラウドプロバイダーのメタデータインターフェースを含む、クラスターVPC内の任意のIPアドレスと自由に通信できます。ゼロトラストネットワーク境界を実装することで、セルフホスト型ランナーは承認された外部APIと必要なGitHubエンドポイントにのみ接続できるように制限されます。
+
+![Network Egress Filtering and Firewalling](/static/images/github-actions-self-hosted-runner-security-network-isolation.jpg)
+
+ネットワーク強化の最初のステップは、クラウドメタデータサービスへのアクセスをブロックすることです。`169.254.169.254`で実行されているクラウドインスタンスメタデータサービス（IMDSv1）は、認証なしで任意のローカルプロセスがノードIAMロール認証情報を取得することを許可します。悪意のあるビルドスクリプトがランナーポッド内で実行された場合、IMDSを照会して、基盤となるワーカーノードにアタッチされた権限を持つ一時的なクラウド認証情報を取得できます。ネットワークポリシーは、ルーティング不可能なリンクローカルメタデータIPアドレスに向けられたすべてのトラフィックを明示的にドロップする必要があります。
+
+以下は、セルフホスト型ランナーポッドを隔離する本番環境のKubernetes NetworkPolicyマニフェストです。
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-runner-egress
+  namespace: actions-runners
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hardened-k8s-runner
+  policyTypes:
+    - Egress
+  egress:
+    # 1. Allow CoreDNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+    # 2. Allow outbound HTTPS to GitHub API and package registries
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+```
+
+`ipBlock.except`がすべてのプライベートIPv4アドレス空間（`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`）と`169.254.169.254/32`をブロックしていることに注目してください。このポリシーは、侵害されたランナーポッドが内部企業ネットワークをスキャンしたり、内部ステージングデータベースに接続したりするのを防ぎます。ビルドワークフローが特定の内部コンテナレジストリまたはアーティファクトリポジトリへのアクセスを必要とする場合、ターゲットサービスのIP CIDRブロックを許可されたエグレスルール配列に明示的に追加します。
+
+厳格なドメインレベルの監査を必要とするエンタープライズ環境では、アウトバウンドSquidプロキシまたはFQDNフィルタリングを備えたCilium Network Policyをデプロイします。ランナーポッドの仕様内で`HTTPS_PROXY`環境変数を設定すると、すべてのWebトラフィックがプロキシレイヤーを通過するように強制され、そこでドメインホワイトリストルールが`github.com`、`api.github.com`、`npm.pkg.github.com`、および承認された依存関係ミラーへの接続のみを許可します。
+
+## Docker-in-Dockerワークフローにルートレスサンドボックス隔離を強制する方法
+
+Docker-in-Dockerワークフローにルートレスサンドボックス隔離を強制するには、ユーザーネームスペースでコンテナデーモンを実行したり、gVisorコンテナランタイムをデプロイしたり、DockerソケットマウントをKanikoやBuildahに置き換えてコンテナイメージをビルドしたりします。従来のDocker-in-Docker (DinD) セットアップでは、ホストVMからランナーコンテナに`/var/run/docker.sock`をマウントするか、`privileged: true`でポッドを実行する必要があります。ルート権限を付与したり、ホストのDockerソケットを公開したりすると、コンテナ化されたワークフローにホストマシンに対する完全なルートアクセスが与えられ、完全なコンテナブレイクアウトエクスプロイトが可能になります。
+
+![Rootless Container Sandbox Isolation](/static/images/github-actions-self-hosted-runner-security-rootless-container.jpg)
+
+`/var/run/docker.sock`を公開すると、ランナーコンテナ内の任意のプロセスが`docker run -v /:/host alpine`を実行し、ホストのルートファイルシステムへのルート読み書きアクセス権を取得できます。このセキュリティ上の危険を排除するには、ビルドパイプラインをPodman、Buildah、またはDocker Rootlessモードなどのルートレスコンテナエンジンに移行する必要があります。ルートレスコンテナエンジンは、特権のないユーザーネームスペース内で完全に実行されるため、攻撃者がビルドコンテナ内でルート権限を取得したとしても、ホストオペレーティングシステム上では特権のないユーザー（UID 10001）のままです。
+
+CIパイプライン内でOCIコンテナイメージのビルドを厳密に必要とするワークロードの場合、Dockerデーモンの代わりにKanikoを使用します。Kanikoは、Dockerデーモンや特権セキュリティコンテキストを必要とせずに、ユーザー空間でコンテナイメージのビルドを実行します。
+
+以下は、Kanikoを使用してルートレスコンテナビルドを実行するGitHub Actionsワークフローステップの例です。
+
+```yaml
+name: Build Hardened Container Image
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: self-hosted-ephemeral
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build and Push Image with Kaniko
+        run: |
+          /kaniko/executor             --context=dir://.             --dockerfile=Dockerfile             --destination=ghcr.io/company-org/api-service:${{ github.sha }}             --cache=true             --single-snapshot
+```
+
+高いセキュリティ隔離が必須の場合、KubernetesワーカーノードをgVisor（`runsc`）の下でランナーポッドを実行するように設定します。gVisorはコンテナのシステムコールを傍受するアプリケーションカーネルとして機能し、ビルドスクリプトとホストLinuxカーネルの間に強力な仮想化境界を作成します。悪意のある依存関係がカーネルの脆弱性（ダーティCOWやuse-after-freeバグなど）を悪用しようとした場合、gVisorサンドボックスがシステムコールを傍受し、ホストカーネルの侵害を防ぎます。
+
+## GitHub OIDCトークンを使用して短命の認証情報を管理する方法
+
+短命の認証情報を管理するには、GitHub OpenID Connect (OIDC) IDフェデレーションをクラウドプロバイダーと構成し、JSON Webトークン (JWT) を短命のIAMセッション認証情報と交換します。`AWS_ACCESS_KEY_ID`や`AWS_SECRET_ACCESS_KEY`のような長命のクラウド認証情報をGitHubシークレットに保存すると、シークレット値が漏洩したり、ワークフローログに出力されたりした場合に永続的なリスクが生じます。OIDCフェデレーションにより、セルフホスト型ランナーは静的なシークレット文字列を保存することなく動的に認証できます。
+
+![Short-Lived OIDC Credential Management](/static/images/github-actions-self-hosted-runner-security-oidc-tokens.jpg)
+
+ワークフローステップがOIDC認証を要求すると、GitHub ActionsランナーエージェントはGitHubトークンサービスからOIDC JWTトークンを直接取得します。このトークンには、リポジトリID、ワークフローのトリガーイベント、ターゲットブランチ、ジョブ実行コンテキストを検証する署名付きクレームが含まれています。ランナーはこのJWTトークンをクラウドプロバイダーのSTSエンドポイント（AWS STS `AssumeRoleWithWebIdentity`など）に渡し、STSエンドポイントはGitHubの公開OIDCキーに対して署名を検証し、1時間有効な一時的なクラウド認証情報を発行します。
+
+以下は、OIDCロールの引き受けを特定のリポジトリとブランチに制限する、強化されたAWS IAMロール信頼ポリシーです。
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:company-org/production-service:ref:refs/heads/main"
+        }
+      }
+    }
+  ]
+}
+```
+
+厳格な`token.actions.githubusercontent.com:sub`条件チェックに注目してください。この条件により、`company-org/production-service`リポジトリの`main`ブランチから実行されるワークフローのみがIAMロールを引き受けることができます。開発者がフィーチャーブランチまたは外部フォークからプルリクエストを開いた場合、トークンの`sub`クレームが必須のブランチパターンと一致しないため、AWS STSはロール引き受けリクエストを拒否します。
+
+GitHub Actionsワークフローファイルを構成して、`permissions`ブロックを使用して最小限の権限を要求します。
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: self-hosted-ephemeral
+    steps:
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-actions-runner-role
+          aws-region: us-east-1
+```
+
+`id-token: write`を設定すると、ジョブにOIDC JWTトークンを取得する権限が付与され、`contents: read`を設定すると、リポジトリへのアクセスが読み取り専用モードに制限されます。すべてのワークフローに厳格な明示的な権限を設定することで、デフォルトの広範なトークンスコープ割り当てを防ぎます。
+
+## セルフホスト型ランナーの実行アクティビティを監査および監視する方法
+
+セルフホスト型ランナーのアクティビティを監査するには、GitHub組織監査ログを有効にし、FalcoのようなeBPFセンサーを介してコンテナランタイムのテレメトリをキャプチャし、ランナーポッドの標準出力ログをSIEMプラットフォームに一元化します。継続的なセキュリティ監視により、疑わしいプロセス実行、予期しないネットワークアウトバウンド接続、または特権昇格の試みがリアルタイムで検出され、アラートが発せられます。
+
+Sysdig FalcoのようなeBPF監視ツールは、Kubernetesワーカーノードに直接インストールされ、ランナープロセスによって行われるシステムコールを監視します。Falcoルールは、ランナーポッド内での不正な対話型シェルセッションの起動、予期しないディレクトリ内でのバイナリコンパイルツールの実行、または機密性の高いホスト構成ファイルの読み取りなどの異常な動作を検出します。
+
+以下は、セルフホスト型ランナーコンテナ内での不正なシェル実行を検出するように設計された、本番環境のFalcoセキュリティルールです。
+
+```yaml
+- rule: Unauthorized Shell Spawn in Runner Pod
+  desc: Detect unexpected interactive shell processes spawned inside Actions Runner containers
+  condition: >
+    container.image.repository contains "actions-runner" and
+    evt.type = execve and
+    proc.name in (bash, sh, zsh, ksh) and
+    not proc.pname in (run.sh, Runner.Listener)
+  output: >
+    Unexpected shell execution detected inside runner container
+    (user=%user.name command=%proc.cmdline pod=%container.name image=%container.image.repository)
+  priority: WARNING
+  tags: [ci_cd, container, security]
+```
+
+ランタイムeBPF監視に加えて、GitHubでWebhookを設定して、ランナーの登録と実行ライフサイクルイベントを追跡します。`workflow_job` Webhookイベントを購読すると、ジョブの開始時期、どのランナープールが実行を処理したか、実行にかかった時間がログに記録されます。GitHub Webhook監査ログとKubernetesポッド作成タイムスタンプを関連付けることで、インシデント対応調査のための完全な追跡可能性が提供されます。
+
+最後に、ランナーグループを使用して組織のランナーのスコープを制限します。GitHub組織設定で、セルフホスト型ランナープールを、明示的なリポジトリアクセスリストを持つ専用のランナーグループに割り当てます。機密性の高い本番ランナーを承認されたインフラストラクチャリポジトリのみがターゲットにできるように制限することで、不正なアプリケーションが特殊なランナーハードウェアでワークロードをスケジュールするのを防ぎます。
+
+## セルフホスト型ランナーのセキュリティに関するよくある質問
+
+### パブリックなオープンソースGitHubリポジトリにセルフホスト型ランナーを使用しても安全ですか？
+
+いいえ、パブリックリポジトリにセルフホスト型ランナーを使用することは非常に危険であり、GitHubによって明示的に推奨されていません。パブリックリポジトリはインターネット上の誰からのプルリクエストも受け入れるため、悪意のあるアクターがランナーインフラストラクチャ上で任意のコードを実行するプルリクエストワークフローを送信する可能性があります。パブリックプロジェクトにセルフホスト型ハードウェアを使用する必要がある場合は、エフェメラルなKubernetesランナーと、すべての外部コントリビューターに対する厳格な手動プルリクエスト承認要件を組み合わせて使用してください。
+
+### ランナーポッドがジョブの途中でクラッシュした場合、GitHub Actions Runner Controllerはどのようにクリーンアップを処理しますか？
+
+ランナーポッドがジョブの途中でクラッシュしたり、ノード接続を失ったりした場合、ARCオペレーターはKubernetes APIウォッチを介してポッドの状態の失敗を検出し、ランナーインスタンスをオフラインとしてマークします。コントローラーはGitHub APIにクリーンアップリクエストを送信してオフラインランナーの登録を解除し、クラッシュしたポッドリソースを削除し、新しい代替ポッドを生成して設定された`minReplicas`数を維持します。この自動自己修復ループにより、古い破損したポッドがサービスプールに残るのを防ぎます。
+
+### Actions Runner Controller (ARC) スケールセットと従来のランナーデプロイメントの違いは何ですか？
+
+ARCスケールセットは、Kubernetesでセルフホスト型ランナーを管理するための最新のアーキテクチャであり、従来のRunnerDeploymentおよびRunnerReplicaSetカスタムリソースに代わるものです。スケールセットは、継続的なポーリングではなくWebSocketを介してGitHubと通信するため、ジョブディスパッチのレイテンシが短縮され、APIレート制限の消費が少なくなります。スケールセットは、`ephemeral`ランナーモードと、リアルタイムのGitHubジョブキューの深さに基づくオートスケーリングのネイティブサポートも提供します。
+
+### セルフホスト型ランナーがホストのKubernetes APIサーバーにアクセスするのを防ぐにはどうすればよいですか？
+
+セルフホスト型ランナーがホストのKubernetes APIサーバーにアクセスするのを防ぐには、ランナーポッドの仕様で`automountServiceAccountToken: false`を設定し、Kubernetes APIサービスIPのポート443へのトラフィックをブロックするエグレスネットワークポリシーを適用します。デフォルトでは、Kubernetesはサービスアカウントトークンをすべてのポッドの`/var/run/secrets/kubernetes.io/serviceaccount`にマウントします。トークンの自動マウントを無効にすることで、侵害されたランナープロセスがクラスターリソースを照会したり、ホストKubernetesクラスター内で特権を昇格させたりできないようにします。
+
+### Actions Runner Controllerが使用するGitHub PATまたはAppに付与すべき権限は何ですか？
+
+Actions Runner Controllerが使用するGitHub Appには、最小限必要な組織権限、特に`Organization Self-hosted runners: Read and Write`と`Actions: Read-only`を付与する必要があります。組織レベルではなくリポジトリレベルでランナーをデプロイする場合は、`Repository Self-hosted runners: Read and Write`を付与します。PATは広範なアカウント権限を付与し、きめ細かな権限スコープ設定ができないため、個々の開発者アカウントにアタッチされた個人アクセストークン（PAT）の使用は避けてください。
+
+### エフェメラルなセルフホスト型ランナーポッド間でビルド依存関係を安全にキャッシュするにはどうすればよいですか？
+
+エフェメラルなランナーポッド間でビルド依存関係を安全にキャッシュするには、読み取り専用の共有ネットワークボリューム（AWS EFSやNFSなど）をマウントするか、MinIOやAWS S3などのリモートキャッシュストレージバックエンドを使用します。複数のポッド間で読み書き可能な共有ボリュームマウントを使用することは避けてください。侵害されたランナーポッドが、他のビルドパイプラインで使用される共有キャッシュアーカイブに悪意のあるコードを注入する可能性があるためです。常に依存関係のロックファイルをハッシュして、決定論的なキャッシュキープレフィックスを構築してください。
+
+### セルフホスト型ランナーは専用のクラウドインスタンスで実行すべきですか、それとも共有Kubernetesノードで実行すべきですか？
+
+セルフホスト型ランナーは、Kubernetesノードのテイントとトレランスを使用して、コアのプロダクションアプリケーションワークロードから隔離された専用のワーカーノードプールで実行する必要があります。顧客向けのマイクロサービスと共有ノードで信頼できないビルドコードを実行すると、コンテナブレイクアウトの脆弱性が発生した場合に深刻なリスクが生じます。ランナーワークロード用に専用の隔離されたワーカーノードグループをプロビジョニングすることで、ノードレベルの侵害がCIビルド層内に封じ込められることが保証されます。
+
+## こちらもおすすめ
+
+- [Kubernetesにおけるゼロトラストセキュリティの実装：完全なプロダクションガイド](/en/blog/zero-trust-architecture-kubernetes)
+- [2026年におけるゼロトラストアーキテクチャの実装](/en/blog/zero-trust-arch)
+- [ゼロトラストネットワークアーキテクチャ](/en/blog/zero-trust-network)
+- [2026年におけるクラウドネイティブセキュリティの進化](/en/blog/cloud-native-security)

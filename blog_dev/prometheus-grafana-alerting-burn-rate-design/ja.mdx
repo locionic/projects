@@ -1,0 +1,323 @@
+---
+title: "PrometheusとGrafanaによるアラートとバーンレートの設計"
+images:
+  - '/static/images/prometheus-grafana-alerting-burn-rate-design-featured.jpg'
+  - '/static/images/prometheus-grafana-alerting-burn-rate-design-sli-slo.jpg'
+  - '/static/images/prometheus-grafana-alerting-burn-rate-design-multi-window.jpg'
+  - '/static/images/prometheus-grafana-alerting-burn-rate-design-promql-rules.jpg'
+  - '/static/images/prometheus-grafana-alerting-burn-rate-design-alertmanager.jpg'
+  - '/static/images/prometheus-grafana-alerting-burn-rate-design-grafana-dashboard.jpg'
+date: '2026-07-29'
+tags: ["prometheus", "grafana", "devops"]
+draft: false
+summary: "サービスレベル目標(SLO)とエラーバジェットのために、マルチウィンドウマルチバーンレートPromQLルールを使った本番環境のPrometheusとGrafanaアラートを設計します。"
+authors: ['default']
+category: Tech
+---
+
+
+私たちは皆、このような経験をしてきました。午前3時にページングされ、サーバーのCPUが2分間85%に達したためログインしてみると、すべてが完全に正常であることが判明したのです。このような静的なしきい値アラートは、オンコールローテーションを燃え尽きさせる最速の方法です。これらは際限のないアラート疲れを引き起こし、対応不要な一時的な異常でエンジニアを起こし、そして最悪の場合、ユーザーに実際に影響を与えるような、ゆっくりと忍び寄るレイテンシーの低下を完全に見逃してしまうことがよくあります。解決策は？リソースメトリクスでのアラートを止め、症状でのアラートを開始することです。GoogleのSREチームによって普及したMulti-Window Multi-Burn-Rateアラート手法を採用することで、リアルタイムのエラーバジェットが実際に消費されている場合に*のみ*ページングするようにPrometheusとGrafanaを設定できます。
+
+<AudioPlayer src="/static/audio/prometheus-grafana-alerting-burn-rate-design.mp3" title="Executive Audio Briefing" />
+
+## SREアラートアーキテクチャにおけるSLI、SLO、およびエラーバジェットとは？
+
+SLI（Service Level Indicator）、SLO（Service Level Objective）、およびエラーバジェットは、本番アプリケーションの測定可能なパフォーマンス指標、目標可用性、および許容可能な障害許容量を定義することにより、サイト信頼性エンジニアリング（SRE）アラートの基礎となるフレームワークを形成します。SLIは、サービス品質をリアルタイムで測定する定量的なメトリクスであり、たとえば、成功したHTTPリクエストの総リクエストに対する比率や、99パーセンタイルリクエストレイテンシーなどです。SLOは、30日間のローリングコンプライアンス期間にわたるSLIの目標しきい値を設定し、サービスが指定された割合の総リクエストに対してパフォーマンス目標を満たす必要があることを宣言します。
+
+![SLI SLO Error Budget Fundamentals](/static/images/prometheus-grafana-alerting-burn-rate-design-sli-slo.jpg)
+
+エラーバジェットはSLOの数学的な逆数を表し、コンプライアンス期間中にアプリケーションが経験できる最大許容不能性を定義します。たとえば、APIサービスが30日間で`99.9%`の可用性SLOを定義している場合、そのエラーバジェットは`0.1%`（`100% - 99.9%`）です。サービスがその30日間に合計1,000万件のリクエストを受信した場合、エンジニアリングチームはサービスレベル契約に違反する前に、最大1万件の失敗したリクエストを経験できます。
+
+エラーバジェットは、機能開発の速度とシステム安定性のバランスを取るための明確な定量的な境界を確立します。サービスに十分なエラーバジェットが残っている場合、開発チームは新しいソフトウェアデプロイを積極的にプッシュできます。逆に、エラーバジェットがゼロに近づくと、システムが安定するまでデプロイは凍結されます。
+
+以下は、30日間の可用性SLOとエラーバジェットの計算例です。
+
+```
++-----------------------------------------------------------------------------------+
+| 30-Day Rolling Window (Total Requests: 10,000,000)                               |
++-----------------------------------------------------------------------------------+
+| Target Availability SLO: 99.9%  =====>  Successful Requests Goal: 9,990,000     |
+| Total Error Budget:      0.1%   =====>  Max Allowed Failed Requests: 10,000        |
++-----------------------------------------------------------------------------------+
+| Burn Rate 1x   =====> Consumes 100% Error Budget exactly in 30 days (13.8 req/hr)  |
+| Burn Rate 14.4x ====> Consumes  2% Error Budget in 1 Hour (Urgent Page Alert)     |
++-----------------------------------------------------------------------------------+
+```
+
+## Multi-Window Multi-Burn-Rateアラートはアラート疲れをどのように防ぐのか？
+
+Multi-Window Multi-Burn-Rateアラートは、アラートを発する前に、短期間と長期間の両方の評価ウィンドウでエラー率が同時に消費しきい値を超過することを要求することで、アラート疲れを防ぎます。従来のシングルウィンドウアラートは、固有のトレードオフに悩まされます。短期間の評価ウィンドウ（5分など）は、自然に解決する一時的なトラフィックの急増に対して誤検知を引き起こし、長期間の評価ウィンドウ（6時間など）は、深刻な障害中の重要な通知を遅延させ、問題が解決した後もゆっくりとリセットされます。
+
+![Multi-Window Multi-Burn-Rate Architecture](/static/images/prometheus-grafana-alerting-burn-rate-design-multi-window.jpg)
+
+マルチバーンレート設計は、複数の時間ウィンドウにわたるエラーバジェット消費速度を測定することで、これらの制限を解決します。`1x`のバーンレートは、アプリケーションが30日間のコンプライアンス期間中にエラーバジェットの100%を正確に消費することを意味します。`14.4x`のバーンレートは、アプリケーションが通常よりも14倍速くエラーバジェットを消費しており、わずか1時間で総エラーバジェットの2%を使い果たしていることを示します。
+
+高いアラート精度を確保するために、マルチウィンドウアプローチでは2つの条件が同時に満たされる必要があります。長いウィンドウは、大量のエラーバジェットが消費されたことを確認し、短いウィンドウは、障害イベントが現在進行中であることを確認します。両方の条件を要求することで、すでに停止している一時的なエラーに対するページング通知の送信を防ぎます。
+
+以下は、重大度ルートをバーンレートしきい値にマッピングする標準的なSREマルチバーンレートマトリックスです。
+
+| アラート重大度レベル | 消費されたエラーバジェット | 長いウィンドウサイズ | 短いウィンドウサイズ | バーンレート乗数 | ターゲット通知ルート |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **クリティカルページ** | 2% エラーバジェット | 1時間 | 5分 | 14.4倍 バーンレート | PagerDuty / オンコールSRE |
+| **警告ページ** | 5% エラーバジェット | 6時間 | 30分 | 6.0倍 バーンレート | PagerDuty / セカンダリ |
+| **チケット / 警告** | 10% エラーバジェット | 3日 | 6時間 | 1.0倍 バーンレート | Jiraチケット / Slackチャンネル |
+
+## レイテンシーとエラーレートのバーンレートに対するPromQLルールはどのように記述するのか？
+
+レイテンシーとエラーレートのバーンレートに対するPromQLルールは、さまざまな時間ウィンドウにわたるリクエストレートを事前計算するための記録ルールを定義し、その後、ターゲットエラーバジェットに対してバーンレート乗数を評価するアラートルールを定義することによって記述します。Prometheusの記録ルールを使用して生のリクエストレートを事前計算することで、アラート評価ループ中のPrometheusサーバーのCPUクエリオーバーヘッドを削減します。
+
+![PromQL Alerting Rule Definitions](/static/images/prometheus-grafana-alerting-burn-rate-design-promql-rules.jpg)
+
+バーンレートアラートを実装する最初のステップは、不良イベントと総イベントの比率を計算することです。可用性SLIの場合、不良イベントは`5xx`ステータスコードを持つHTTPレスポンスを表します。レイテンシーSLIの場合、不良イベントは、定義されたターゲットしきい値を超えるレスポンスレイテンシーを持つHTTPリクエスト（たとえば、`500ms`より長い時間がかかるリクエスト）を表します。
+
+以下に、複数の時間ウィンドウにわたるエラーレートメトリクスを定義する完全なPrometheus記録ルール設定ファイルを示します。
+
+```yaml
+groups:
+  - name: service_sli_recording_rules
+    rules:
+      # 5-minute error rate ratio
+      - record: job:http_requests_error_rate:ratio_rate5m
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+          /
+          sum(rate(http_requests_total[5m])) by (job)
+
+      # 1-hour error rate ratio
+      - record: job:http_requests_error_rate:ratio_rate1h
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[1h])) by (job)
+          /
+          sum(rate(http_requests_total[1h])) by (job)
+
+      # 30-minute error rate ratio
+      - record: job:http_requests_error_rate:ratio_rate30m
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[30m])) by (job)
+          /
+          sum(rate(http_requests_total[30m])) by (job)
+
+      # 6-hour error rate ratio
+      - record: job:http_requests_error_rate:ratio_rate6h
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[6h])) by (job)
+          /
+          sum(rate(http_requests_total[6h])) by (job)
+```
+
+これらの記録ルールがPrometheusに存在したら、マルチウィンドウマルチバーンレート式を評価するアラートルールを構築します。
+
+```yaml
+  - name: service_slo_burn_rate_alerts
+    rules:
+      # Critical Page: 14.4x burn rate over 1h and 5m windows (2% budget in 1 hour)
+      - alert: APIAvailabilityErrorBudgetBurnCritical
+        expr: |
+          (job:http_requests_error_rate:ratio_rate1h > (14.4 * 0.001))
+          and
+          (job:http_requests_error_rate:ratio_rate5m > (14.4 * 0.001))
+        for: 2m
+        labels:
+          severity: critical
+          tier: platform
+        annotations:
+          summary: "API Service consuming error budget rapidly (14.4x burn rate)"
+          description: "API Service error rate is {{ $value | printf "%.4f" }} over 1 hour, consuming 2% of 30-day error budget."
+
+      # Warning Ticket: 6x burn rate over 6h and 30m windows (5% budget in 6 hours)
+      - alert: APIAvailabilityErrorBudgetBurnWarning
+        expr: |
+          (job:http_requests_error_rate:ratio_rate6h > (6.0 * 0.001))
+          and
+          (job:http_requests_error_rate:ratio_rate30m > (6.0 * 0.001))
+        for: 15m
+        labels:
+          severity: warning
+          tier: platform
+        annotations:
+          summary: "API Service consuming error budget steadily (6x burn rate)"
+          description: "API Service error rate is {{ $value | printf "%.4f" }} over 6 hours, consuming 5% of 30-day error budget."
+```
+
+`14.4 * 0.001`がバーンレート乗数を`99.9%`の可用性SLO（`error_budget = 0.001`）の明示的なエラーしきい値に変換していることに注目してください。ターゲットSLOが`99.5%`（`error_budget = 0.005`）の場合、PromQL乗数を`14.4 * 0.005`（`0.072`エラーレートしきい値）に更新します。
+
+## 動的なアラートエスカレーションのためにAlertmanagerのルーティングをどのように設定するのか？
+
+動的なアラートエスカレーションのためにAlertmanagerのルーティングを設定するには、`alertmanager.yml`で階層的なルーティングツリーを定義し、`severity`や`tier`などのアラートラベルを対応するレシーバーにルーティングします。AlertmanagerはPrometheusの中央通知エンジンとして機能し、PagerDuty、Opsgenie、Slackなどの外部通知レシーバー全体でアラートの重複排除、グループ化、抑制、ルーティングを処理します。
+
+![Alertmanager Routing and Severity Controls](/static/images/prometheus-grafana-alerting-burn-rate-design-alertmanager.jpg)
+
+ルーティングツリーは、`matchers`配列を使用して、ラベルのキーと値のペアに基づいて受信アラートをフィルタリングします。`group_by`パラメータを設定することで、Alertmanagerは同じサービス層から発生する複数の同時アラートを単一の要約通知に統合し、大規模なインフラストラクチャ障害時の通知の氾濫を防ぎます。
+
+以下に、マルチチャネルエスカレーションルーティングを示す完全な`alertmanager.yml`設定を示します。
+
+```yaml
+global:
+  resolve_timeout: 5m
+  pagerduty_url: 'https://events.pagerduty.com/v2/enqueue'
+
+route:
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'slack-default'
+  routes:
+    - matchers:
+        - severity = critical
+      receiver: 'pagerduty-oncall'
+      continue: true
+    - matchers:
+        - severity = warning
+      receiver: 'slack-warnings'
+
+inhibit_rules:
+  - source_matchers:
+      - alertname = NodeNetworkDown
+    target_matchers:
+      - alertname = APIAvailabilityErrorBudgetBurnCritical
+    equal: ['cluster', 'instance']
+
+receivers:
+  - name: 'slack-default'
+    slack_configs:
+      - channel: '#devops-alerts'
+        send_resolved: true
+        text: "Alert: {{ .CommonAnnotations.summary }}
+Description: {{ .CommonAnnotations.description }}"
+
+  - name: 'pagerduty-oncall'
+    pagerduty_configs:
+      - service_key: 'pd-integration-key-production'
+        severity: 'critical'
+
+  - name: 'slack-warnings'
+    slack_configs:
+      - channel: '#sre-warning-tickets'
+        send_resolved: true
+```
+
+`inhibit_rules`セクションは、重要なアラート抑制機能を提供します。この設定では、Kubernetesノード全体がネットワーク障害（`NodeNetworkDown`）を経験した場合、Alertmanagerはそのノード上の`APIAvailabilityErrorBudgetBurnCritical`のような子サービスアラートを自動的に抑制します。ダウンストリームの症状を抑制することで、オンコールエンジニアが単一の根本原因障害に対して数十の冗長なページを受信するのを防ぎます。
+
+## リアルタイムSLO可視化のためのGrafanaアラートダッシュボードはどのように構築するのか？
+
+リアルタイムSLO可視化のためのGrafanaアラートダッシュボードは、現在のエラーバジェット残高、履歴バーンレート、およびアクティブなアラート状態しきい値を視覚化するダッシュボードパネルを作成することによって構築します。ダッシュボードは、インシデント対応中の主要な運用ワークスペースとして機能し、エンジニアがアラート通知が実際の顧客への影響に対応しているかどうかを確認し、SLO違反までのエラーバジェットの残り時間を推定できるようにします。
+
+![Grafana Alert Dashboard and SLO Visuals](/static/images/prometheus-grafana-alerting-burn-rate-design-grafana-dashboard.jpg)
+
+適切に設計されたSREダッシュボードは、3つの主要な視覚ゾーンを備えています。トップレベルのSLOコンプライアンス率を表示するエグゼクティブサマリー行、マルチウィンドウエラーバジェットバーンレート曲線を描画する中央行、およびアクティブなPrometheusアラートインスタンスとシステムメトリクスを表示する下部行です。GrafanaのStatパネル可視化を使用すると、残りのエラーバジェット値を色分けして表示できます。バジェットが50%を超えると緑、20%を下回ると黄色、バジェットが枯渇すると赤で表示されます。
+
+以下に、30日間の残りのエラーバジェット率を追跡するGrafanaダッシュボードパネルのJSON定義の例を示します。
+
+```json
+{
+  "type": "stat",
+  "title": "30-Day Remaining Error Budget",
+  "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+  "targets": [
+    {
+      "datasource": "Prometheus",
+      "expr": "(1 - (sum(increase(http_requests_total{status=~"5.."}[30d])) / sum(increase(http_requests_total[30d])))) / 0.001 * 100",
+      "format": "time_series",
+      "legendFormat": "Remaining Budget %"
+    }
+  ],
+  "fieldConfig": {
+    "defaults": {
+      "unit": "percent",
+      "thresholds": {
+        "mode": "absolute",
+        "steps": [
+          { "color": "red", "value": null },
+          { "color": "yellow", "value": 20 },
+          { "color": "green", "value": 50 }
+        ]
+      }
+    }
+  }
+}
+```
+
+静的な可視化パネルに加えて、Grafana Unified Alertingを使用すると、マルチデータソースクエリを使用してGrafana UI内で直接アラートルールを作成できます。Grafana Alertingは、Alertmanagerと同一のコンタクトポイント、通知ポリシー、およびサイレンスをサポートしており、プラットフォームチームがダッシュボードの可視化と並行してアラートポリシーを統一されたユーザーワークフローで管理できます。
+
+## アラートしきい値の調整とバーンレートルールのテストはどのように行うのか？
+
+アラートしきい値の調整とバーンレートルールのテストは、k6のようなロードジェネレーターを使用して合成トラフィック障害をシミュレートし、履歴メトリクスデータを確認し、Prometheusの履歴データに対してドライランPromQLルール評価を実行することによって行います。新しいバーンレートアラートルールを本番環境にデプロイする前に、通常のトラフィック変動中に誤警報を発することなく、実際の障害条件下でルールが確実にトリガーされることを検証する必要があります。
+
+合成テストには、ロードテストツールを使用して人工的なHTTPトラフィックを生成し、制御された障害注入（たとえば、APIリクエストの一部にHTTP 500エラーを強制的に返すなど）を導入することが含まれます。Prometheusが記録ルールを評価し、`APIAvailabilityErrorBudgetBurnCritical`アラートを発する速度を監視することで、短いウィンドウ評価期間が実際のトラフィック量で正しく機能することを確認します。
+
+Prometheusの履歴メトリクスに対してドライランルールテストを実行するには、Prometheusの公式ルールテストCLIユーティリティである`promtool`を使用します。
+
+```bash
+# 1. Validate syntax of Prometheus alerting rules file
+promtool check rules rules/slo_alerts.yml
+
+# 2. Run unit test suite against synthetic time-series test data
+promtool test rules tests/slo_alerts_test.yml
+```
+
+`promtool`を使用したアラートルールの単体テストには、YAMLテストファイルで合成時系列入力を定義し、特定の時間オフセットでの期待されるアラート発火状態を宣言することが含まれます。
+
+```yaml
+# Unit test file: tests/slo_alerts_test.yml
+rule_files:
+  - ../rules/slo_alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="api", status="200"}'
+        values: '1000+1000x60'
+      - series: 'http_requests_total{job="api", status="500"}'
+        values: '0+50x60'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: APIAvailabilityErrorBudgetBurnCritical
+        exp_alerts:
+          - labels:
+              severity: critical
+              tier: platform
+            annotations:
+              summary: "API Service consuming error budget rapidly (14.4x burn rate)"
+```
+
+CI/CDパイプラインで単体テストを実行することで、PromQLアラートルールやメトリクスラベルスキーマの変更がアラートロジックを破壊したり、無効なPromQL構文を本番監視クラスターに導入したりしないことを保証します。重要なSREページング用のPrometheusバックエンドルールと、運用チーム通知用のGrafanaアラートを組み合わせることで、堅牢な監視アーキテクチャが実現します。
+
+## Prometheusアラートバーンレートに関するよくある質問
+
+### プライマリページングアラートにCPUまたはメモリメトリクスを使用すべきではないのはなぜですか？
+
+CPUまたはメモリメトリクスをプライマリページングアラートに使用すべきではありません。高いリソース使用率が顧客に影響を与えるアプリケーションの劣化に直接対応するわけではないからです。最新のアプリケーションは、高負荷時でも利用可能なCPUおよびメモリリソースを効率的に使用するように設計されています。CPU使用率が高いことでページングアラートがトリガーされると、リソース消費量が高くてもアプリケーションがスムーズに動作している場合にアラート疲れを引き起こします。ページングアラートは、実際のユーザーエクスペリエンスを測定するレイテンシー、エラー率、可用性などのSLIに厳密に焦点を当てるべきです。
+
+### 14.4倍のバーンレートアラートと6倍のバーンレートアラートの違いは何ですか？
+
+違いは、エラーバジェットの消費速度と、結果として生じる通知の緊急性にあります。`14.4x`のバーンレートは、30日間の総エラーバジェットの2%を1時間で消費し、オンコールエンジニアへの即時ページエスカレーションが必要な深刻な障害を示します。`6x`のバーンレートは、エラーバジェットの5%を6時間で消費し、警告通知やチケットチャネルを通じて数時間以内に注意が必要な、より緩やかな劣化を示します。
+
+### 少ないエラー数でバーンレートが急上昇する低トラフィックサービスはどのように処理しますか？
+
+低トラフィックサービスは、PromQLアラート式に最小リクエスト数しきい値を組み込むか、短い評価ウィンドウサイズを延長することで処理します。1分あたり10リクエストしか受信しない低トラフィックサービスでは、1つの失敗したリクエストが10%のエラー率を表し、誤ったバーンレートの急上昇を引き起こします。`and sum(rate(http_requests_total[5m])) > 5`を追加することで、バーンレートアラートが、統計的に有効な結果を得るのに十分な総リクエストスループットがある場合にのみ評価されるようにします。
+
+### Prometheusヒストグラムを使用してレイテンシーSLOをアラートするにはどうすればよいですか？
+
+Prometheusヒストグラムを使用してレイテンシーSLOをアラートするには、`le`バケットラベルを使用して、レイテンシーしきい値よりも速く処理されたリクエストの割合を追跡します。たとえば、SLOがリクエストの95%が200ms未満で完了する必要があると規定している場合、不良イベント率のPromQLクエリは`1 - (sum(rate(http_request_duration_seconds_bucket{le="0.2"}[5m])) / sum(rate(http_request_duration_seconds_count[5m])))`です。このクエリは、200msのターゲットを超過したリクエストの割合を評価します。
+
+### Prometheusアラートルールにおけるfor句の目的は何ですか？
+
+`for`句（たとえば`for: 2m`）は、アラート式が指定された期間継続的に真であり続けるまで待機してから、アラート状態を`Pending`から`Firing`に移行するようにPrometheusに指示します。短い`for`句を使用することで、一時的なメトリクスの欠落や単一スクレイプクエリの異常による時期尚早なアラートがAlertmanagerに送信されるのを防ぎつつ、実際の持続的な障害イベントが迅速に発火することを可能にします。
+
+### デプロイ中のアラートを防ぐために、スケジュールされたメンテナンスウィンドウはどのように管理しますか？
+
+スケジュールされたメンテナンスウィンドウは、計画されたメンテナンス操作中にAlertmanagerまたはGrafana Alertingでサイレンスを作成することで管理します。Alertmanagerのサイレンスはアラートラベル（たとえば`service="payment-api"`）に一致し、定義された期間の通知を抑制します。サイレンスは、Alertmanager Web UIを介して対話的に作成することも、メンテナンス作業を実行する前にCI/CDデプロイスクリプトからAPI呼び出しを介して自動化することもできます。
+
+### PrometheusとGrafana Unified Alertingのどちらでアラートルールを設定すべきですか？
+
+PrometheusのルールファイルでコアインフラストラクチャとSREエラーバジェットアラートを直接設定することは、Prometheusが時系列データベースの隣でアラート式をローカルで評価するため、高可用性のために推奨されます。Grafana Unified Alertingは、チームレベルのダッシュボードアラート、マルチデータソース相関、およびユーザーフレンドリーなアラート管理UIワークフローに最適です。重要なSREページング用のPrometheusバックエンドルールと、運用チーム通知用のGrafanaアラートを組み合わせることで、信頼性の高い監視アーキテクチャが実現します。
+
+## こちらもおすすめです
+
+- [k6 Grafana 分散負荷テストとパフォーマンスプロファイリング](/en/blog/k6-grafana-distributed-load-testing)
+- [PactとNode.jsによるマイクロサービス契約テスト](/en/blog/contract-testing-pact-nodejs-microservices)
+- [Playwright E2Eテスト: フレーキーテストゼロのための4つのルール](/en/blog/getting-started-with-playwright-for-e2e-testing)
+- [エンタープライズ自動化のためのPlaywrightの最良の代替案](/en/blog/best-playwright-alternatives)

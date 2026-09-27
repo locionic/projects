@@ -1,0 +1,304 @@
+---
+title: "Terraform State LockとBackendアーキテクチャガイド"
+images:
+  - '/static/images/terraform-state-lock-backend-architecture-featured.jpg'
+  - '/static/images/terraform-state-lock-backend-architecture-overview.jpg'
+  - '/static/images/terraform-state-lock-backend-architecture-dynamodb-lock.jpg'
+  - '/static/images/terraform-state-lock-backend-architecture-s3-backend-config.jpg'
+  - '/static/images/terraform-state-lock-backend-architecture-force-unlock.jpg'
+  - '/static/images/terraform-state-lock-backend-architecture-cicd-pipeline.jpg'
+date: '2026-07-29'
+tags: ["devops", "cloud-computing", "state-management"]
+draft: false
+summary: "Terraformのremote state管理を習得し、S3 backend lockingとDynamoDBの設定でstate driftを防ぎ、並行するCI/CDパイプラインの実行を処理しましょう。"
+authors: ['default']
+category: Tech
+---
+
+
+エンジニアリングチーム間でインフラストラクチャの状態を管理するには、競合状態、状態ファイルの破損、不正な構成の上書きを防ぐために、絶対的な運用の一貫性が必要です。複数のエンジニアまたは自動デプロイパイプラインが同じインフラストラクチャスタックに対してTerraform操作を同時に実行すると、調整されていない状態の変更によってデプロイトラッキングファイルが永久に破損する可能性があります。Amazon S3とDynamoDBを使用してアクティブな状態ロックメカニズムを備えたリモート状態バックエンドを設計することで、インフラストラクチャライフサイクル全体で単一ライターの排他性を保証できます。
+
+<AudioPlayer src="/static/audio/terraform-state-lock-backend-architecture.mp3" title="Executive Audio Briefing" />
+
+## 本番環境のTerraformアーキテクチャで状態ロックが重要な理由
+
+状態ロックは、状態ファイルを破損させたり、競合するインフラストラクチャの変更をデプロイしたりする書き込み操作の同時実行を防ぐため、本番環境のTerraformアーキテクチャで非常に重要です。Terraformが`terraform plan`、`terraform apply`、または`terraform destroy`のようなコマンドを実行すると、状態メタデータを読み取り、ターゲットグラフの依存関係を計算し、完了時にリソースマッピングを更新します。2つの実行スレッドがまったく同じミリ秒で状態ファイルを変更すると、最終的に書き込まれた状態は、いずれかのスレッドによって作成されたリソースを省略し、クラウド環境に追跡されないインフラストラクチャアーティファクトを生成します。
+
+![Remote State Backend Architecture Overview](/static/images/terraform-state-lock-backend-architecture-overview.jpg)
+
+ローカル状態ストレージの主な脆弱性は、ロック機能とアクセス制御の強制が完全に欠如している点にあります。ローカル開発者マシンまたはバージョン管理されていないディスク共有に状態ファイルを保存すると、緊急のホットフィックス中にチームメンバーが誤って互いの作業を上書きしてしまう可能性があります。リモートバックエンドは、ローカル状態ストレージを集中型オブジェクトストアと分散ロックストアに置き換えます。状態を読み取ったり変更したりするコマンドを実行する前に、Terraformはリモートロックサービスに接続し、実行メタデータ、オペレーターID、タイムスタンプ、一意のロックIDを含む排他的ロックトークンを要求します。
+
+別のユーザーまたは自動CI/CDジョブがすでにアクティブなロックを保持している場合、ロックバックエンドは新しいリクエストを即座にエラーメッセージで拒否します。セカンダリのTerraform CLI実行は、インフラストラクチャリソースを変更したり、リモートストレージを破損させたりすることなく安全に停止します。アクティブな実行スレッドが操作を完了し、更新された状態をオブジェクトストレージにフラッシュすると、Terraformは自動的にロックトークンを解放し、保留中の操作がロックを取得して順次続行できるようにします。
+
+以下は、実行中の状態ロックの取得と解放のワークフローを示すステップバイステップの図です。
+
+```
++--------------------+           1. Request Lock          +--------------------+
+| Terraform CLI      | ---------------------------------> | DynamoDB Lock Table|
+| (Engineer / CI/CD) | <--------------------------------- | (LockID Key)       |
++--------------------+         2. Lock Granted (ID)       +--------------------+
+          |                                                         ^
+          | 3. Execute Plan / Apply                                 |
+          v                                                         |
++--------------------+           4. Write State           +--------------------+
+| Cloud Provider API | ---------------------------------> | Amazon S3 Storage  |
+| (AWS / GCP / Azure)|                                    | (State Versioning) |
++--------------------+                                    +--------------------+
+          |                                                         |
+          +---------------------------------------------------------+
+                                 5. Release Lock
+```
+
+## DynamoDBは状態ロック取得の内部メカニズムをどのように処理しますか？
+
+DynamoDBは、操作メタデータのJSON文字列を含む`LockID`という名前のパーティションキーを持つ単一のテーブル項目を保存することで、状態ロック取得の内部メカニズムを処理します。TerraformがDynamoDBロックで構成されたS3リモートバックエンドに対してコマンドを開始すると、指定されたDynamoDBテーブルに条件付き`PutItem`操作を送信します。条件式は、`LockID`がテーブルにまだ存在しないことを要求し、分散クラウドリージョン全体でのアトミック性を保証します。
+
+![DynamoDB State Lock Mechanism](/static/images/terraform-state-lock-backend-architecture-dynamodb-lock.jpg)
+
+項目キーが存在しない場合、DynamoDBは新しいレコードをアトミックに挿入し、HTTP 200 OKを返して、Terraformにインフラストラクチャ評価を進める排他的な権利を付与します。`LockID`項目内に保存されたJSONペイロードは、アクティブな実行セッションに関する広範な診断情報を記録します。このDynamoDB項目を検査すると、オペレーターのIAM ID、ローカルホスト名、プロセスID、実行タイムスタンプ、および現在実行中の正確なCLIサブコマンドが明らかになります。
+
+DynamoDB状態ロックレコード内に保存される生のJSONメタデータペイロードの例を次に示します。
+
+```json
+{
+  "ID": "e7b1a2c3-4d5e-6f7a-8b9c-0d1e2f3a4b5c",
+  "Operation": "OperationTypeApply",
+  "Info": "Provisioning production EKS cluster nodes",
+  "Who": "deploy-agent@ci-runner-node-04",
+  "Version": "1.8.5",
+  "Created": "2026-07-29T09:28:00Z",
+  "Path": "production/us-east-1/eks/terraform.tfstate"
+}
+```
+
+このレコードがDynamoDBに存在している間に競合するTerraformプロセスが実行しようとすると、その条件付き`PutItem`リクエストは`ConditionalCheckFailedException`エラーで失敗します。クライアントは、誰がロックを保持しているか、いつ作成されたかを詳細に記述した構造化されたCLIエラーを受け取ります。
+
+```
+Error: Error acquiring the state lock
+
+Error message: ConditionalCheckFailedException: The conditional request failed
+Lock Info:
+  ID:        e7b1a2c3-4d5e-6f7a-8b9c-0d1e2f3a4b5c
+  Path:      production/us-east-1/eks/terraform.tfstate
+  Operation: OperationTypeApply
+  Who:       deploy-agent@ci-runner-node-04
+  Version:   1.8.5
+  Created:   2026-07-29 09:28:00 UTC
+
+Terraform acquires a state lock to protect the state from being written by
+multiple users at the same time. Please resolve the issue above and try again.
+```
+
+インフラストラクチャ操作が正常に完了すると、Terraformは正確な`LockID`文字列を指定する`DeleteItem`リクエストを送信してレコードを削除します。DynamoDBは、テーブル内の単一項目の読み取りと書き込みに対して強力な整合性を保証するため、数十の同時ビルドランナーが同時にトリガーされた場合でも、ロックチェックとロック取得の間の競合状態のウィンドウはゼロです。
+
+## HCLでS3とDynamoDBのバックエンドアーキテクチャを構成する方法
+
+HCLでS3とDynamoDBのバックエンドアーキテクチャを構成するには、Terraform構成内で`backend "s3"`ブロックを定義し、バケット名、状態キーパス、AWSリージョン、暗号化要件、およびDynamoDBテーブル名を指定します。すべてのインフラストラクチャモジュールでこのバックエンド定義を標準化することで、すべての環境が専用のバケットプレフィックスキーに状態ファイルを分離し、共有ロックテーブルを参照するようにします。
+
+![S3 and DynamoDB Backend Configuration](/static/images/terraform-state-lock-backend-architecture-s3-backend-config.jpg)
+
+Terraform構成をリモートストレージにポイントする前に、ブートストラップインフラストラクチャコードまたは自動CLIコマンドを使用して、基盤となるS3バケットとDynamoDBテーブルをプロビジョニングする必要があります。S3バケットは、偶発的なリソース削除の場合に以前の状態リビジョンを復元できるように、オブジェクトバージョニングを有効にする必要があります。また、AWS KMSキーでサーバーサイド暗号化を強制し、状態ファイル内に保存されている機密性の高い認証情報変数を保護するために、すべてのパブリックアクセスをブロックする必要があります。
+
+バックエンドインフラストラクチャリソースをプロビジョニングする本番環境のTerraform構成を次に示します。
+
+```hcl
+resource "aws_s3_bucket" "terraform_state" {
+  bucket        = "company-terraform-state-prod-us-east-1"
+  force_destroy = false
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_s3_bucket_versioning" "terraform_state" {
+  bucket = aws_s3_bucket.terraform_state.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "terraform_state" {
+  bucket = aws_s3_bucket.terraform_state.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_dynamodb_table" "terraform_locks" {
+  name         = "company-terraform-locks"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "LockID"
+
+  attribute {
+    name = "LockID"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+}
+```
+
+これらのバックエンドリソースがAWSアカウントに存在したら、`terraform`設定ブロックを使用してワークロードモジュール内でそれらを参照します。
+
+```hcl
+terraform {
+  required_version = ">= 1.5.0"
+
+  backend "s3" {
+    bucket         = "company-terraform-state-prod-us-east-1"
+    key            = "workloads/production/networking/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "company-terraform-locks"
+    encrypt        = true
+  }
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+```
+
+`encrypt = true`を構成すると、状態ファイルがTLS経由で転送中に暗号化され、S3マネージドキーを使用して保存時に暗号化されることが義務付けられます。既存のローカル状態ファイルをこのリモートバックエンドに移行する場合、`terraform init`を実行すると状態移行の確認を求められ、既存のローカル状態ファイルが自動的にS3にアップロードされ、DynamoDBに状態ロックメカニズムが登録されます。
+
+## Force-Unlockを使用してスタックした状態ロックを安全に処理する方法
+
+スタックした状態ロックをforce-unlockで安全に処理するには、アクティブなデプロイプロセスやCI/CDジョブが現在インフラストラクチャを変更していないことを確認した後、`terraform force-unlock <LOCK-ID>`を実行します。スタックしたロックは通常、自動ビルドエージェントがタイムアウト、メモリ不足エラー、またはネットワーク切断によって、`DeleteItem`リクエストをDynamoDBに送信する前に予期せず強制終了された場合に発生します。
+
+![Handling Stuck Locks with Force-Unlock](/static/images/terraform-state-lock-backend-architecture-force-unlock.jpg)
+
+force-unlockコマンドを発行する前に、ロックがアクティブな`terraform apply`ステップによって使用されているのではなく、本当に放棄されていることを確認するために徹底的なフォレンジック調査を実行する必要があります。ロックエラーメッセージで返されたメタデータを検査して、所有者のホスト名、プロセスID、および作成タイムスタンプを特定します。アクティブなCIランナープロセスによって3分前にロックが作成された場合、それをforce-unlockすると、アクティブなランナーが最終的な状態更新を書き込もうとしたときに壊滅的な状態破損が発生します。
+
+force-unlockを実行する前に、この検証手順に従ってください。
+
+```bash
+# 1. Query DynamoDB directly to inspect active lock item
+aws dynamodb get-item   --table-name company-terraform-locks   --key '{"LockID": {"S": "company-terraform-state-prod-us-east-1/workloads/production/networking/terraform.tfstate-md5"}}'
+
+# 2. Verify CI runner job status to confirm build container terminated
+gh run view <RUN-ID> --job <JOB-ID>
+
+# 3. Once confirmed abandoned, execute force-unlock with lock ID string
+terraform force-unlock e7b1a2c3-4d5e-6f7a-8b9c-0d1e2f3a4b5c
+```
+
+`terraform force-unlock`を実行するためのCLIターミナルアクセスがない場合は、AWSマネジメントコンソールまたはAWS CLIを使用して、DynamoDBテーブルから古いロック項目を手動で削除できます。`LockID`プライマリキー列で状態ファイルパスに一致する項目を見つけて行を削除すると、チーム全体で状態の可用性が即座に復元されます。ただし、手動でのテーブル編集はTerraformの内部安全ログをバイパスするため、`terraform force-unlock`を実行することが推奨される修復方法です。
+
+自動化された環境でスタックしたロックの発生を減らすには、常にTerraform CLIの呼び出しを、`SIGINT`や`SIGTERM`などのプロセス終了シグナルをトラップするシグナルハンドラーでラップしてください。ビルドコンテナがTerraform子プロセスにシグナルを適切に渡すようにすることで、CLIクライアントはコンテナが破棄される前にクリーンアップルーチンを実行し、DynamoDBロックを解放する時間を確保できます。
+
+## TerraformパイプラインのCI/CD並行性制御をどのように設計しますか？
+
+TerraformパイプラインのCI/CD並行性制御を設計するには、ワークフロー並行性グループを構成し、厳格なブランチ保護ルールを適用し、環境ごとに状態キープレフィックスを分離します。DynamoDBの状態ロックは同時状態書き込みから保護しますが、ワークフローレベルの並行性制御は、GitHub ActionsまたはGitLab CIパイプライン内で不要なパイプラインキューイング、冗長な計画計算、およびデプロイ順序の競合を防ぎます。
+
+![CI CD Concurrency Controls for Terraform](/static/images/terraform-state-lock-backend-architecture-cicd-pipeline.jpg)
+
+GitHub Actionsでは、`concurrency`ブロックを使用すると、環境名や状態パスプレフィックスなどの共有変数に基づいてワークフロー実行をグループ化できます。`cancel-in-progress: false`を設定すると、実行中のデプロイステップが途中でキャンセルされることなくクリーンに完了し、孤立したクラウドリソースやスタックした状態ロックが残されるのを防ぎます。
+
+以下は、適切な並行性ロックを備えた、本番環境で強化された完全なGitHub Actionsワークフローです。
+
+```yaml
+name: Terraform Production Deployment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/production/**'
+
+concurrency:
+  group: terraform-production-lock
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.5
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-actions-terraform-role
+          aws-region: us-east-1
+
+      - name: Terraform Init
+        run: terraform init -working-directory=terraform/production
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -input=false -lock-timeout=10m terraform/production
+```
+
+`terraform apply`ステップでの`-lock-timeout=10m`の使用に注目してください。デフォルトでは、Terraformがアクティブな状態ロックに遭遇すると、すぐにエラーで失敗します。`-lock-timeout=10m`を渡すと、CLIクライアントはタイムアウトするまで最大10分間、ロック取得を継続的に再試行するように指示されます。このフラグにより、シーケンシャルなCIジョブが、ビルドステップを失敗させることなく、長時間実行される適用操作の背後に適切にキューイングできるようになります。
+
+開発、ステージング、本番などの異なる環境に対して個別の状態キーパスを設計することで、爆発半径の分離が保証されます。開発環境へのデプロイは`workloads/dev/terraform.tfstate`のみをロックし、本番パイプラインは完全にブロックされません。複数のクラウドリージョンまたは環境で単一の状態ファイルを再利用しないでください。
+
+## クラウドプロバイダー間で代替リモートバックエンドアーキテクチャを比較する方法
+
+クラウドプロバイダー間で代替リモートバックエンドアーキテクチャを比較するには、状態ロックのサポート、ネイティブセキュリティ統合、コストオーバーヘッド、およびマルチリージョン回復力を評価します。AWS S3とDynamoDBの組み合わせは業界標準ですが、Google Cloud Storage、Azure Blob Storage、およびTerraform Cloudは、個別のデータベーステーブルの必要性を排除する独自のネイティブ状態ロックメカニズムを提供します。
+
+Google Cloud Storage (GCS) は、補助データベースを必要とせずに、組み込みの強力なグローバル整合性と自動オブジェクトロックを提供します。`backend "gcs"`を使用する場合、TerraformはGCSのネイティブオブジェクト生成事前条件 (`if-generation-match`) を使用して、状態書き込み操作中にアトミックロックを実現します。これにより、DynamoDBテーブルのようなセカンダリリソースが不要になり、インフラストラクチャのブートストラップコードが簡素化されます。
+
+Azure Blob Storageは、`backend "azurerm"`の状態ロックを実装するためにネイティブのBLOBリースを使用します。TerraformがAzure Blobコンテナに対して状態更新を開始すると、Azure Storage REST APIから排他的な60秒の無限BLOBリースを要求します。クライアントはCLIプロセスが実行されている間、このリースを継続的に更新し、正常に完了するとリースを解除します。
+
+主要なクラウドバックエンドオプションを評価する比較表を次に示します。
+
+| クラウドバックエンドプロバイダー | 状態ストレージメカニズム | ロックストレージメカニズム | ネイティブロックサポート | ブートストラップの複雑さ |
+| :--- | :--- | :--- | :--- | :--- |
+| **AWS S3 + DynamoDB** | Amazon S3バケット | DynamoDBキーテーブル | 補助テーブルが必要 | 中程度 (2リソース) |
+| **Google Cloud (GCS)** | GCSバケット | ネイティブGCS事前条件 | 組み込みのネイティブサポート | 低 (1リソース) |
+| **Azure Blob Storage** | Azureストレージコンテナ | Azure BLOBリース | 組み込みのネイティブサポート | 低 (1リソース) |
+| **Terraform Cloud / HCP** | HashiCorpマネージドDB | マネージドサービスロックエンジン | フルマネージドAPI | 最小 (0クラウドリソース) |
+
+これらのバックエンドアーキテクチャの選択は、チームの主要なクラウドフットプリントと運用上の好みによって異なります。AWSで大規模に運用しているマルチクラウド組織は、CloudTrailとDynamoDBストリームを介した状態アクセスに対する完全な監査可能性を提供するため、S3とDynamoDBの恩恵を受けます。Google CloudまたはMicrosoft Azureのみにデプロイしているチームは、運用オーバーヘッドを最小限に抑えるために、ネイティブのGCSまたはAzure Blobバックエンドを使用する必要があります。
+
+## Terraform状態ロック管理に関するよくある質問
+
+### DynamoDBテーブルなしでS3リモートバックエンドを状態ロックに使用できますか？
+
+はい、DynamoDBテーブルを指定せずにS3バックエンドを構成できますが、状態ロックは完全に無効になります。ロックテーブルなしでTerraformを実行すると、複数のユーザーまたはCIパイプラインが同時に操作を実行するたびに、状態ファイルが同時書き込み破損にさらされます。S3のみのセットアップは単一の開発者によるローカルテストには機能しますが、本番チーム環境では、状態ロック保護を強制するために常にS3とDynamoDBテーブルを組み合わせる必要があります。
+
+### DynamoDBでTerraformの状態ロックを許可するためにIAMポリシーで必要な権限は何ですか？
+
+状態ロック操作を実行するには、IAMポリシーで指定されたロックテーブルリソースARNに対する`dynamodb:GetItem`、`dynamodb:PutItem`、および`dynamodb:DeleteItem`権限を付与する必要があります。チームがカスタムKMSキーを使用してDynamoDBテーブルを暗号化している場合は、KMSキーポリシーに対する`kms:Encrypt`、`kms:Decrypt`、および`kms:GenerateDataKey`権限も付与する必要があります。ロックテーブルへの書き込みアクセスを制限することで、不正なユーザーがロックチェックをバイパスするのを防ぎます。
+
+### 自動化されたTerraform実行中に`lock-timeout`パラメーターはどのように機能しますか？
+
+`-lock-timeout`パラメーターは、ロックがアクティブな場合にすぐに失敗するのではなく、指定された期間、ロック取得を継続的に再試行するようにTerraform CLIに指示します。たとえば、`-lock-timeout=15m`を渡すと、既存のロックが解放されるか、15分の制限が期限切れになるまで、Terraformは数秒ごとにスリープしてDynamoDBテーブルをポーリングします。ロックタイムアウトを使用すると、連続するコミットが迅速なデプロイジョブをトリガーした場合に、CI/CDパイプラインでの一時的なビルド障害を防ぐことができます。
+
+### `terraform apply`コマンドがSIGKILLまたは停電で強制終了された場合、どうなりますか？
+
+`terraform apply`プロセスが`SIGKILL`（シグナル9）で突然強制終了されたり、ホストの突然の電源喪失が発生したりすると、`DeleteItem`リクエストをDynamoDBに送信する前にプロセスが即座に終了します。ロックレコードはDynamoDBに無期限に保存され、その後のTerraformコマンドは状態ロックエラーで失敗します。実行ホストがダウンしており、適用プロセスが実行されていないことを確認したら、`terraform force-unlock <LOCK-ID>`を実行して問題を解決します。
+
+### APIキーやデータベースパスワードなどの機密シークレットをTerraform状態ファイルに保存しても安全ですか？
+
+いいえ、Terraform状態ファイルにプレーンテキストのシークレットを保存すると、状態ファイルにはJSON形式で暗号化されていない完全なリソース属性値が含まれるため、重大なセキュリティリスクが生じます。S3バケットでサーバーサイド暗号化を構成することで保存時の状態ファイルは保護されますが、S3バケットへの読み取りアクセス権を持つユーザーは、`terraform output`または直接JSON解析を使用して機密値を抽出できます。HCLに生のシークレット値をハードコーディングする代わりに、AWS Secrets ManagerやHashiCorp Vaultなどのシークレットマネージャーを使用して動的なシークレット参照を渡してください。
+
+### 環境ごとに個別のS3バケットとDynamoDBロックテーブルを作成すべきですか？
+
+はい、厳格なIAMアクセス境界を強制し、爆発半径を最小限に抑えるために、開発、ステージング、本番などの個別の環境ごとに専用のS3バケットとDynamoDBロックテーブルを作成することをお勧めします。本番状態ファイルを専用のAWSアカウントに分離することで、開発アクセス権を持つジュニア開発者が誤って本番状態ファイルを読み取ったり変更したりするのを防ぎます。あるいは、統一されたIAM権限を持つ小規模なチームの場合は、共有バックエンドバケット内で異なるバケットプレフィックスを使用することも許容されます。
+
+### 既存のローカル状態ファイルをDynamoDBロック付きのS3リモートバックエンドに移行する方法は？
+
+ローカル状態ファイルを移行するには、ルートモジュール構成に`backend "s3"`ブロックを追加し、ターミナルで`terraform init`を実行します。Terraformは新しいリモートバックエンドを構成したことを検出し、ローカル状態ファイルをターゲットS3キーの宛先と比較し、ローカル状態データの移行を確認するプロンプトを表示します。プロンプトを確認すると、ローカルの`terraform.tfstate`がS3にアップロードされ、DynamoDBにロックテーブルが登録され、ローカル状態ファイルの名前が`terraform.tfstate.backup`に変更されます。
+
+## こちらもおすすめ
+
+- [Terraform State Management Best Practices](/en/blog/terraform-state-management)
+- [Docker BuildKit Cache Mount and Multi-Stage Optimization](/en/blog/docker-buildkit-cache-mount-optimization)
+- [Astral uv in Docker: Multi-Stage Builds, BuildKit Caching & Fast CI](/en/blog/python-uv-package-manager-guide)
+- [FastAPI Docker Multistage Builds: Cut Your Image Size by 70%](/en/blog/fastapi-docker-multistage-build)

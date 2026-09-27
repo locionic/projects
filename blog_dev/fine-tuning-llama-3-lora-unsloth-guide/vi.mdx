@@ -1,0 +1,272 @@
+---
+title: "Tinh chỉnh Llama 3 với LoRA và Unsloth: Hướng dẫn dành cho nhà phát triển"
+images:
+  - '/static/images/fine-tuning-llama-3-lora-unsloth-guide-featured.jpg'
+  - '/static/images/fine-tuning-llama-3-lora-unsloth-guide-qlora-architecture.jpg'
+  - '/static/images/fine-tuning-llama-3-lora-unsloth-guide-unsloth-kernels.jpg'
+  - '/static/images/fine-tuning-llama-3-lora-unsloth-guide-dataset-formatting.jpg'
+  - '/static/images/fine-tuning-llama-3-lora-unsloth-guide-hyperparameter-tuning.jpg'
+  - '/static/images/fine-tuning-llama-3-lora-unsloth-guide-gguf-export.jpg'
+date: '2026-07-29'
+tags: ["ai", "ai-tools"]
+draft: false
+summary: "Hướng dẫn từng bước dành cho nhà phát triển để tinh chỉnh Llama 3 với LoRA, QLoRA và Unsloth: custom Triton GPU kernels, gradient checkpointing và tiết kiệm bộ nhớ."
+authors: ['default']
+category: Tech
+---
+
+
+Việc tùy chỉnh các mô hình ngôn ngữ lớn mã nguồn mở (open-weight) cho các tác vụ chuyên biệt đòi hỏi các kỹ thuật tinh chỉnh hiệu quả để bỏ qua chi phí phần cứng đắt đỏ. Các kỹ sư học máy điều chỉnh dòng mô hình Llama 3 của Meta thường gặp khó khăn với phân mảnh bộ nhớ và tốc độ huấn luyện chậm khi sử dụng các tập lệnh tinh chỉnh PyTorch tiêu chuẩn. Nếu bạn cố gắng tinh chỉnh toàn bộ tham số trên phần cứng đồ họa tiêu dùng, quá trình huấn luyện của bạn sẽ gặp sự cố ngay lập tức do lỗi cấp phát VRAM hết bộ nhớ.
+
+Hướng dẫn dành cho nhà phát triển này trình bày chi tiết quy trình tinh chỉnh hoàn chỉnh cho các mô hình Llama 3 của Meta bằng cách sử dụng Low-Rank Adaptation (LoRA), Quantized Low-Rank Adaptation (QLoRA) và các nhân Triton được tối ưu hóa của Unsloth. Bạn sẽ có được mã huấn luyện PyTorch sẵn sàng sản xuất, tập lệnh định dạng tập dữ liệu, hướng dẫn siêu tham số và quy trình lượng tử hóa GGUF để phục vụ Ollama cục bộ.
+
+<AudioPlayer src="/static/audio/fine-tuning-llama-3-lora-unsloth-guide.mp3" title="Tóm tắt âm thanh điều hành" />
+
+## Tại sao Tinh chỉnh Hiệu quả Tham số lại Giảm Yêu cầu Phần cứng?
+
+Tinh chỉnh hiệu quả tham số giảm yêu cầu phần cứng bằng cách đóng băng các trọng số mô hình cơ sở và huấn luyện một tập hợp nhỏ các ma trận bộ điều hợp hạng thấp được gắn vào các lớp chú ý của transformer. Trong quá trình tinh chỉnh toàn bộ tham số của một mô hình tám tỷ tham số, PyTorch phải lưu trữ ba mươi hai gigabyte trọng số mô hình cơ sở, sáu mươi bốn gigabyte trạng thái gradient và chín mươi sáu gigabyte trạng thái bộ tối ưu hóa Adam trong VRAM. Các kỹ thuật hiệu quả tham số loại bỏ chi phí trạng thái bộ tối ưu hóa cho các trọng số cơ sở, giảm tổng mức tiêu thụ VRAM hơn tám mươi phần trăm.
+
+![Lượng tử hóa QLoRA 4-Bit](/static/images/fine-tuning-llama-3-lora-unsloth-guide-qlora-architecture.jpg)
+
+Để hiểu việc giảm bộ nhớ này, chúng ta xem xét cách Low-Rank Adaptation phân tách các ma trận cập nhật trọng số trong quá trình lan truyền ngược. Thay vì cập nhật trực tiếp một ma trận trọng số dày đặc, LoRA phân tích ma trận cập nhật thành hai ma trận hạng thấp có hạng nhỏ hơn đáng kể so với chiều ẩn của mô hình. Việc phân tích ma trận này giảm các tham số có thể huấn luyện từ tám tỷ xuống dưới năm mươi triệu tham số.
+
+```python
+# PyTorch script demonstrating LoRA rank matrix parameter counting
+def calculate_lora_trainable_parameters(
+    hidden_dim: int = 4096,
+    num_layers: int = 32,
+    lora_rank: int = 16,
+    target_modules: list[str] = ["q_proj", "k_proj", "v_proj", "o_proj"]
+) -> int:
+    # Each target projection layer gets matrix A (hidden x rank) and B (rank x hidden)
+    params_per_matrix = 2 * hidden_dim * lora_rank
+    matrices_per_layer = len(target_modules)
+    total_lora_params = num_layers * matrices_per_layer * params_per_matrix
+    return total_lora_params
+
+# Calculate trainable parameters for Llama-3-8B model with rank 16
+trainable_params = calculate_lora_trainable_parameters(lora_rank=16)
+print(f"Total LoRA trainable parameters: {trainable_params:,} ({trainable_params / 8e9 * 100:.2f}% of base model)")
+```
+
+Đoạn mã Python trên cho thấy việc cấu hình hạng mười sáu trên tất cả các lớp chiếu chú ý cốt lõi tạo ra khoảng bốn mươi mốt triệu tham số có thể huấn luyện. Huấn luyện chưa đến một phần trăm tổng số tham số mô hình giúp giảm đáng kể nhu cầu VRAM, cho phép tinh chỉnh trên GPU có mười sáu gigabyte bộ nhớ.
+
+Quantized Low-Rank Adaptation (QLoRA) nén các trọng số mô hình cơ sở hơn nữa bằng cách chuyển đổi chúng thành kiểu dữ liệu NormalFloat 4-bit chuyên biệt. QLoRA giới thiệu lượng tử hóa kép và bộ tối ưu hóa phân trang để ngăn chặn các đột biến bộ nhớ trong quá trình cập nhật gradient. Kết quả là, các nhà phát triển phần mềm có thể tinh chỉnh một mô hình tham số 8B trên một GPU máy tính để bàn duy nhất như RTX 4080 mà không làm giảm độ chính xác đầu ra.
+
+Tính ổn định cấp phát bộ nhớ trong quá trình huấn luyện phụ thuộc nhiều vào việc ngăn chặn tràn tích lũy gradient trong VRAM. Công cụ autograd PyTorch tiêu chuẩn xây dựng các đồ thị tính toán động lớn làm phân mảnh bộ nhớ trừ khi được giới hạn cẩn thận. Kết hợp giảm tham số QLoRA với checkpointing gradient duy trì dấu chân bộ nhớ ổn định trong suốt các epoch huấn luyện dài.
+
+Đánh giá các đường cong hội tụ mất mát trong các bước huấn luyện ban đầu cung cấp phản hồi tức thì về các lựa chọn siêu tham số. Nếu mất mát huấn luyện vẫn ổn định hoặc tăng vọt đến vô cùng, hạng bộ điều hợp hoặc các tham số tốc độ học cần được điều chỉnh ngay lập tức. Các kỹ thuật hiệu quả tham số cho phép các kỹ sư chạy các lần quét siêu tham số nhanh chóng trong vòng vài giờ thay vì chờ đợi nhiều ngày cho các lần huấn luyện đầy đủ.
+
+## Các Nhân Triton Tùy chỉnh của Unsloth Tăng tốc Huấn luyện Mô hình như thế nào?
+
+Các nhân Triton tùy chỉnh của Unsloth tăng tốc huấn luyện mô hình bằng cách viết lại các vòng lặp lan truyền ngược thủ công của PyTorch thành mã C++ GPU và OpenAI Triton được tối ưu hóa thủ công. Các quy trình huấn luyện Hugging Face Transformers và PEFT tiêu chuẩn dựa vào cơ chế autograd PyTorch chung thực hiện hàng trăm lần khởi chạy nhân CUDA riêng biệt mỗi bước. Unsloth hợp nhất các phép tính chú ý, nhúng vị trí RoPE, chuẩn hóa lớp RMSNorm và các hàm mất mát entropy chéo thành các nhân Triton thống nhất, loại bỏ chi phí nhân.
+
+![Các nhân Triton tùy chỉnh của Unsloth](/static/images/fine-tuning-llama-3-lora-unsloth-guide-unsloth-kernels.jpg)
+
+Thông qua việc hợp nhất nhân GPU tùy chỉnh, Unsloth tăng thông lượng huấn luyện từ hai đến năm lần đồng thời giảm mức tiêu thụ VRAM cao nhất thêm sáu mươi phần trăm. Những cải thiện tốc độ này cho phép các nhóm học máy hoàn thành các lần điều chỉnh hướng dẫn trong ba mươi phút trên các phiên bản GPU đám mây có thể truy cập.
+
+```python
+# Unsloth fine-tuning setup script for Llama-3-8B model
+from unsloth import FastLanguageModel
+import torch
+
+def initialize_unsloth_model(model_name: str, max_seq_length: int = 2048):
+    # Load 4-bit quantized base model with custom Triton kernel bindings
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=max_seq_length,
+        dtype=None,  # Auto-detect float16 or bfloat16 based on GPU
+        load_in_4bit=True
+    )
+    
+    # Configure LoRA adapter targets with optimized gradient tracking
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=16,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_alpha=16,
+        lora_dropout=0,  # Optimized zero dropout for Unsloth speedup
+        bias="none",
+        use_gradient_checkpointing="unsloth"
+    )
+    print("Initialized Unsloth FastLanguageModel successfully.")
+    return model, tokenizer
+
+if __name__ == "__main__":
+    m, t = initialize_unsloth_model("unsloth/llama-3-8b-Instruct-bnb-4bit")
+```
+
+Đoạn mã Python trên minh họa cách Unsloth thay thế việc tải mô hình Hugging Face tiêu chuẩn bằng các trình bao bọc mô hình hiệu suất cao. Việc đặt `use_gradient_checkpointing="unsloth"` sử dụng checkpointing RAM được offload, cho phép các nhà phát triển xử lý kích thước lô lớn gấp đôi so với các tập lệnh huấn luyện PyTorch tiêu chuẩn cho phép.
+
+Các triển khai truyền ngược thủ công bên trong Unsloth tính toán gradient cho các ma trận bộ điều hợp LoRA trực tiếp mà không cần xây dựng các đồ thị autograd trung gian nặng nề. Bằng cách tính toán các đạo hàm riêng thủ công bên trong các trình bao bọc Triton C++, Unsloth bỏ qua việc lưu các tensor kích hoạt mà các mô hình PyTorch tiêu chuẩn giữ trong VRAM. Tối ưu hóa cấp thấp này ngăn chặn lỗi hết bộ nhớ trong các chuỗi huấn luyện ngữ cảnh dài.
+
+Hỗ trợ độ chính xác Bfloat16 trong Unsloth duy trì sự ổn định số học trên các lớp transformer sâu trên kiến trúc NVIDIA Ampere và Hopper hiện đại. So với độ chính xác hỗn hợp FP16 thông thường, BF16 cung cấp dải số mũ động rộng hơn giúp ngăn chặn hiện tượng underflow trong quá trình tính toán mất mát. Sử dụng độ chính xác BF16 trong các nhân Triton đảm bảo lan truyền gradient ổn định trong suốt quá trình huấn luyện.
+
+Tích hợp với SFTTrainer của Hugging Face cho phép các nhà phát triển giữ lại các đường ống tải tập dữ liệu quen thuộc trong khi hưởng lợi từ tốc độ tăng tốc nhân cơ bản của Unsloth. Unsloth tự động vá các lớp huấn luyện viên Hugging Face khi khởi tạo, đảm bảo khả năng tương thích ngược hoàn toàn với các quy trình huấn luyện hiện có.
+
+## Bạn Chuẩn bị Tập dữ liệu Hướng dẫn cho Llama 3 Chat Templates như thế nào?
+
+Bạn chuẩn bị tập dữ liệu hướng dẫn cho các mẫu trò chuyện Llama 3 bằng cách định dạng các cặp nhắc-phản hồi thô thành cú pháp mã thông báo tiêu đề cụ thể của Meta và áp dụng mặt nạ mất mát thích hợp trong quá trình mã hóa. Các mô hình Llama 3 sử dụng các mã thông báo tiêu đề đặc biệt như `<|start_header_id|>`, `<|end_header_id|>` và `<|eot_id|>` để phân biệt các quy tắc nhắc hệ thống, câu hỏi của người dùng và phản hồi của trợ lý. Nếu tập lệnh định dạng tập dữ liệu của bạn bỏ qua các mã thông báo đặc biệt này hoặc căn chỉnh sai ranh giới chuỗi, mô hình đã tinh chỉnh sẽ tạo ra cú pháp định dạng bị hỏng trong sản xuất.
+
+![Chuẩn bị tập dữ liệu & Mặt nạ mất mát](/static/images/fine-tuning-llama-3-lora-unsloth-guide-dataset-formatting.jpg)
+
+Mặt nạ mất mát cũng rất quan trọng trong quá trình chuẩn bị tập dữ liệu để đảm bảo mô hình học cách tạo ra câu trả lời của trợ lý thay vì ghi nhớ các câu hỏi nhắc của người dùng. Trong quá trình lan truyền ngược, các phép tính mất mát entropy chéo phải bỏ qua các mã thông báo câu hỏi nhắc bằng cách gán chỉ số nhãn `-100` cho tất cả các mã thông báo đầu vào đứng trước tiêu đề phản hồi của trợ lý.
+
+```python
+# Dataset formatting script applying Llama 3 chat template and loss masking
+def format_llama3_chat_prompt(sample: dict, tokenizer) -> dict:
+    messages = [
+        {"role": "system", "content": "You are an expert Python engineering assistant."},
+        {"role": "user", "content": sample["instruction"]},
+        {"role": "assistant", "content": sample["response"]}
+    ]
+    
+    # Apply official Llama 3 Jinja template to construct formatted text string
+    formatted_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False
+    )
+    return {"text": formatted_text}
+
+# Example validation of template text formatting
+print("Formatted chat template function constructed successfully.")
+```
+
+Đoạn mã Python trên cho thấy cách các bộ mã hóa Hugging Face áp dụng các quy tắc mẫu Jinja chính thức để tạo ra các chuỗi văn bản tuân thủ. Sử dụng `tokenizer.apply_chat_template()` đảm bảo rằng các mã thông báo điều khiển tiêu đề đặc biệt được chèn vào các chuỗi văn bản tại các vị trí cấu trúc chính xác theo yêu cầu của các lớp chú ý được huấn luyện trước của Llama 3.
+
+Mã hóa các chuỗi văn bản yêu cầu đặt độ dài chuỗi tối đa cố định để ngăn chặn chi phí cấp phát bộ nhớ đệm động. Đặt `max_seq_length=2048` cắt bớt các mẫu tập dữ liệu quá lớn trong khi đệm các chuỗi ngắn hơn đến các ranh giới lô đồng nhất. Cắt bớt văn bản một cách khéo léo ngăn chặn sự hỏng hóc chuỗi ẩn trong quá trình mã hóa.
+
+Việc lọc các mẫu huấn luyện bị hỏng, trùng lặp hoặc chất lượng thấp khỏi tập dữ liệu của bạn là cần thiết trước khi khởi chạy các lần huấn luyện. Tinh chỉnh các mô hình trên các tập dữ liệu nhiễu gây ra sự suy thoái hướng dẫn, trong đó mô hình lặp lại văn bản nhắc hoặc tạo ra các vòng lặp cụm từ lặp đi lặp lại. Làm sạch trước tập dữ liệu bằng cách loại bỏ trùng lặp và lọc độ dài đảm bảo chất lượng đầu ra mô hình cao.
+
+Sự thông đồng dữ liệu giữa các phân tách huấn luyện và đánh giá làm mất hiệu lực các số liệu xác thực điểm chuẩn. Tách các tập dữ liệu đánh giá trước khi mã hóa đảm bảo rằng các số liệu mất mát phản ánh hiệu suất tổng quát hóa thực tế chứ không phải các chuỗi tập dữ liệu đã ghi nhớ. Duy trì các ranh giới phân tách tập dữ liệu nghiêm ngặt đảm bảo theo dõi xác thực đáng tin cậy.
+
+## Bạn Điều chỉnh Tham số LoRA Rank và Alpha như thế nào để Đạt Độ chính xác Tối ưu?
+
+Bạn điều chỉnh các tham số LoRA rank và alpha để đạt độ chính xác tối ưu bằng cách cân bằng khả năng tham số bộ điều hợp với rủi ro quá khớp, sử dụng tỷ lệ alpha-to-rank mặc định là một đối một hoặc hai đối một. Tham số LoRA rank xác định chiều bên trong của các ma trận cập nhật hạng thấp, kiểm soát mức độ khả năng thích ứng mà bộ điều hợp thêm vào mô hình cơ sở. Đặt giá trị rank quá thấp sẽ hạn chế khả năng học kiến thức miền phức tạp của mô hình, trong khi đặt giá trị rank quá cao sẽ làm tăng dấu chân VRAM và có nguy cơ ghi nhớ các tập dữ liệu huấn luyện nhỏ.
+
+![Điều chỉnh siêu tham số LoRA](/static/images/fine-tuning-llama-3-lora-unsloth-guide-hyperparameter-tuning.jpg)
+
+Tham số tỷ lệ, `lora_alpha`, hoạt động như một hệ số nhân không đổi trên các trọng số bộ điều hợp, điều chỉnh độ lớn của các cập nhật bộ điều hợp so với các tham số mô hình cơ sở đã đóng băng. Một thực hành thực nghiệm tiêu chuẩn đặt `lora_alpha` bằng `lora_rank` hoặc `2 * lora_rank`, cung cấp tỷ lệ số học ổn định trên các bước gradient mà không yêu cầu tính toán lại tốc độ học thủ công.
+
+```python
+# Script configuring SFTTrainer with optimized LoRA hyperparameters
+from trl import SFTTrainer
+from transformers import TrainingArguments
+
+def configure_fine_tuning_trainer(model, tokenizer, dataset):
+    training_args = TrainingArguments(
+        output_dir="./llama3_lora_results",
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=4,
+        warmup_steps=10,
+        max_steps=60,
+        learning_rate=2e-4,  # Standard learning rate for QLoRA fine-tuning
+        fp16=not torch.cuda.is_bf16_supported(),
+        bf16=torch.cuda.is_bf16_supported(),
+        logging_steps=1,
+        optim="adamw_8bit",  # Use 8-bit AdamW to minimize VRAM footprint
+        weight_decay=0.01,
+        lr_scheduler_type="linear",
+        seed=3407
+    )
+    
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=dataset,
+        dataset_text_field="text",
+        max_seq_length=2048,
+        dataset_num_proc=2,
+        args=training_args
+    )
+    return trainer
+```
+
+Tập lệnh cấu hình trên minh họa các cài đặt siêu tham số tiêu chuẩn để tinh chỉnh Llama 3 bằng cách sử dụng bộ tối ưu hóa AdamW 8-bit. Đặt `learning_rate=2e-4` với suy giảm tuyến tính cung cấp giảm mất mát ổn định trên các ma trận bộ điều hợp mà không làm mất ổn định các trọng số cơ sở đã đóng băng.
+
+Nhắm mục tiêu tất cả các lớp chiếu tuyến tính bên trong các khối transformer mang lại chất lượng thích ứng cao hơn đáng kể so với việc chỉ nhắm mục tiêu các lớp chiếu truy vấn và giá trị. Nghiên cứu cho thấy rằng việc nhắm mục tiêu đồng thời các lớp `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj` và `down_proj` cho phép các cài đặt rank thấp hơn như `r=16` trong khi vượt trội hơn các cấu hình `r=64` bị hạn chế.
+
+Lựa chọn tốc độ học cho tinh chỉnh QLoRA yêu cầu tốc độ cao hơn so với tinh chỉnh toàn bộ tham số. Bởi vì các trọng số cơ sở vẫn đóng băng và chỉ các ma trận bộ điều hợp chấp nhận cập nhật, tốc độ học giữa `1e-4` và `3e-4` cho phép các tham số bộ điều hợp hội tụ nhanh chóng mà không làm gián đoạn các biểu diễn mô hình cơ sở bên dưới.
+
+Theo dõi các đường cong mất mát đánh giá cùng với các đường cong mất mát huấn luyện phát hiện các dấu hiệu sớm của quá khớp tập dữ liệu. Nếu mất mát huấn luyện tiếp tục giảm trong khi mất mát xác thực tăng lên, quá trình huấn luyện nên được dừng ngay lập tức. Áp dụng các callback dừng sớm ngăn chặn các tham số bộ điều hợp quá khớp với các mẫu nhắc huấn luyện chuyên biệt.
+
+## Bạn Xuất Trọng số đã Tinh chỉnh sang GGUF để Phục vụ Cục bộ như thế nào?
+
+Bạn xuất trọng số đã tinh chỉnh sang GGUF để phục vụ cục bộ bằng cách hợp nhất các ma trận bộ điều hợp hạng thấp trở lại trọng số mô hình cơ sở, lưu mô hình kết hợp ở định dạng Hugging Face 16-bit và chuyển đổi checkpoint bằng các công cụ lượng tử hóa `llama.cpp`. Lượng tử hóa trọng số đã tinh chỉnh thành các tệp GGUF 4-bit hoặc 5-bit cho phép chạy mô hình tùy chỉnh của bạn cục bộ bên trong Ollama hoặc vLLM với dấu chân VRAM thấp.
+
+![Xuất GGUF & Triển khai Ollama](/static/images/fine-tuning-llama-3-lora-unsloth-guide-gguf-export.jpg)
+
+Unsloth bao gồm các phương thức xuất gốc tự động hợp nhất các bộ điều hợp và xây dựng các tệp lượng tử hóa GGUF trực tiếp trong mã Python. Khả năng xuất tích hợp này loại bỏ nhu cầu biên dịch thủ công các tệp nhị phân C++ `llama.cpp` bên ngoài.
+
+```python
+# Script demonstrating native GGUF export and Ollama Modelfile generation
+def export_model_to_gguf(model, tokenizer, output_dir: str):
+    print("Saving fine-tuned model and merging LoRA adapters...")
+    
+    # Save merged FP16 model and native 4-bit Q4_K_M GGUF file
+    model.save_pretrained_gguf(
+        output_dir,
+        tokenizer,
+        quantization_method="q4_k_m"
+    )
+    print(f"Exported Q4_K_M GGUF model successfully to {output_dir}")
+
+# Generate Modelfile for Ollama integration
+def generate_ollama_modelfile(gguf_filename: str) -> str:
+    modelfile_text = "FROM ./" + gguf_filename + "
+" + "PARAMETER temperature 0.2
+" + 'SYSTEM "You are a fine-tuned Python assistant."'
+    return modelfile_text
+```
+
+Đoạn mã Python trên minh họa cách thực hiện xuất GGUF bằng phương thức `.save_pretrained_gguf()` gốc của Unsloth. Xuất trực tiếp sang định dạng `q4_k_m` tạo ra một tệp mô hình được tối ưu hóa sẵn sàng để triển khai cục bộ ngay lập tức.
+
+Xác minh tính toàn vẹn trọng số mô hình GGUF đã xuất yêu cầu kiểm tra độ chính xác tạo văn bản bằng cách sử dụng các thời gian chạy CLI cục bộ trước khi đẩy các checkpoint lên các kho lưu trữ sản xuất. Chạy các lời nhắc đánh giá thử nghiệm thông qua `llama-cli` xác nhận rằng các mã thông báo điều khiển đặc biệt và ánh xạ mã hóa ký tự vẫn còn nguyên vẹn trong quá trình lượng tử hóa.
+
+Triển khai các mô hình GGUF đã tinh chỉnh vào các daemon Ollama cục bộ liên quan đến việc xây dựng một tham chiếu mô hình được đặt tên bằng cách sử dụng `ollama create`. Các nhà phát triển trỏ lệnh vào `Modelfile` đã tạo để đăng ký các trọng số đã tinh chỉnh tùy chỉnh vào kho mô hình cục bộ của Ollama.
+
+Quản lý các tạo phẩm mô hình được phiên bản yêu cầu lưu trữ các trọng số bộ điều hợp đã tinh chỉnh riêng biệt với trọng số mô hình cơ sở trong các kho lưu trữ tạo phẩm. Lưu trữ các tệp bộ điều hợp nhỏ gọn hai mươi megabyte cùng với các tham chiếu tổng kiểm tra mô hình cơ sở đơn giản hóa việc lập phiên bản tạo phẩm trên các nhóm kỹ thuật.
+
+## Các Câu hỏi Phổ biến nhất về Tinh chỉnh Llama 3 là gì?
+
+### Cần bao nhiêu VRAM để tinh chỉnh Llama 3 8B với Unsloth và QLoRA?
+
+Tinh chỉnh Llama 3 8B với Unsloth và QLoRA yêu cầu tối thiểu bảy gigabyte VRAM GPU khi sử dụng độ dài chuỗi ngữ cảnh hai nghìn mã thông báo. Hiệu quả bộ nhớ này cho phép tinh chỉnh trên các card đồ họa tiêu dùng như NVIDIA RTX 3080 hoặc RTX 4080 GPU.
+
+### Bạn nên tinh chỉnh các mô hình Llama 3 cơ sở hay các mô hình Llama 3 đã được điều chỉnh hướng dẫn?
+
+Bạn nên tinh chỉnh các mô hình Llama 3 đã được điều chỉnh hướng dẫn nếu ứng dụng mục tiêu của bạn yêu cầu tương tác trò chuyện, tuân thủ hướng dẫn hoặc gọi công cụ. Các mô hình cơ sở yêu cầu các tập dữ liệu hướng dẫn lớn hơn đáng kể để học các quy tắc định dạng lượt trò chuyện cơ bản.
+
+### Cần bao nhiêu mẫu huấn luyện để thích ứng miền LoRA hiệu quả?
+
+Đối với thích ứng tác vụ chuyên biệt hoặc căn chỉnh kiểu, các tập dữ liệu chất lượng cao chứa năm trăm đến hai nghìn mẫu hướng dẫn đã được làm sạch mang lại kết quả mạnh mẽ. Mở rộng kiến thức miền yêu cầu các tập dữ liệu lớn hơn chứa hàng chục nghìn mẫu.
+
+### Tinh chỉnh QLoRA có làm giảm độ chính xác của mô hình so với tinh chỉnh FP16 đầy đủ không?
+
+Nghiên cứu thực nghiệm sâu rộng cho thấy rằng tinh chỉnh QLoRA với lượng tử hóa NormalFloat 4-bit phù hợp với độ chính xác tinh chỉnh FP16 đầy đủ trên các điểm chuẩn NLP tiêu chuẩn trong khi sử dụng một phần nhỏ bộ nhớ phần cứng.
+
+### Bạn có thể tinh chỉnh các mô hình Llama 3 trên Apple Silicon MacBook bằng Unsloth không?
+
+Không, Unsloth yêu cầu GPU NVIDIA CUDA và các ràng buộc nhân Triton tùy chỉnh. Để tinh chỉnh các mô hình mã nguồn mở trên Apple Silicon MacBook, các framework như MLX hoặc Axolotl với backend PyTorch MPS là lựa chọn được khuyến nghị.
+
+### Sự khác biệt giữa các tham số LoRA rank và LoRA alpha là gì?
+
+LoRA rank định nghĩa chiều bên trong của các ma trận bộ điều hợp, xác định tổng khả năng tham số có thể huấn luyện. LoRA alpha là một hệ số tỷ lệ điều chỉnh các cập nhật trọng số ma trận bộ điều hợp trong quá trình truyền tiến.
+
+## Bạn nên Triển khai các Mô hình đã Tinh chỉnh vào Cụm Sản xuất như thế nào?
+
+Bạn nên triển khai các mô hình đã tinh chỉnh vào các cụm sản xuất bằng cách phục vụ các trọng số GGUF hoặc Safetensors đã hợp nhất bằng cách sử dụng các công cụ suy luận thông lượng cao như vLLM hoặc Ollama. Phục vụ các trọng số bộ điều hợp chưa hợp nhất trong sản xuất gây ra độ trễ tính toán bổ sung trong quá trình truyền tiến suy luận. Hợp nhất các bộ điều hợp LoRA vào các tham số mô hình cơ sở tạo ra một checkpoint mô hình thống nhất duy nhất thực thi ở tốc độ suy luận tối đa.
+
+Thiết lập các đường ống tích hợp liên tục tự động để tinh chỉnh mô hình đảm bảo triển khai mô hình có thể tái tạo. Các quy trình CI nên thực hiện kiểm tra xác thực tập dữ liệu, kích hoạt các công việc tinh chỉnh tự động trên các worker GPU đám mây, đánh giá độ phức tạp đầu ra so với các điểm chuẩn thử nghiệm và tự động đăng ký các tạo phẩm GGUF đã xác thực vào các kho lưu trữ mô hình trung tâm.
+
+Giám sát hiệu suất suy luận và chất lượng đầu ra trên các điểm cuối đã tinh chỉnh được triển khai cung cấp phản hồi hoạt động liên tục. Theo dõi các số liệu độ trễ, tín hiệu phản hồi của người dùng và tốc độ tạo mã thông báo đảm bảo mô hình tùy chỉnh của bạn duy trì chất lượng dịch vụ cao dưới tải công việc sản xuất thực tế.
+
+Bằng cách kết hợp hiệu quả tham số LoRA, tăng tốc nhân Triton của Unsloth và các quy trình xuất GGUF có cấu trúc, bạn thiết lập một đường ống tùy chỉnh mô hình từ đầu đến cuối. Ngăn xếp công nghệ này trao quyền cho các nhóm phần mềm thích ứng các mô hình mã nguồn mở một cách hiệu quả mà không yêu cầu cơ sở hạ tầng cụm GPU đắt tiền.
+
+## Bạn cũng có thể thích
+
+- [Chạy các Mô hình AI cục bộ với Ollama: Hành trình của tôi từ Hóa đơn máy chủ đến Phát triển ưu tiên quyền riêng tư](/en/blog/running-local-ai-models-ollama)
+- [vLLM vs Ollama: Thông lượng LLM cục bộ & Điểm chuẩn GPU](/en/blog/vllm-vs-ollama-local-llm-benchmarking)
+- [Bộ nhớ đệm ngữ nghĩa với Redis và Qdrant để Giảm chi phí LLM](/en/blog/semantic-caching-redis-qdrant-llm-cost-reduction)
+- [Xây dựng giao diện người dùng dựa trên ý định: Tương lai của phát triển giao diện người dùng](/en/blog/intent-based-ui-architecture)

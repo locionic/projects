@@ -1,0 +1,345 @@
+---
+title: "FastAPIとLitestar（2026年版）：パフォーマンスとベンチマーク"
+images:
+  - '/static/images/fastapi-vs-litestar-comparison.png'
+  - '/static/images/fastapi-vs-litestar-comparison-featured.jpg'
+  - '/static/images/fastapi-vs-litestar-comparison-architecture.jpg'
+  - '/static/images/fastapi-vs-litestar-comparison-dependency-injection.jpg'
+  - '/static/images/fastapi-vs-litestar-comparison-dto-patterns.jpg'
+  - '/static/images/fastapi-vs-litestar-comparison-benchmarks.jpg'
+date: '2026-07-29'
+lastUpdated: '2026-09-08'
+tags: ["python", "fastapi", "performance", "microservices"]
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "Python"
+summary: "FastAPIとLitestar（2026年版）のRPSスループット（28,500 vs 14,200）、p99レイテンシ、dependency injection、Pydantic v2パフォーマンスを比較する詳細なベンチマーク。"
+authors: ['default']
+category: Tech
+---
+
+
+コードレビューで「FastAPIとLitestar、どちらを使うべきか？」と何度も聞かれました。何を最適化したいのかが分からなければ、明確な答えは出ません。
+
+**FastAPI**は現行の主流です。習得が容易で、Pydanticに支えられ、Starletteの上に構築されています。迅速な出荷が必要なチームにとって頼りになる存在です。**Litestar**（旧Starlite）は挑戦者です。クラスベースのコントローラーモデル、事前コンパイルされた依存性注入、および`msgspec`シリアライゼーションを中心に構築された独立したASGIフレームワークで、高スループットのエンタープライズワークロード向けにゼロから設計されています。どちらを最大限に活用するためには、[Pythonの並行処理モデル](/en/blog/multi_thread_process_and_coroutine)を理解し、[厳格なMypy型チェック](/en/blog/advanced-mypy-strict-type-checking)を適用することが前提となります。
+
+このガイドでは、アーキテクチャの違い、依存性注入、DTO、実世界のベンチマーク、そしていつ切り替える価値があるのかについての最終的な評価を扱います。
+
+<AudioPlayer src="/static/audio/fastapi-vs-litestar-comparison.mp3" title="エグゼクティブオーディオブリーフィング" />
+
+## FastAPI vs Litestar: クイック比較 (2026)
+
+| 機能 | FastAPI | Litestar |
+| :--- | :--- | :--- |
+| **スループット（単純なJSON）** | 14,200 RPS | 28,500 RPS (+100%) |
+| **p99レイテンシ** | 18.4 ms | 8.2 ms (-55%) |
+| **ワーカーあたりのメモリ** | 85 MB | 58 MB (-31%) |
+| **シリアライゼーション** | Pydantic v2 (Rustベース) | msgspec (Cレベル) |
+| **ルーティング** | Starlette正規表現ツリー | 事前コンパイルされたディスパッチテーブル |
+| **依存性注入** | 動的（リクエストごと） | 起動時に事前コンパイル |
+| **コントローラー形式** | 関数ベース | クラスベース (OOP) |
+| **エコシステムの成熟度** | ⭐⭐⭐⭐⭐ 巨大 | ⭐⭐⭐ 成長中 |
+| **組み込みレート制限** | ❌ サードパーティ | ✅ 組み込み |
+| **組み込みキャッシュ** | ❌ サードパーティ | ✅ 組み込み |
+| **組み込みPrometheus** | ❌ サードパーティ | ✅ 組み込み |
+| **学習曲線** | 低い | 中程度 |
+| **最適な用途** | 迅速なプロトタイピング、大規模チーム | 高トラフィックマイクロサービス、エンタープライズ |
+
+**TL;DR 結論:** 開発速度とエコシステムの広さを重視するなら**FastAPI**を選びましょう。生のスループット、低いメモリフットプリント、またはサードパーティプラグインなしでエンタープライズ機能が必要な場合は**Litestar**を選びましょう。APIが約5,000 RPSを超えるリクエストを処理する場合や、コストに敏感なコンテナで実行される場合、Litestarのパフォーマンス上の利点はクラウド料金に明確に現れます。
+
+<ArticleSeries
+  name="高性能Pythonバックエンドシリーズ"
+  current={1}
+  articles={[
+    { title: "FastAPI vs Litestar: パフォーマンス、ベンチマーク、そして切り替え時", href: "/en/blog/fastapi-vs-litestar-comparison" },
+    { title: "高並行処理のためのPython FastAPIの最適化", href: "/en/blog/optimizing-fastapi-high-concurrency" },
+    { title: "FastAPI vs Celery: バックグラウンドタスク vs 分散キュー", href: "/en/blog/fastapi-vs-celery-background-tasks" },
+    { title: "Python Asyncio ディープダイブ: イベントループと並行処理パターン", href: "/en/blog/python-asyncio-deep-dive" }
+  ]}
+/>
+
+---
+
+## 高負荷時のアーキテクチャ: Starlette vs 独立したASGI
+
+FastAPIとLitestarのアーキテクチャは、高負荷時に異なります。Litestarはコンパイルされたmsgspecシリアライゼーション層と明示的なコントローラークラス階層に依存する一方、FastAPIはStarletteとPydanticのバリデーションループに依存します。
+
+![フレームワークアーキテクチャ比較](/static/images/fastapi-vs-litestar-comparison-architecture.jpg)
+
+FastAPIは、StarletteとPydanticの上に直接構築された軽量なオーケストレーション層として機能します。受信HTTPリクエストがFastAPIエンドポイントに到達すると、フレームワークはStarletteのミドルウェアスタックを介してリクエストをルーティングし、シグネチャ型アノテーションを検査し、ペイロードの解析をPydantic v2に委譲します。Pydantic v2はRustベースのコアバリデーションループを導入しましたが、FastAPIは依然として、受信するすべてのリクエストでリクエストのバリデーションと依存関係ツリーを動的に処理します。対照的に、LitestarはStarletteから独立したASGIフレームワークとして設計されました。Litestarは、アプリケーションの起動時にルートハンドラー、依存関係ツリー、およびシリアライゼーションパイプラインを最適化された実行グラフにコンパイルし、リクエスト処理中の動的なリフレクションオーバーヘッドを排除します。ソフトウェアエンジニアリングチームは、リクエストハンドラーが厳格なレイテンシSLAターゲットを満たすことを確認するためにフレームワークをベンチマークします。起動時のコンパイルが、大量のトラフィックスパイク下で大幅なパフォーマンス上の利点をもたらすことは明らかです。
+
+以下のコードスニペットは、FastAPIの関数ルートとLitestarのオブジェクト指向コントローラー構造の対比を示しています。
+
+```python
+# FastAPI Route Definition Pattern
+from fastapi import FastAPI, Depends, HTTPException, status
+from pydantic import BaseModel
+
+app = FastAPI(title="FastAPI Enterprise Gateway")
+
+class UserRequest(BaseModel):
+    username: str
+    email: str
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    email: str
+
+@app.post("/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+async def create_user(payload: UserRequest) -> UserResponse:
+    # FastAPI resolves request parsing and Pydantic response serialization dynamically
+    return UserResponse(id=101, username=payload.username, email=payload.email)
+```
+
+対照的に、Litestarは、関連するエンドポイントハンドラーを論理的にグループ化し、明示的なデータ転送オブジェクトを宣言するクラスベースのコントローラーパターンを推奨しています。
+
+```python
+# Litestar Controller Definition Pattern
+from litestar import Litestar, Controller, post, status_codes
+from msgspec import Struct
+
+class UserPayload(Struct):
+    username: str
+    email: str
+
+class UserRecord(Struct):
+    id: int
+    username: str
+    email: str
+
+class UserController(Controller):
+    path = "/users"
+
+    @post(status_code=status_codes.HTTP_201_CREATED)
+    async def create_user(self, data: UserPayload) -> UserRecord:
+        # Litestar leverages msgspec C-struct serialization for ultra-fast JSON execution
+        return UserRecord(id=101, username=data.username, email=data.email)
+
+app = Litestar(route_handlers=[UserController])
+```
+
+Pydanticに加えてネイティブの`msgspec`シリアライゼーションをサポートすることで、Litestarは並行アプリケーションワークロード下で大幅に高速なJSONエンコーディングおよびデコーディングスループットを実現します。マイクロサービスが高容量のJSONペイロードを処理する場合、`msgspec`コンパイル済み構造体を使用すると、即座にスループットが向上します。コンパイル済みバイナリ構造体を使用すると、応答シリアライゼーションのオーバーヘッドが劇的に減少することがわかるでしょう。
+
+生のシリアライゼーションを超えて、Litestarのコントローラー階層により、チームはコントローラーレベルでパスパラメータ、ガード、および依存関係を定義できます。FastAPIでは、パスプレフィックスと依存関係は個々のルーターで再宣言するか、グローバルに適用する必要があります。
+
+さらに、Litestarのルーターコンパイラは、アプリケーションの起動時にルートシグネチャを検証します。ハンドラーが未定義の依存関係または誤設定されたパスパラメータを参照している場合、最初の本番HTTPリクエストまでサイレントに失敗するのではなく、起動中に例外を発生させます。
+
+## 依存性注入: 動的解決 vs 事前コンパイルされたグラフ
+
+Litestarの依存性注入は、HTTPリクエストごとに依存性グラフを再計算するのではなく、アプリケーションの起動時に依存性ツリーを解決することで、FastAPIのサブ依存性よりも優れたパフォーマンスを発揮します。
+
+![依存性注入の解決](/static/images/fastapi-vs-litestar-comparison-dependency-injection.jpg)
+
+依存性注入は、APIエンドポイント全体でデータベース接続、認証プロバイダー、およびビジネスサービスインスタンスを管理するために不可欠です。FastAPIは、`Depends()`で宣言された関数パラメータのデフォルトを使用して依存性注入を実装します。エンドポイントが実行されると、FastAPIは依存性ツリーを再帰的に走査し、サブ依存性を解決し、リクエストのライフタイム中に結果インスタンスをキャッシュします。小規模なアプリケーションでは直感的ですが、深くネストされたFastAPIのサブ依存性チェーンは、受信するすべてのHTTPリクエストで測定可能なCPUオーバーヘッドを発生させます。Litestarは、アプリケーションの起動時に依存性グラフ全体を事前コンパイルするという根本的に異なるアプローチを採用しています。高ボリュームサービスを設計するソフトウェアアーキテクトは、サブミリ秒のルートディスパッチオーバーヘッドを維持するために、事前コンパイルされた依存性解決を優先します。負荷がかかった状態での依存性解決速度をベンチマークしたことがない場合、動的なリフレクションがどれほどのレイテンシを追加することに驚くでしょう。
+
+データベースセッションと認証ガードを設定する際の、両フレームワーク間の依存関係宣言パターンの比較を以下に示します。
+
+```python
+# FastAPI Dependency Injection Pattern
+from typing import AsyncGenerator
+from fastapi import Depends
+
+async def get_db_session() -> AsyncGenerator[str, None]:
+    session = "PostgreSQL_Session_Handle"
+    try:
+        yield session
+    finally:
+        pass
+
+async def get_current_user(db: str = Depends(get_db_session)) -> dict[str, str]:
+    # FastAPI inspects and evaluates get_db_session dynamically per request
+    return {"user_id": "42", "db": db}
+```
+
+Litestarは、明示的な`Provide`ファクトリを使用してアプリケーションレベルまたはコントローラーレベルで依存関係を管理し、依存関係を効率的に解決します。
+
+```python
+# Litestar Dependency Injection Pattern
+from litestar import Litestar, get
+from litestar.di import Provide
+
+async def provide_db_session() -> str:
+    return "PostgreSQL_Session_Handle"
+
+async def provide_current_user(db_session: str) -> dict[str, str]:
+    # Litestar resolves dependency graph linkages at application boot time
+    return {"user_id": "42", "db": db_session}
+
+@get("/profile", dependencies={"current_user": Provide(provide_current_user)})
+async def get_profile(current_user: dict[str, str]) -> dict[str, str]:
+    return current_user
+
+app = Litestar(
+    route_handlers=[get_profile],
+    dependencies={"db_session": Provide(provide_db_session)}
+)
+```
+
+依存関係解決パスを事前コンパイルすることで、Litestarはランタイムパラメータ検査のオーバーヘッドなしに、解決された依存関係をハンドラシグネチャに注入できます。バックエンドアーキテクチャがマイクロサービス全体で深い依存関係グラフに依存している場合、事前コンパイルされた解決は、顕著なリクエストレイテンシオーバーヘッドを排除します。高並行マイクロサービス向けに、起動時依存関係解決に移行するエンジニアリングチームが増えています。
+
+単体テストの場合、Litestarは分離されたテストアプリケーションインスタンスでのローカライズされた依存関係オーバーライドをサポートしています。対照的に、FastAPIはグローバルな`app.dependency_overrides`辞書を変更する必要があり、並行テスト実行間で状態リークバグを引き起こす可能性があります。
+
+Litestarは、明示的なライフサイクルスコープ（リクエストスコープとアプリケーションシングルトンスコープ）もサポートしており、リクエストライフサイクル全体で高価なサービスの不要な再インスタンス化を防ぎます。
+
+## データシリアライゼーション: Pydanticモデル vs msgspec構造体とDTO
+
+Litestarのデータ転送オブジェクト（DTO）は、冗長なPydanticモデル宣言を必要とせずに、データベースエンティティモデルとリクエストペイロードスキーマを自動的に分離します。
+
+![DTOスキーマ生成](/static/images/fastapi-vs-litestar-comparison-dto-patterns.jpg)
+
+FastAPIで構築されたエンタープライズアプリケーションでは、開発者は単一のドメインエンティティに対して`UserCreate`、`UserUpdate`、`UserResponse`、`UserInDB`といった複数のPydanticモデルを作成することがよくあります。これは、大規模なプロジェクトリポジトリ全体でボイラープレートコードの重複につながります。Litestarは、データ転送オブジェクト（DTO）を導入することで、スキーマの冗長性に対処します。Litestar DTOは、既存のSQLAlchemyモデルまたはDataclassを検査し、手動でのモデルの重複なしに、入力解析ルールと出力フィルタリングスキーマを自動的に生成します。データベース駆動型アプリケーションを構築するソフトウェア開発者は、CRUD操作全体でスキーマ定義を合理化するためにDTOを利用します。DTOプラグインがフィールドフィルタリングを自動的に処理する場合、個別の入力スキーマと出力スキーマを維持する時間を無駄にしないでください。
+
+宣言的なSQLAlchemy ORMモデルから、Litestarがリクエストおよびレスポンススキーマを直接自動的に導出する方法を考えてみましょう。
+
+```python
+# Litestar Automatic DTO Pattern from SQLAlchemy Model
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from litestar.plugins.sqlalchemy import SQLAlchemyDTO, SQLAlchemyDTOConfig
+from litestar import Litestar, post
+
+class Base(DeclarativeBase):
+    pass
+
+class UserEntity(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str]
+    password_hash: Mapped[str]  # Sensitive field that shouldn't leak in responses
+
+# Configure DTO to exclude sensitive attributes automatically during JSON serialization
+class UserWriteDTO(SQLAlchemyDTO[UserEntity]):
+    config = SQLAlchemyDTOConfig(exclude={"id", "password_hash"})
+
+@post("/users", dto=UserWriteDTO)
+async def create_user_endpoint(data: UserEntity) -> UserEntity:
+    # Litestar automatically validates input against non-excluded fields
+    return data
+```
+
+Litestar DTOを使用すると、シリアライゼーション契約をデータベースエンティティ定義と同期させることで、モデルのメンテナンスオーバーヘッドが削減されます。DTOの自動化を使用しない場合、データベースモデル属性を更新するには、コードベース全体の複数のPydanticスキーマファイルを手動で更新する必要があります。これは、数十のORMモデルを管理するバックエンドチームにとって、生産性を大幅に向上させます。
+
+Litestar DTOは、ネストされたリレーションシップもすぐに処理します。リレーションシップを持つORMモデルをシリアライズする場合、DTO設定は最大ネスト深度とフィールド除外を強制し、偶発的なデータベースN+1クエリトリガーを防ぎます。
+
+部分的な更新（`PATCH`ルート）も同様に合理化されています。`partial=True`を設定すると、すべてのエンティティ属性が自動的にオプションフィールドに変換され、個別の`*Update` Pydanticスキーマを作成および維持する必要がなくなります。
+
+## ベンチマーク結果: スループット、p99レイテンシ、メモリフットプリント
+
+Litestarは、最適化されたASGI応答処理とmsgspecを介した高速JSON解析により、高並行ベンチマークで優れたリクエストスループットと低いレイテンシメトリクスを提供します。
+
+![スループットとレイテンシのベンチマーク](/static/images/fastapi-vs-litestar-comparison-benchmarks.jpg)
+
+FastAPIとLitestarの実際のパフォーマンスの違いを評価するために、`wrk`を使用して同一のJSONエンドポイントルートに対してHTTP負荷テストベンチマークを実行しました。テスト環境は、Uvicorn ASGIワーカーを備えた8コアLinuxサーバーでPython 3.13を実行しました。各テストシナリオでは、500の同時接続ストリーム全体でリクエストスループット（1秒あたりのリクエスト数）とレイテンシ分布を評価しました。パフォーマンス評価ベンチマークを実施するエンジニアリングチームは、ピークトラフィック負荷下での高パーセンタイルレイテンシテールに細心の注意を払います。合成トラフィックスパイク下でAPIゲートウェイをテストしていない場合、ライブ本番デプロイメントまでレイテンシのボトルネックが隠されたままになる可能性があります。
+
+ベンチマーク結果は、フレームワークアーキテクチャ間の明確なパフォーマンスの違いを示しています。
+
+| 評価指標 | FastAPI (Pydantic v2 + Starlette) | Litestar (msgspec + 事前コンパイルされたDI) | パフォーマンス差異 |
+| :--- | :--- | :--- | :--- |
+| 単純なJSONスループット | 14,200 RPS | 28,500 RPS | Litestarが100%高速 |
+| 高並行レイテンシ (p99) | 18.4 ms | 8.2 ms | Litestarが55%低レイテンシ |
+| ワーカーあたりのメモリ使用量 | 85 MB | 58 MB | Litestarが31%メモリ削減 |
+| 複雑なDTO検証スループット | 8,100 RPS | 19,400 RPS | Litestarが139%高速 |
+
+FastAPIは小規模プロジェクト向けに優れた開発者エルゴノミクスを提供しますが、Litestarのアーキテクチャは、スループットが重要なマイクロサービス向けに優れたスケーラビリティを提供します。
+
+```python
+# Litestar High Performance Route Definition with msgspec Structs
+from litestar import Litestar, get
+from msgspec import Struct
+
+class TelemetryPoint(Struct):
+    sensor_id: int
+    temperature: float
+    status: str
+
+@get("/telemetry")
+async def get_telemetry() -> list[TelemetryPoint]:
+    # msgspec serializes Struct lists directly to JSON bytes at native C speeds
+    return [
+        TelemetryPoint(sensor_id=1, temperature=22.5, status="NORMAL"),
+        TelemetryPoint(sensor_id=2, temperature=88.1, status="WARNING")
+    ]
+
+app = Litestar(route_handlers=[get_telemetry])
+```
+
+FastAPIとLitestarのどちらを選択するかは、チームのエコシステムの優先順位、既存のライブラリの習熟度、および生のランタイムパフォーマンス目標によって異なります。
+
+生の処理能力を超えて、Litestarのメモリ効率は、クラウド環境でコンテナ化されたマイクロサービスをホストする場合に大きな利点をもたらします。`msgspec`構造体はPydanticモデルよりも少ない内部CPythonオブジェクトヘッダーを割り当てるため、Litestarワーカープロセスは、持続的な高並行トラフィックバースト中に低いメモリフットプリントを維持します。そのため、高ボリュームのマイクロサービスは、Litestarのコンパイル済みメモリモデルから大きな恩恵を受けます。
+
+Litestarは、応答処理中の途中データ変換も回避します。エンドポイントが生のバイトまたは`msgspec`構造体を返す場合、データを中間Python辞書に変換することなく、バイナリ応答をASGIサーバーに直接ストリーミングします。
+
+Starletteの正規表現ツリートラバーサルをすべてのURLディスパッチで回避する事前コンパイルされたルーティングテーブルと組み合わせることで、CPUオーバーヘッドは激しい接続スパイク下でも最小限に抑えられます。
+
+<InfoAlert title="本番環境でのASGIメモリリークの診断">
+  ベースラインのメモリフットプリントが低い場合でも、どちらのフレームワークの長時間実行されるASGIワーカーも、未解決のバックグラウンドタスクやぶら下がったジェネレータフレームによって影響を受ける可能性があります。持続的な負荷の下でワーカーが徐々にRSSの増加を示す場合、`tracemalloc`と`memray`を使用して参照リークと循環参照を分離し、オートスケーリングインスタンスの前に、**[本番環境での非同期Pythonメモリリークのプロファイリング](/en/blog/python-async-memory-leak-profiling)**に関する包括的なガイドを参照してください。
+</InfoAlert>
+
+## エコシステム、ミドルウェア、サードパーティ統合
+
+フレームワークの生のパフォーマンスは戦いの半分に過ぎません。ライブラリ、データベースコネクタ、ミドルウェアといった周辺エコシステムが、チームが機能をどれだけ迅速に出荷できるかを決定することがよくあります。
+
+### FastAPIエコシステムの利点
+FastAPIは2018年から存在しており、巨大で成熟したエコシステムを築き上げてきました。Azure ADとのOAuth2統合、ニッチなグラフデータベースへの接続、Prometheusメトリクスの追加が必要な場合、PyPIにはほぼ間違いなく十分にメンテナンスされた`fastapi-*`パッケージが存在します。
+
+FastAPIがStarletteに依存しているということは、Starletteのミドルウェア（`CORSMiddleware`、`SessionMiddleware`、レートリミッターなど）がそのまま動作することを意味します。さらに、StackOverflowの回答やGitHubのIssueの膨大な量は、不明瞭な問題のデバッグをはるかに容易にします。
+
+### Litestarの統合アプローチ
+Litestarは比較的新しいため、サードパーティのエコシステムは小さいです。しかし、これを補うために、**多くの重要なエンタープライズ機能をコアフレームワークに直接バンドルしています**。
+
+断片化されたサードパーティパッケージに依存する代わりに、Litestarには、公式で高度に最適化された実装が含まれています。
+- **レート制限:** 設定可能なレート制限バックエンドを内蔵。
+- **サーバーサイドセッション:** Redis、Memcached、またはファイルバックエンドによるネイティブセッション管理。
+- **キャッシュ:** TTL制御を備えたファーストクラスの応答キャッシュメカニズム。
+- **Prometheusメトリクス:** 外部ラッパーなしのネイティブインストゥルメンテーション。
+- **SQLAlchemy 2.0統合:** セッションライフサイクルを自動的に処理する高度なプラグインサポート。
+
+多くのチームにとって、これらの機能がコアフレームワーク開発者によって公式にメンテナンスされていることは、新しいフレームワークのリリースと同期が取れなくなる可能性のある5つの異なるサードパーティFastAPIプラグインを組み合わせるよりも好ましいことです。
+
+<InfoAlert title="高スループットPythonサービスにおけるデータベースの並行処理">
+  FastAPIまたはLitestarの高スループットASGIワーカーは、接続プール競合とデータベースロックによってボトルネックになることがよくあります。アーキテクチャが組み込み永続性またはマイクロサービスストレージを使用している場合、Python用に最適化された接続コードを生成するインタラクティブな**[SQLite Production PRAGMA Configurator](/en/tools/sqlite-configurator)**を特徴とする、**[本番環境でのSQLite: WALモード、高並行処理、およびPRAGMA](/en/blog/sqlite-wal-mode-production-concurrency)**に関する詳細な解説を参照してください。
+</InfoAlert>
+
+## 決定マトリックス: FastAPIとLitestarの選択時期
+
+**FastAPIを選択する場合:**
+- 小規模から中規模のAPIを構築しており、信じられないほど迅速に開発を進める必要がある場合。
+- 特定のサードパーティエコシステムプラグイン（`fastapi-users`や`fastapi-sso`など）に依存している場合。
+- チームがすでにPydanticとStarletteに非常に習熟している場合。
+- コミュニティサポート、チュートリアル、およびジュニア開発者のオンボーディングの容易さを優先する場合。
+
+**Litestarを選択する場合:**
+- サブミリ秒のレイテンシが重要な、大規模で高トラフィックのエンタープライズマイクロサービスを設計している場合。
+- Pydanticよりも`msgspec`の極端な速度を利用したい場合。
+- 散在する関数ベースのルーターよりも、明示的なクラスベースのオブジェクト指向コントローラーパターンを好む場合。
+- コアフレームワークに直接組み込まれたエンタープライズ機能（キャッシュ、レート制限、DTOなど）を望み、サードパーティプラグインに依存したくない場合。
+
+<InfoAlert title="最新のPython並行処理とアーキテクチャを習得する">
+  本番レベルの非同期Python、サブミリ秒のシリアライゼーション、型システム、Python 3.13以降のフリースレッド実行を習得したいですか？無料のインタラクティブコース「**[エンジニアのためのモダンPython: ゼロから本番まで](/en/courses/modern-python-course)**」を探索してください。実践的なアーキテクチャレッスンとインタラクティブなコードサンドボックスが含まれています。
+</InfoAlert>
+
+## 移行手順: FastAPIからLitestarへの移行
+
+FastAPIがボトルネックであることをベンチマークで確認した場合、書き換えのリスクを最小限に抑えるための実用的な移行チェックリストを以下に示します。
+
+1. **Pydanticモデルを保持する:** LitestarはPydantic v2をファーストクラスでサポートしています。すぐにスキーマを書き換える必要はなく、エンドポイントごとに`msgspec`構造体へ段階的に移行できます。
+2. **関数ルートをコントローラークラスに変換する:** 関連する`@app.get` / `@app.post`ハンドラーを単一の`Controller`サブクラスにグループ化します。これは最大の構造変更ですが、大規模なコードベースでは効果を発揮します。
+3. **`Depends()`を`Provide()`に置き換える:** Litestarの`Provide()`ファクトリはFastAPIの`Depends()`と似ていますが、ルートごとではなくコントローラー/アプリケーションレベルで登録されます。
+4. **例外ハンドラーをルーターレベルに移動する:** `app.add_exception_handler(...)`の代わりに、Litestarは`exception_handlers={ExceptionClass: handler_fn}`を`Litestar()`コンストラクタまたは`Controller`ごとに使用します。
+5. **`TestClient`でテストする:** Litestarは`httpx`と互換性のある独自の`TestClient`を同梱しています。`from starlette.testclient import TestClient`を`from litestar.testing import TestClient`に置き換えます。
+
+> **プロのヒント:** エンドポイントグループごとに1つずつ移行してください。Litestarの起動時検証により、設定ミスのあるルートは起動時にすぐに失敗するため、段階的な移行の検証が容易になります。
+
+どちらのフレームワークを本番コンテナにパッケージ化する場合でも、ビルド時間は依存関係のコンパイルとホイールのダウンロードで停止することがよくあります。[Astral uvをマルチステージDockerビルドで使用](/en/blog/python-uv-package-manager-guide)し、永続的なBuildKitキャッシュマウントを使用すると、ワーカーイメージサイズを150MB未満に抑え、CIリビルドを2秒未満に短縮できます。
+
+## こちらもおすすめです
+
+- [本番環境でのSQLite: WALモード、高並行処理、そして実証済みのPRAGMA](/en/blog/sqlite-wal-mode-production-concurrency)
+- [本番環境での非同期Pythonメモリリークのプロファイリング](/en/blog/python-async-memory-leak-profiling)
+- [FastAPI vs Celery: BackgroundTasksと分散タスクキューの使い分け](/en/blog/fastapi-vs-celery-background-tasks)
+- [Next.jsでReactハイドレーションエラー418を修正: テキストの不一致と拡張機能 (2026)](/en/blog/nextjs-hydration-errors)
+- [Polars vs Pandas: パフォーマンスとメモリのベンチマーク](/en/blog/polars-vs-pandas-python-performance)
+- [高性能ビルドのためのVitestモノレポ単体テスト](/en/blog/vitest-monorepo-unit-testing-performance)
+- [fireEventの使用をやめる: React Testing Library user-event v14のベストプラクティス](/en/blog/react-testing-library-user-event-best-practices)
+- [本番RAG向けベクターデータベース (2026): Pinecone vs Qdrant vs Milvus vs pgvector](/en/blog/vector-databases-rag)

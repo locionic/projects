@@ -1,0 +1,301 @@
+---
+title: "Hướng dẫn kiến trúc Backend và khóa trạng thái Terraform"
+images:
+  - '/static/images/terraform-state-lock-backend-architecture-featured.jpg'
+  - '/static/images/terraform-state-lock-backend-architecture-overview.jpg'
+  - '/static/images/terraform-state-lock-backend-architecture-dynamodb-lock.jpg'
+  - '/static/images/terraform-state-lock-backend-architecture-s3-backend-config.jpg'
+  - '/static/images/terraform-state-lock-backend-architecture-force-unlock.jpg'
+  - '/static/images/terraform-state-lock-backend-architecture-cicd-pipeline.jpg'
+date: '2026-07-29'
+tags: ["devops", "cloud-computing", "state-management"]
+draft: false
+summary: "Nắm vững quản lý trạng thái từ xa của Terraform: cấu hình khóa backend S3 với DynamoDB, ngăn chặn trôi trạng thái và xử lý các lần chạy pipeline CI/CD đồng thời."
+authors: ['default']
+category: Tech
+---
+
+
+Việc quản lý trạng thái hạ tầng giữa các nhóm kỹ thuật đòi hỏi sự nhất quán tuyệt đối trong vận hành để ngăn chặn các tình huống tranh chấp tài nguyên (race conditions), hỏng tệp trạng thái và ghi đè cấu hình trái phép. Khi nhiều kỹ sư hoặc các quy trình triển khai tự động chạy các thao tác Terraform đồng thời trên cùng một ngăn xếp hạ tầng, các sửa đổi trạng thái không phối hợp có thể làm hỏng vĩnh viễn tệp theo dõi triển khai của bạn. Bằng cách thiết kế một backend trạng thái từ xa với các cơ chế khóa trạng thái chủ động sử dụng Amazon S3 và DynamoDB, bạn đảm bảo tính độc quyền của một người ghi duy nhất trong toàn bộ vòng đời hạ tầng của mình.
+
+<AudioPlayer src="/static/audio/terraform-state-lock-backend-architecture.mp3" title="Tóm tắt âm thanh dành cho giám đốc điều hành" />
+
+## Tại sao khóa trạng thái lại quan trọng trong kiến trúc Terraform sản xuất?
+
+Khóa trạng thái rất quan trọng trong kiến trúc Terraform sản xuất vì nó ngăn chặn việc thực thi đồng thời các thao tác ghi có thể làm hỏng tệp trạng thái của bạn hoặc triển khai các thay đổi hạ tầng xung đột. Khi Terraform thực thi các lệnh như `terraform plan`, `terraform apply` hoặc `terraform destroy`, nó đọc siêu dữ liệu trạng thái, tính toán các phụ thuộc biểu đồ mục tiêu và cập nhật ánh xạ tài nguyên khi hoàn thành. Nếu hai luồng thực thi sửa đổi tệp trạng thái chính xác cùng một mili giây, trạng thái được ghi cuối cùng sẽ bỏ qua các tài nguyên được tạo bởi một trong các luồng, tạo ra các tạo phẩm hạ tầng không được theo dõi trong môi trường đám mây của bạn.
+
+![Tổng quan kiến trúc backend trạng thái từ xa](/static/images/terraform-state-lock-backend-architecture-overview.jpg)
+
+Điểm yếu chính của lưu trữ trạng thái cục bộ nằm ở việc thiếu hoàn toàn khả năng khóa và thực thi kiểm soát truy cập. Lưu trữ tệp trạng thái trên máy phát triển cục bộ hoặc các chia sẻ đĩa không được phiên bản hóa có nghĩa là các thành viên trong nhóm có thể vô tình ghi đè công việc của nhau trong quá trình sửa lỗi khẩn cấp. Các backend từ xa thay thế lưu trữ trạng thái cục bộ bằng các kho đối tượng tập trung và kho khóa phân tán. Trước khi thực thi bất kỳ lệnh nào đọc hoặc thay đổi trạng thái, Terraform liên hệ với dịch vụ khóa từ xa để yêu cầu một mã thông báo khóa độc quyền chứa siêu dữ liệu thực thi, danh tính người vận hành, dấu thời gian và ID khóa duy nhất.
+
+Nếu một người dùng khác hoặc một công việc CI/CD tự động đã giữ khóa đang hoạt động, backend khóa sẽ từ chối yêu cầu mới với một thông báo lỗi ngay lập tức. Việc thực thi CLI Terraform thứ cấp sẽ dừng an toàn mà không sửa đổi tài nguyên hạ tầng hoặc làm hỏng bộ lưu trữ từ xa. Sau khi luồng thực thi đang hoạt động hoàn thành thao tác của nó và đẩy trạng thái cập nhật vào bộ lưu trữ đối tượng, Terraform sẽ tự động giải phóng mã thông báo khóa, cho phép các thao tác đang chờ xử lý có được khóa và tiếp tục tuần tự.
+```
++--------------------+           1. Request Lock          +--------------------+
+| Terraform CLI      | ---------------------------------> | DynamoDB Lock Table|
+| (Engineer / CI/CD) | <--------------------------------- | (LockID Key)       |
++--------------------+         2. Lock Granted (ID)       +--------------------+
+          |                                                         ^
+          | 3. Execute Plan / Apply                                 |
+          v                                                         |
++--------------------+           4. Write State           +--------------------+
+| Cloud Provider API | ---------------------------------> | Amazon S3 Storage  |
+| (AWS / GCP / Azure)|                                    | (State Versioning) |
++--------------------+                                    +--------------------+
+          |                                                         |
+          +---------------------------------------------------------+
+                                 5. Release Lock
+```
+
+## DynamoDB xử lý cơ chế nội bộ thu nhận khóa trạng thái như thế nào?
+
+DynamoDB xử lý cơ chế nội bộ thu nhận khóa trạng thái bằng cách lưu trữ một mục bảng duy nhất với khóa phân vùng có tên `LockID` chứa một chuỗi JSON siêu dữ liệu hoạt động. Khi Terraform khởi tạo một lệnh chống lại backend từ xa S3 được cấu hình với khóa DynamoDB, nó sẽ gửi một hoạt động `PutItem` có điều kiện đến bảng DynamoDB được chỉ định. Biểu thức điều kiện yêu cầu rằng `LockID` chưa tồn tại trong bảng, đảm bảo tính nguyên tử trên các vùng đám mây phân tán.
+
+![Cơ chế khóa trạng thái DynamoDB](/static/images/terraform-state-lock-backend-architecture-dynamodb-lock.jpg)
+
+Nếu khóa mục không có, DynamoDB sẽ chèn bản ghi mới một cách nguyên tử và trả về HTTP 200 OK, cấp cho Terraform quyền độc quyền để tiếp tục đánh giá hạ tầng. Tải trọng JSON được lưu trữ bên trong mục `LockID` ghi lại thông tin chẩn đoán mở rộng về phiên thực thi đang hoạt động. Kiểm tra mục DynamoDB này cho thấy danh tính IAM của người vận hành, tên máy chủ cục bộ, ID tiến trình, dấu thời gian thực thi và lệnh con CLI chính xác đang được thực thi.
+
+Dưới đây là một ví dụ về tải trọng siêu dữ liệu JSON thô được lưu trữ bên trong bản ghi khóa trạng thái DynamoDB:
+
+```json
+{
+  "ID": "e7b1a2c3-4d5e-6f7a-8b9c-0d1e2f3a4b5c",
+  "Operation": "OperationTypeApply",
+  "Info": "Provisioning production EKS cluster nodes",
+  "Who": "deploy-agent@ci-runner-node-04",
+  "Version": "1.8.5",
+  "Created": "2026-07-29T09:28:00Z",
+  "Path": "production/us-east-1/eks/terraform.tfstate"
+}
+```
+
+Khi một tiến trình Terraform cạnh tranh cố gắng chạy trong khi bản ghi này tồn tại trong DynamoDB, yêu cầu `PutItem` có điều kiện của nó sẽ thất bại với lỗi `ConditionalCheckFailedException`. Máy khách nhận được một lỗi CLI có cấu trúc chi tiết ai đang giữ khóa và khi nào nó được tạo:
+
+```
+Error: Error acquiring the state lock
+
+Error message: ConditionalCheckFailedException: The conditional request failed
+Lock Info:
+  ID:        e7b1a2c3-4d5e-6f7a-8b9c-0d1e2f3a4b5c
+  Path:      production/us-east-1/eks/terraform.tfstate
+  Operation: OperationTypeApply
+  Who:       deploy-agent@ci-runner-node-04
+  Version:   1.8.5
+  Created:   2026-07-29 09:28:00 UTC
+
+Terraform acquires a state lock to protect the state from being written by
+multiple users at the same time. Please resolve the issue above and try again.
+```
+
+Sau khi hoàn thành thành công hoạt động hạ tầng, Terraform gửi yêu cầu `DeleteItem` chỉ định chuỗi `LockID` chính xác để xóa bản ghi. Bởi vì DynamoDB đảm bảo tính nhất quán mạnh mẽ cho các thao tác đọc và ghi một mục trong một bảng, không có khoảng thời gian nào cho các tình huống tranh chấp tài nguyên giữa việc kiểm tra khóa và thu nhận khóa, ngay cả khi hàng chục trình chạy build đồng thời kích hoạt.
+
+## Bạn cấu hình kiến trúc Backend S3 và DynamoDB trong HCL như thế nào?
+
+Bạn cấu hình kiến trúc backend S3 và DynamoDB trong HCL bằng cách định nghĩa một khối `backend "s3"` trong cấu hình Terraform của bạn, chỉ định tên bucket, đường dẫn khóa trạng thái, vùng AWS, yêu cầu mã hóa và tên bảng DynamoDB. Việc chuẩn hóa định nghĩa backend này trên tất cả các module hạ tầng đảm bảo rằng mọi môi trường đều cách ly các tệp trạng thái trong các khóa tiền tố bucket chuyên dụng trong khi tham chiếu một bảng khóa dùng chung.
+
+![Cấu hình Backend S3 và DynamoDB](/static/images/terraform-state-lock-backend-architecture-s3-backend-config.jpg)
+
+Trước khi trỏ cấu hình Terraform của bạn đến bộ lưu trữ từ xa, bạn phải cung cấp bucket S3 và bảng DynamoDB cơ bản bằng cách sử dụng mã hạ tầng khởi động hoặc các lệnh CLI tự động. Bucket S3 phải có tính năng tạo phiên bản đối tượng được bật để bạn có thể khôi phục các bản sửa đổi trạng thái trước đó trong trường hợp xóa tài nguyên vô tình. Bạn cũng nên thực thi mã hóa phía máy chủ bằng các khóa AWS KMS và chặn tất cả quyền truy cập công khai để bảo vệ các biến thông tin xác thực nhạy cảm được lưu trữ bên trong các tệp trạng thái.
+
+Hãy để tôi chỉ cho bạn một cấu hình Terraform sản xuất cung cấp các tài nguyên hạ tầng backend:
+
+```hcl
+resource "aws_s3_bucket" "terraform_state" {
+  bucket        = "company-terraform-state-prod-us-east-1"
+  force_destroy = false
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_s3_bucket_versioning" "terraform_state" {
+  bucket = aws_s3_bucket.terraform_state.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "terraform_state" {
+  bucket = aws_s3_bucket.terraform_state.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_dynamodb_table" "terraform_locks" {
+  name         = "company-terraform-locks"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "LockID"
+
+  attribute {
+    name = "LockID"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+}
+```
+
+Khi các tài nguyên backend này tồn tại trong tài khoản AWS của bạn, hãy tham chiếu chúng trong các module khối lượng công việc của bạn bằng cách sử dụng khối cài đặt `terraform`:
+
+```hcl
+terraform {
+  required_version = ">= 1.5.0"
+
+  backend "s3" {
+    bucket         = "company-terraform-state-prod-us-east-1"
+    key            = "workloads/production/networking/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "company-terraform-locks"
+    encrypt        = true
+  }
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+```
+
+Cấu hình `encrypt = true` yêu cầu các tệp trạng thái phải được mã hóa trong quá trình truyền qua TLS và khi lưu trữ bằng các khóa được quản lý bởi S3. Khi di chuyển một tệp trạng thái cục bộ hiện có sang backend từ xa này, việc chạy `terraform init` sẽ nhắc bạn xác nhận di chuyển trạng thái, tự động tải tệp trạng thái cục bộ hiện có của bạn lên S3 và đăng ký cơ chế khóa trạng thái trong DynamoDB.
+
+## Bạn xử lý các khóa trạng thái bị kẹt một cách an toàn bằng cách sử dụng Force-Unlock như thế nào?
+
+Bạn xử lý các khóa trạng thái bị kẹt một cách an toàn bằng cách sử dụng force-unlock bằng cách chạy `terraform force-unlock <LOCK-ID>` sau khi xác minh rằng không có quá trình triển khai đang hoạt động hoặc công việc CI/CD nào hiện đang sửa đổi hạ tầng. Các khóa bị kẹt thường xảy ra khi một tác nhân build tự động bị tắt đột ngột do hết thời gian chờ, lỗi hết bộ nhớ hoặc mất kết nối mạng trước khi nó có thể gửi yêu cầu `DeleteItem` đến DynamoDB.
+
+![Xử lý các khóa bị kẹt bằng Force-Unlock](/static/images/terraform-state-lock-backend-architecture-force-unlock.jpg)
+
+Trước khi đưa ra lệnh force-unlock, bạn phải thực hiện một cuộc điều tra pháp y kỹ lưỡng để xác nhận rằng khóa thực sự bị bỏ rơi chứ không phải đang được sử dụng tích cực bởi một bước `terraform apply` chạy dài. Kiểm tra siêu dữ liệu được trả về trong thông báo lỗi khóa để xác định tên máy chủ của chủ sở hữu, ID tiến trình và dấu thời gian tạo. Nếu khóa được tạo ba phút trước bởi một tiến trình CI runner đang hoạt động, việc force-unlock nó sẽ gây ra hỏng trạng thái thảm khốc khi runner đang hoạt động cố gắng ghi cập nhật trạng thái cuối cùng của nó.
+
+Thực hiện quy trình xác minh này trước khi thực thi force-unlock:
+
+```bash
+# 1. Query DynamoDB directly to inspect active lock item
+aws dynamodb get-item   --table-name company-terraform-locks   --key '{"LockID": {"S": "company-terraform-state-prod-us-east-1/workloads/production/networking/terraform.tfstate-md5"}}'
+
+# 2. Verify CI runner job status to confirm build container terminated
+gh run view <RUN-ID> --job <JOB-ID>
+
+# 3. Once confirmed abandoned, execute force-unlock with lock ID string
+terraform force-unlock e7b1a2c3-4d5e-6f7a-8b9c-0d1e2f3a4b5c
+```
+
+Nếu bạn không có quyền truy cập trực tiếp vào terminal CLI để chạy `terraform force-unlock`, bạn có thể xóa thủ công mục khóa cũ khỏi bảng DynamoDB bằng Bảng điều khiển quản lý AWS hoặc AWS CLI. Việc định vị mục khớp với đường dẫn tệp trạng thái trong cột khóa chính `LockID` và xóa hàng ngay lập tức khôi phục tính khả dụng của trạng thái trên toàn nhóm của bạn. Tuy nhiên, các chỉnh sửa bảng thủ công bỏ qua nhật ký an toàn nội bộ của Terraform, vì vậy việc chạy `terraform force-unlock` vẫn là phương pháp khắc phục ưu tiên.
+
+Để giảm sự xuất hiện của các khóa bị kẹt trong môi trường tự động, hãy luôn gói các lệnh gọi Terraform CLI của bạn trong các trình xử lý tín hiệu bẫy các tín hiệu chấm dứt tiến trình như `SIGINT` và `SIGTERM`. Đảm bảo rằng các container build chuyển tín hiệu một cách duyên dáng đến tiến trình con Terraform sẽ cho phép máy khách CLI có thời gian thực hiện các quy trình dọn dẹp và giải phóng khóa DynamoDB trước khi container bị hủy.
+
+## Bạn thiết kế kiểm soát đồng thời CI/CD cho các đường ống Terraform như thế nào?
+
+Bạn thiết kế kiểm soát đồng thời CI/CD cho các đường ống Terraform bằng cách cấu hình các nhóm đồng thời quy trình làm việc, áp dụng các quy tắc bảo vệ nhánh nghiêm ngặt và cách ly các tiền tố khóa trạng thái cho mỗi môi trường. Mặc dù khóa trạng thái DynamoDB bảo vệ chống lại các thao tác ghi trạng thái đồng thời, các kiểm soát đồng thời cấp độ quy trình làm việc ngăn chặn việc xếp hàng đường ống không cần thiết, tính toán kế hoạch dư thừa và xung đột thứ tự triển khai bên trong GitHub Actions hoặc GitLab CI pipelines.
+
+![Kiểm soát đồng thời CI CD cho Terraform](/static/images/terraform-state-lock-backend-architecture-cicd-pipeline.jpg)
+
+Trong GitHub Actions, khối `concurrency` cho phép bạn nhóm các lần chạy quy trình làm việc dựa trên các biến dùng chung như tên môi trường hoặc tiền tố đường dẫn trạng thái. Đặt `cancel-in-progress: false` đảm bảo rằng các bước triển khai đang chạy hoàn thành sạch sẽ mà không bị hủy giữa chừng, điều này sẽ để lại các tài nguyên đám mây mồ côi và các khóa trạng thái bị kẹt.
+
+Dưới đây là một quy trình làm việc GitHub Actions hoàn chỉnh, được tăng cường sản xuất với các khóa đồng thời phù hợp:
+
+```yaml
+name: Terraform Production Deployment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/production/**'
+
+concurrency:
+  group: terraform-production-lock
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.5
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-actions-terraform-role
+          aws-region: us-east-1
+
+      - name: Terraform Init
+        run: terraform init -working-directory=terraform/production
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -input=false -lock-timeout=10m terraform/production
+```
+
+Lưu ý việc sử dụng `-lock-timeout=10m` trong bước `terraform apply`. Theo mặc định, nếu Terraform gặp một khóa trạng thái đang hoạt động, nó sẽ thất bại ngay lập tức với một lỗi. Truyền `-lock-timeout=10m` hướng dẫn máy khách CLI liên tục thử lại việc thu nhận khóa trong tối đa mười phút trước khi hết thời gian chờ. Cờ này cho phép các công việc CI tuần tự xếp hàng một cách duyên dáng sau các hoạt động apply chạy dài mà không làm thất bại các bước build.
+
+Thiết kế các đường dẫn khóa trạng thái riêng biệt cho các môi trường khác nhau như phát triển, thử nghiệm và sản xuất đảm bảo cách ly phạm vi ảnh hưởng. Một triển khai vào môi trường phát triển chỉ khóa `workloads/dev/terraform.tfstate`, để các đường ống sản xuất hoàn toàn không bị chặn. Không bao giờ sử dụng lại một tệp trạng thái duy nhất trên nhiều vùng đám mây hoặc môi trường.
+
+## Bạn so sánh các kiến trúc Backend từ xa thay thế giữa các nhà cung cấp đám mây như thế nào?
+
+Bạn so sánh các kiến trúc backend từ xa thay thế giữa các nhà cung cấp đám mây bằng cách đánh giá hỗ trợ khóa trạng thái, tích hợp bảo mật gốc, chi phí và khả năng phục hồi đa vùng. Mặc dù AWS S3 kết hợp với DynamoDB vẫn là tiêu chuẩn công nghiệp, Google Cloud Storage, Azure Blob Storage và Terraform Cloud cung cấp các cơ chế khóa trạng thái gốc riêng biệt giúp loại bỏ nhu cầu về các bảng cơ sở dữ liệu riêng biệt.
+
+Google Cloud Storage (GCS) cung cấp tính nhất quán toàn cầu mạnh mẽ tích hợp sẵn và khóa đối tượng tự động mà không yêu cầu cơ sở dữ liệu phụ trợ. Khi sử dụng `backend "gcs"`, Terraform sử dụng các điều kiện tiên quyết tạo đối tượng gốc của GCS (`if-generation-match`) để đạt được khóa nguyên tử trong các thao tác ghi trạng thái. Điều này đơn giản hóa mã khởi động hạ tầng bằng cách loại bỏ các tài nguyên thứ cấp như bảng DynamoDB.
+
+Azure Blob Storage sử dụng các lease blob gốc để triển khai khóa trạng thái cho `backend "azurerm"`. Khi Terraform khởi tạo các cập nhật trạng thái chống lại các container Azure Blob, nó yêu cầu một lease blob vô hạn 60 giây độc quyền từ Azure Storage REST API. Máy khách liên tục gia hạn lease này trong khi tiến trình CLI chạy và phá vỡ lease khi hoàn thành thành công.
+
+Dưới đây là bảng so sánh đánh giá các tùy chọn backend đám mây chính:
+
+| Nhà cung cấp Backend đám mây | Cơ chế lưu trữ trạng thái | Cơ chế lưu trữ khóa | Hỗ trợ khóa gốc | Độ phức tạp khởi động |
+| :--- | :--- | :--- | :--- | :--- |
+| **AWS S3 + DynamoDB** | Amazon S3 Bucket | Bảng khóa DynamoDB | Yêu cầu bảng phụ trợ | Trung bình (2 tài nguyên) |
+| **Google Cloud (GCS)** | GCS Bucket | Điều kiện tiên quyết GCS gốc | Hỗ trợ gốc tích hợp sẵn | Thấp (1 tài nguyên) |
+| **Azure Blob Storage** | Azure Storage Container | Azure Blob Leases | Hỗ trợ gốc tích hợp sẵn | Thấp (1 tài nguyên) |
+| **Terraform Cloud / HCP** | HashiCorp Managed DB | Công cụ khóa dịch vụ được quản lý | API được quản lý hoàn toàn | Tối thiểu (0 tài nguyên đám mây) |
+
+Việc lựa chọn giữa các kiến trúc backend này phụ thuộc vào dấu chân đám mây chính và các ưu tiên vận hành của nhóm bạn. Các tổ chức đa đám mây hoạt động nhiều trên AWS được hưởng lợi từ S3 và DynamoDB vì nó cung cấp khả năng kiểm toán hoàn chỉnh về quyền truy cập trạng thái thông qua CloudTrail và các luồng DynamoDB. Các nhóm triển khai độc quyền trên Google Cloud hoặc Microsoft Azure nên sử dụng các backend GCS hoặc Azure Blob gốc để giảm thiểu chi phí vận hành.
+
+## Các câu hỏi thường gặp về quản lý khóa trạng thái Terraform là gì?
+
+### Bạn có thể sử dụng backend từ xa S3 mà không cần bảng DynamoDB để khóa trạng thái không?
+
+Có, bạn có thể cấu hình backend S3 mà không cần chỉ định bảng DynamoDB, nhưng khóa trạng thái sẽ bị tắt hoàn toàn. Chạy Terraform mà không có bảng khóa khiến các tệp trạng thái của bạn bị hỏng do ghi đồng thời bất cứ khi nào nhiều người dùng hoặc đường ống CI thực hiện các thao tác đồng thời. Mặc dù thiết lập chỉ S3 hoạt động để kiểm tra cục bộ bởi các nhà phát triển đơn lẻ, môi trường nhóm sản xuất phải luôn ghép nối S3 với bảng DynamoDB để thực thi bảo vệ khóa trạng thái.
+
+### Cần có những quyền nào trong các chính sách IAM để cho phép khóa trạng thái Terraform trong DynamoDB?
+
+Để thực hiện các thao tác khóa trạng thái, chính sách IAM của bạn phải cấp các quyền `dynamodb:GetItem`, `dynamodb:PutItem` và `dynamodb:DeleteItem` trên ARN tài nguyên bảng khóa được chỉ định. Nếu nhóm của bạn sử dụng các khóa KMS tùy chỉnh để mã hóa bảng DynamoDB, bạn cũng phải cấp các quyền `kms:Encrypt`, `kms:Decrypt` và `kms:GenerateDataKey` trên chính sách khóa KMS. Hạn chế quyền ghi trên bảng khóa ngăn chặn người dùng trái phép bỏ qua các kiểm tra khóa.
+
+### Tham số lock-timeout hoạt động như thế nào trong quá trình thực thi Terraform tự động?
+
+Tham số `-lock-timeout` hướng dẫn Terraform CLI liên tục thử lại việc thu nhận khóa trong một khoảng thời gian được chỉ định thay vì thất bại ngay lập tức khi một khóa đang hoạt động. Ví dụ, truyền `-lock-timeout=15m` khiến Terraform ngủ và thăm dò bảng DynamoDB vài giây một lần cho đến khi khóa hiện có được giải phóng hoặc giới hạn mười lăm phút hết hạn. Sử dụng thời gian chờ khóa ngăn chặn các lỗi build tạm thời trong các đường ống CI/CD khi các commit liên tiếp kích hoạt các công việc triển khai nhanh chóng.
+
+### Điều gì xảy ra nếu lệnh terraform apply bị tắt bằng SIGKILL hoặc mất điện?
+
+Nếu một tiến trình `terraform apply` bị tắt đột ngột bằng `SIGKILL` (tín hiệu 9) hoặc bị mất điện máy chủ đột ngột, tiến trình sẽ chấm dứt ngay lập tức trước khi gửi yêu cầu `DeleteItem` đến DynamoDB. Bản ghi khóa vẫn được lưu trữ trong DynamoDB vô thời hạn, khiến các lệnh Terraform tiếp theo thất bại với lỗi khóa trạng thái. Sau khi bạn xác minh rằng máy chủ thực thi đã tắt và không có tiến trình apply nào đang chạy, hãy giải quyết vấn đề bằng cách chạy `terraform force-unlock <LOCK-ID>`.
+
+### Có an toàn khi lưu trữ các bí mật nhạy cảm như khóa API hoặc mật khẩu cơ sở dữ liệu trong các tệp trạng thái Terraform không?
+
+Không, việc lưu trữ các bí mật văn bản thuần túy trong các tệp trạng thái Terraform tạo ra rủi ro bảo mật đáng kể vì các tệp trạng thái chứa đầy đủ các giá trị thuộc tính tài nguyên không được mã hóa ở định dạng JSON. Mặc dù cấu hình mã hóa phía máy chủ trên bucket S3 của bạn bảo vệ các tệp trạng thái khi lưu trữ, bất kỳ ai có quyền đọc bucket S3 đều có thể trích xuất các giá trị nhạy cảm bằng cách sử dụng `terraform output` hoặc phân tích cú pháp JSON trực tiếp. Sử dụng các trình quản lý bí mật như AWS Secrets Manager hoặc HashiCorp Vault để truyền các tham chiếu bí mật động thay vì mã hóa cứng các giá trị bí mật thô trong HCL.
+
+### Bạn có nên tạo một bucket S3 và bảng khóa DynamoDB riêng biệt cho mỗi môi trường không?
+
+Có, nên tạo các bucket S3 và bảng khóa DynamoDB chuyên dụng cho các môi trường riêng biệt như dev, staging và production để thực thi các ranh giới truy cập IAM nghiêm ngặt và giảm thiểu phạm vi ảnh hưởng. Việc cách ly các tệp trạng thái sản xuất trong một tài khoản AWS chuyên dụng ngăn chặn các nhà phát triển cấp dưới có quyền truy cập dev vô tình đọc hoặc sửa đổi các tệp trạng thái sản xuất. Ngoài ra, việc sử dụng các tiền tố bucket riêng biệt trong một bucket backend dùng chung là chấp nhận được đối với các nhóm nhỏ hơn có quyền IAM thống nhất.
+
+### Bạn di chuyển một tệp trạng thái cục bộ hiện có sang backend từ xa S3 với khóa DynamoDB như thế nào?
+
+Bạn di chuyển một tệp trạng thái cục bộ bằng cách thêm khối `backend "s3"` vào cấu hình module gốc của bạn và chạy `terraform init` trong terminal của bạn. Terraform phát hiện rằng bạn đã cấu hình một backend từ xa mới, so sánh tệp trạng thái cục bộ với đích khóa S3 mục tiêu và nhắc bạn xác nhận di chuyển dữ liệu trạng thái cục bộ. Xác nhận lời nhắc sẽ tải `terraform.tfstate` cục bộ của bạn lên S3, đăng ký bảng khóa trong DynamoDB và đổi tên tệp trạng thái cục bộ của bạn thành `terraform.tfstate.backup`.
+
+## Bạn cũng có thể thích
+
+- [Các phương pháp hay nhất về quản lý trạng thái Terraform](/en/blog/terraform-state-management)
+- [Cache Mount và Tối ưu hóa đa giai đoạn của Docker BuildKit](/en/blog/docker-buildkit-cache-mount-optimization)
+- [Astral uv trong Docker: Build đa giai đoạn, BuildKit Caching & CI nhanh](/en/blog/python-uv-package-manager-guide)
+- [FastAPI Docker Multistage Builds: Giảm kích thước hình ảnh của bạn tới 70%](/en/blog/fastapi-docker-multistage-build)

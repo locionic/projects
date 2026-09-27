@@ -1,0 +1,357 @@
+---
+draft: false
+images: ['https://imgbed.locionic.com/file/1784441606582_why-pipes-sometimes-get-stuck-buffering.jpg']
+title: "Tại sao pipe đôi khi bị \"kẹt\": buffering"
+date: '2024-11-29'
+lastUpdated: '2026-09-22'
+tags: ["terminal", "linux"]
+category: Tech
+summary: "Lần đầu tiên terminal của tôi bị treo giữa pipeline, tôi đã mất một giờ để gỡ lỗi sai vấn đề. Đây là những gì thực sự đã xảy ra và cách khắc phục nó trong vài giây."
+---
+
+Bạn xâu chuỗi một vài lệnh Unix lại với nhau để theo dõi nhật ký máy chủ trực tiếp. Cú pháp hoàn hảo:
+
+```bash
+tail -f access.log | grep --color=never "POST /api/checkout" | awk '{print $1, $4, $7}'
+```
+
+Bạn nhấn Enter. Mọi thứ có vẻ đầy hứa hẹn trong một phần nhỏ của giây. Sau đó, im lặng tuyệt đối. Con trỏ nhấp nháy. Bạn biết các yêu cầu đang đến máy chủ vì bảng điều khiển giám sát của bạn đang sáng lên. Tuy nhiên, thiết bị đầu cuối của bạn từ chối phát ra một dòng nào.
+
+Năm phút sau, bạn nhấn `Ctrl+C`. Đột nhiên, một bức tường lớn gồm năm mươi dòng tràn ngập màn hình của bạn cùng một lúc trước khi thiết bị đầu cuối trở về dấu nhắc của bạn.
+
+Bạn vừa bị **đệm I/O** cắn.
+
+<AudioPlayer src="/static/audio/why-pipes-sometimes-get-stuck-buffering.mp3" title="Tóm tắt âm thanh điều hành" />
+
+<Callout type="danger" title="Nghịch lý đệm đường ống">
+Trong việc sử dụng thiết bị đầu cuối tương tác, các chương trình sẽ xóa đầu ra của chúng sau mỗi dòng mới (`\n`). Nhưng ngay khi bạn kết nối đầu ra chuẩn của một chương trình với một đường ống Unix (`|`), thư viện chuẩn C (`libc`) sẽ tự động chuyển từ **đệm dòng** sang **đệm khối hoàn toàn** (thường là 4.096 hoặc 8.192 byte). Không có gì đến được các công cụ hạ nguồn cho đến khi bộ đệm 4KB–8KB đó đầy hoàn toàn.
+</Callout>
+
+Trong hướng dẫn này, chúng ta sẽ bóc tách lớp trừu tượng Unix để kiểm tra cách I/O chuẩn hoạt động bên dưới, xem xét các tầng đệm kernel và userland, và khám phá mọi công cụ và cờ cần thiết để giữ cho các đường ống của bạn truyền tải theo thời gian thực.
+
+---
+
+## Các lớp đệm kép: Userland so với Kernel
+
+Khi khắc phục sự cố độ trễ đường ống, các nhà phát triển thường nhầm lẫn **đệm luồng userland** với **dung lượng đường ống kernel**. Cả hai đều tồn tại, nhưng chúng hoạt động ở các lớp hoàn toàn khác nhau của hệ điều hành.
+
+```
+Process A (User Space)         Kernel Space                   Process B (User Space)
+┌───────────────────────┐      ┌─────────────────────────┐    ┌───────────────────────┐
+│ Application Code      │      │                         │    │ Application Code      │
+│  └─ printf("hello\n") │      │                         │    │  └─ fgets(...)        │
+│          │            │      │                         │    │          ▲            │
+│ ┌────────▼──────────┐ │      │                         │    │ ┌────────┴──────────┐ │
+│ │ libc stdio buffer │ │      │                         │    │ │ libc stdio buffer │ │
+│ │ (4KB - 8KB)       │ │      │                         │    │ │ (4KB - 8KB)       │ │
+│ └────────┬──────────┘ │      │                         │    │ └────────▲──────────┘ │
+└──────────┼────────────┘      │                         │    └──────────┼────────────┘
+           │ write(fd, buf)    │                         │               │ read(fd, buf)
+           ▼                   │                         │               │
+┌──────────────────────────────┴─────────────────────────┴───────────────┴────────────┐
+│ Linux Kernel Pipe Ring Buffer (Default: 65,536 bytes / 16 memory pages)             │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1. Đệm I/O chuẩn Userland (`FILE*` trong libc)
+Thư viện chuẩn C (`glibc`, `musl`) bao bọc các bộ mô tả tệp kernel thô bằng các luồng `FILE*` cấp cao (`stdin`, `stdout`, `stderr`). Các lệnh gọi hệ thống (`write(2)` và `read(2)`) tốn kém về mặt tính toán vì chúng yêu cầu chuyển đổi CPU giữa chế độ người dùng và chế độ kernel.
+
+Để tối ưu hóa thông lượng, `libc` cung cấp ba quy tắc đệm được định nghĩa trong `<stdio.h>`:
+
+- **Không đệm (`_IONBF`)**: Các ký tự được truyền đến kernel ngay lập tức thông qua `write()` ngay sau khi chúng được ghi. `stderr` sử dụng điều này theo mặc định để các thông báo lỗi xuất hiện ngay cả khi tiến trình gặp sự cố ngay sau đó.
+- **Đệm dòng (`_IOLBF`)**: Các ký tự được tích lũy cho đến khi gặp một dòng mới (`\n`), tại thời điểm đó `libc` xóa bộ đệm vào kernel bằng một lệnh gọi `write()` duy nhất.
+- **Đệm hoàn toàn / Đệm khối (`_IOFBF`)**: Các ký tự được tích lũy cho đến khi một bộ đệm có kích thước cố định (được định nghĩa bởi `BUFSIZ`, thường là 4.096 hoặc 8.192 byte) đầy. Các dòng mới được coi là các ký tự thông thường và không kích hoạt việc xóa.
+
+### Cách `libc` quyết định: Lệnh gọi hệ thống `isatty(3)`
+Khi một chương trình khởi động, `libc` gọi `isatty(fileno(stdout))` để kiểm tra nơi đầu ra chuẩn đang trỏ đến:
+
+```c
+// Simplified pseudo-code inside libc initialization:
+if (isatty(STDOUT_FILENO)) {
+    // Standard output is connected to an interactive terminal (PTY/TTY)
+    setvbuf(stdout, NULL, _IOLBF, BUFSIZ); // Line buffering
+} else {
+    // Standard output is redirected to a file or a PIPE (|)
+    setvbuf(stdout, NULL, _IOFBF, BUFSIZ); // Full block buffering!
+}
+```
+
+Điều này giải thích bí ẩn: **Cùng một tệp nhị phân hoạt động khác nhau khi chạy một mình so với khi được đặt trước một đường ống!**
+
+Khi bạn chạy `tail -f file | grep "pattern"`, đầu ra của `grep` không phải là TTY—nó được kết nối với `awk` thông qua một đường ống ẩn danh. Do đó, `grep`'s `libc` tự động chuyển sang đệm khối, giữ lại mọi dòng khớp cho đến khi 4.096 byte tích lũy trước khi chuyển chúng đến `awk`.
+
+---
+
+## Những nghi phạm thường gặp: Cờ dòng lệnh
+
+Hầu hết các tiện ích Unix tiêu chuẩn đều cung cấp các cờ để buộc đầu ra không đệm hoặc đệm dòng. Hãy giữ bảng gian lận này tiện dụng:
+
+| Lệnh | Cờ / Tùy chọn | Mô tả |
+|---|---|---|
+| **`grep`** | `--line-buffered` | Xóa đầu ra trên mỗi dòng mới khớp. |
+| **`sed`** | `-u` hoặc `--unbuffered` | Xóa đầu ra sau khi xử lý mỗi dòng. |
+| **`awk`** | `fflush()` | Xóa rõ ràng đầu ra chuẩn bên trong các câu lệnh in. |
+| **`jq`** | `--unbuffered` | Xóa đầu ra JSON sau mỗi mục được phát ra. |
+| **`tcpdump`** | `-l` | Làm cho stdout đệm dòng để các gói in ngay lập tức trong các đường ống. |
+| **`tr`** | `-u` (trên BSD/macOS) | Dịch không đệm. |
+| **`cut`** | *Không có cờ gốc* | Yêu cầu `stdbuf` hoặc viết lại thông qua `awk`. |
+| **`sort`** | *Không thể trong luồng* | Phải tiêu thụ `EOF` trước khi sắp xếp; không thể truyền các đường ống không giới hạn. |
+
+### Khắc phục đường ống giám sát nhật ký
+
+Hãy xem xét lại đường ống bị kẹt từ phần giới thiệu:
+
+```bash
+# ❌ FROZEN PIPELINE: grep and awk will block-buffer
+tail -f access.log | grep "POST /api/checkout" | awk '{print $1, $4, $7}'
+
+# ✅ REAL-TIME PIPELINE: Instant streaming
+tail -f access.log | grep --line-buffered "POST /api/checkout" | awk '{print $1, $4, $7; fflush()}'
+```
+
+Lưu ý rằng **mọi giai đoạn trung gian** trong đường ống phải không được đệm. Nếu `grep` xóa từng dòng nhưng `awk` đệm khối, đường ống vẫn bị đóng băng tại `awk`.
+
+---
+
+## Khi bạn kiểm soát mã: Các bản sửa lỗi dành riêng cho ngôn ngữ
+
+Nếu bạn viết các tập lệnh trợ giúp tham gia vào các đường ống, hãy cấu hình đệm stdout một cách rõ ràng.
+
+<Stepper>
+  <Step title="Python">
+    Thư viện chuẩn Python mặc định đệm khối khi stdout được chuyển hướng. Bạn có ba cách chính để buộc đệm dòng:
+    
+    1. Truyền cờ `-u`: `python3 -u script.py | consumer`
+    2. Đặt biến môi trường: `export PYTHONUNBUFFERED=1`
+    3. Cấu hình lại stdout theo chương trình bên trong mã của bạn:
+    ```python
+    import sys
+    # Python 3.7+ idiomatic configuration
+    sys.stdout.reconfigure(line_buffering=True)
+    
+    # Or explicitly flush on individual print statements:
+    print("Event processed", flush=True)
+    ```
+  </Step>
+  <Step title="C & C++">
+    Trong C, gọi `setvbuf()` ngay từ đầu `main()`:
+    ```c
+    #include <stdio.h>
+
+    int main(void) {
+        // Force line buffering even when redirected to a pipe
+        setvbuf(stdout, NULL, _IOLBF, 0);
+
+        // Or disable buffering entirely:
+        // setvbuf(stdout, NULL, _IONBF, 0);
+
+        printf("Immediate output\n");
+        return 0;
+    }
+    ```
+    Trong C++, `std::endl` tự động chèn một dòng mới và xóa luồng (`std::cout << "msg" << std::endl;`). Ngoài ra, hãy bật `std::unitbuf`:
+    ```cpp
+    #include <iostream>
+
+    int main() {
+        std::ios_base::sync_with_stdio(false);
+        std::cout << std::unitbuf; // Flushes after every insertion
+        return 0;
+    }
+    ```
+  </Step>
+  <Step title="Node.js & Go">
+    Trong Node.js, `process.stdout.write()` là không đồng bộ trên các luồng POSIX khi ghi vào một đường ống, nhưng Node không thực hiện đệm dòng:
+    ```javascript
+    // In Node.js, process.stdout handles buffering internally.
+    // If you need immediate transmission:
+    process.stdout.write(data + '\n');
+    ```
+    Trong Go, `fmt.Println` chuẩn ghi trực tiếp vào bộ mô tả tệp cơ bản (`os.Stdout`), không đệm theo mặc định. Tuy nhiên, nếu bạn bao bọc stdout trong `bufio.Writer`, hãy đảm bảo bạn xóa:
+    ```go
+    writer := bufio.NewWriter(os.Stdout)
+    writer.WriteString("streaming message\n")
+    writer.Flush() // Essential!
+    ```
+  </Step>
+  <Step title="Ruby & Perl">
+    Trong Ruby:
+    ```ruby
+    $stdout.sync = true # Disables full buffering globally
+    ```
+    Trong Perl:
+    ```perl
+    $| = 1; # Autoflush the currently selected output handle
+    ```
+  </Step>
+</Stepper>
+
+---
+
+## Khi không có cờ: `stdbuf` và `unbuffer`
+
+Điều gì sẽ xảy ra nếu bạn đang sử dụng một tệp nhị phân cũ, một CLI mã nguồn đóng độc quyền hoặc một công cụ như `cut` mà không có cờ đệm dòng?
+
+Bạn có hai tiện ích hệ thống mạnh mẽ:
+
+<ConceptCompare
+  conceptA="stdbuf (GNU Coreutils)"
+  conceptB="unbuffer (Expect)"
+  descriptionA="Chèn một thư viện chia sẻ thông qua LD_PRELOAD để gọi setvbuf() trước khi main() thực thi. Nhẹ, không có chi phí PTY."
+  descriptionB="Khởi tạo lệnh mục tiêu bên trong một thiết bị đầu cuối giả (PTY). Lừa isatty() trả về true. Nặng hơn một chút."
+/>
+
+### 1. `stdbuf` (Giải pháp thanh lịch)
+`stdbuf` là một phần của GNU Coreutils và có sẵn trên hầu hết mọi bản phân phối Linux. Nó sửa đổi đệm luồng mà không cần chạm vào mã nguồn:
+
+- `-i`: Chế độ đầu vào chuẩn (`0` cho không đệm, `L` cho đệm dòng, hoặc một kích thước như `1M`)
+- `-o`: Chế độ đầu ra chuẩn (`0`, `L`, hoặc kích thước)
+- `-e`: Chế độ lỗi chuẩn (`0`, `L`, hoặc kích thước)
+
+```bash
+# Force cut and tr to be line-buffered in a live pipeline
+tail -f access.log | stdbuf -oL cut -d' ' -f1,4,7 | stdbuf -oL tr '[:lower:]' '[:upper:]'
+```
+
+**Cách `stdbuf` hoạt động bên dưới:**
+Khi bạn chạy `stdbuf -oL cmd`, nó đặt biến môi trường `LD_PRELOAD=/usr/lib/coreutils/libstdbuf.so` và truyền `_STDBUF_O=L`. Trước khi hàm `cmd`'s `main()` được gọi, hàm tạo của `libstdbuf.so` thực thi, phân tích cú pháp các biến môi trường và gọi `setvbuf(stdout, NULL, _IOLBF, 0)`. Nó hoàn toàn trong suốt đối với ứng dụng mục tiêu.
+
+### 2. `unbuffer` (Hack PTY phổ quát)
+Nếu một chương trình liên kết tĩnh `libc` (ví dụ: được biên dịch bằng Go hoặc musl) hoặc cố ý đặt lại bộ đệm của chính nó bên trong, `LD_PRELOAD` sẽ không hoạt động.
+
+`unbuffer` (được đóng gói với gói `expect`) tạo một thiết bị đầu cuối giả (PTY) và thực thi chương trình bên trong nó:
+
+```bash
+# Install expect package if not present:
+# sudo apt-get install expect
+
+unbuffer some_stubborn_cli | grep "ERROR"
+```
+
+Vì tiến trình được kết nối với một thiết bị đầu cuối giả, `isatty(STDOUT_FILENO)` trả về `1` (true). Chương trình thực sự tin rằng nó đang hiển thị cho một thiết bị đầu cuối tương tác của con người và tự nhiên bật đệm dòng.
+
+---
+
+## Kiểm tra các đường ống bị kẹt bằng `strace` và `/proc`
+
+Khi một đường ống dường như bị treo trong sản xuất, làm thế nào để bạn xác minh liệu nó đang chờ đầu vào hay bị kẹt trong bộ đệm?
+
+### 1. Theo dõi các lệnh gọi hệ thống bằng `strace`
+Đính kèm `strace` vào PID tiến trình đang chạy để kiểm tra các lệnh gọi hệ thống đang được kích hoạt:
+
+```bash
+# Find the PID of grep in your pipeline
+pgrep -f "grep --color=never"
+
+# Trace read and write system calls
+strace -p <PID> -e trace=read,write
+```
+
+- Nếu bạn thấy `read(0, ...)` trả về dữ liệu liên tục, nhưng **không có lệnh gọi `write(1, ...)` nào**, tiến trình đang nhận dữ liệu và tích lũy nó bên trong bộ đệm `libc` userland!
+- Nếu bạn thấy `write(1, "...", 4096) = 4096` kích hoạt không liên tục theo các khối lớn, đệm khối được xác nhận.
+- Nếu bạn thấy `write(1, "...", 80) = 80` kích hoạt trên mỗi dòng, đường ống của bạn đã được đệm dòng thành công.
+
+### 2. Kiểm tra bộ đệm đường ống Kernel trong `/proc`
+Linux phân bổ một bộ đệm vòng tròn trong kernel cho mỗi đường ống. Bạn có thể kiểm tra dung lượng và mức độ đầy hiện tại của nó trực tiếp thông qua `/proc`:
+
+```bash
+# Look up open file descriptors for the process
+ls -l /proc/<PID>/fd/
+
+# fd 0 -> pipe:[1492023]
+# fd 1 -> pipe:[1492024]
+
+# View pipe metadata and capacity (Linux 2.6.35+)
+cat /proc/<PID>/fdinfo/1
+```
+
+Đầu ra:
+```
+pos:    0
+flags:  01
+mnt_id: 15
+ino:    1492024
+size:   0
+```
+
+Theo mặc định, các đường ống kernel Linux giữ **65.536 byte** (16 trang 4.096 byte). Bạn có thể thay đổi dung lượng đường ống kernel theo chương trình bằng cách sử dụng lệnh gọi hệ thống `fcntl` với `F_SETPIPE_SZ`:
+
+```c
+// Expand pipe capacity to 1MB to prevent upstream producers from blocking
+fcntl(pipe_fd[1], F_SETPIPE_SZ, 1048576);
+```
+
+---
+
+## Tại sao đệm tồn tại: Sự đánh đổi thông lượng
+
+Nếu đệm gây ra độ trễ đường ống, tại sao các hệ điều hành không tắt nó ở mọi nơi theo mặc định?
+
+Câu trả lời là **thông lượng**.
+
+Mỗi lệnh gọi hệ thống đều gây ra chi phí chuyển đổi ngữ cảnh CPU: lưu các thanh ghi người dùng, chuyển sang vòng 0 của kernel, xác thực các con trỏ bộ nhớ, cập nhật trạng thái bộ lập lịch và khôi phục các thanh ghi người dùng.
+
+Hãy xem xét việc xử lý một nhật ký truy cập Apache 10 GB chứa 50 triệu dòng:
+- **Với đệm dòng (Không đệm)**: 50.000.000 lệnh gọi hệ thống `write()` riêng biệt và 50.000.000 lệnh gọi hệ thống `read()`. CPU dành hơn 70% chu kỳ thực thi của nó trong các chuyển đổi ngữ cảnh kernel. Tổng thời gian: ~45 giây.
+- **Với đệm khối 64KB**: Chỉ khoảng 160.000 lệnh gọi hệ thống `write()`. Chi phí lệnh gọi hệ thống giảm xuống gần bằng không, cho phép bộ đệm đĩa và CPU chạy ở băng thông bộ nhớ tối đa. Tổng thời gian: ~3,2 giây.
+
+<Callout type="info" title="Quy tắc vàng của đệm">
+Sử dụng **đệm dòng** cho truyền trực tiếp, theo dõi nhật ký, đường ống tương tác và cảnh báo giám sát nơi độ trễ quan trọng. Sử dụng **đệm khối** cho xử lý hàng loạt, xoay nhật ký, sao lưu và chuyển đổi dữ liệu khối lượng lớn nơi thông lượng là vua.
+</Callout>
+
+---
+
+## Cây quyết định đệm đường ống
+
+```
+Are you processing live/streaming data (e.g. tail -f, tcpdump)?
+│
+├── NO (Batch data, large file) ──► Keep default block buffering (Fastest throughput)
+│
+└── YES (Real-time stream)
+     │
+     ├── Does the tool have a line-buffering flag?
+     │    ├── YES ──► Use grep --line-buffered, sed -u, jq --unbuffered
+     │    └── NO
+     │         ├── Can you edit the source code?
+     │         │    ├── YES ──► Add setvbuf(stdout, NULL, _IOLBF, 0) or flush=True
+     │         │    └── NO
+     │         │         ├── Is dynamically linked glibc?
+     │         │         │    ├── YES ──► Wrap with: stdbuf -oL <cmd>
+     │         │         │    └── NO  ──► Wrap with: unbuffer <cmd>
+```
+
+---
+
+## Kiểm tra kiến thức tương tác
+
+<Quiz
+  question="Tại sao grep chuyển từ đệm dòng sang đệm khối khi được đưa vào awk?"
+  options={[
+    "grep phát hiện rằng awk là một tệp nhị phân được biên dịch tốc độ cao.",
+    "awk gửi tín hiệu SIGPIPE để yêu cầu các khối 8KB.",
+    "Thư viện chuẩn C gọi isatty(1), phát hiện rằng stdout là một đường ống chứ không phải một thiết bị đầu cuối, và chuyển sang _IOFBF.",
+    "Kernel Linux thực thi đệm hoàn toàn trên tất cả các tiến trình có cha là bash."
+  ]}
+  correctIndex={2}
+  explanation="Khi một chương trình C khởi tạo, libc truy vấn isatty(fileno(stdout)). Nếu stdout trỏ đến một thiết bị đầu cuối (TTY), đệm dòng (_IOLBF) được chọn. Khi được chuyển hướng đến một đường ống hoặc tệp, libc chọn đệm khối hoàn toàn (_IOFBF) để tối ưu hóa thông lượng."
+/>
+
+---
+
+## Tóm tắt
+
+Lần tới khi đường ống thiết bị đầu cuối của bạn bị đóng băng trong khi theo dõi một tệp trực tiếp, đừng viết lại đường ống của bạn bằng một ngôn ngữ khác.
+
+Hãy nhớ hai lớp cơ bản:
+1. Các tiện ích tiêu chuẩn đệm khối vì `isatty(3)` là sai.
+2. Khắc phục nó bằng `--line-buffered`, `stdbuf -oL`, hoặc các lệnh gọi xóa dành riêng cho ngôn ngữ.
+
+Việc nắm vững đệm luồng biến các tắc nghẽn đường ống mơ hồ thành các luồng dữ liệu tức thời, có thể quan sát được.
+
+## Bạn cũng có thể thích
+
+- [Các quy tắc bất thành văn của chương trình Terminal](/en/blog/unwritten-rules-of-terminal-programs)
+- [Sử dụng ít bộ nhớ hơn để tra cứu địa chỉ IP trong Go](/en/blog/using-less-memory-to-look-up-ip-addresse)
+- [SSH và SCP: Hai công cụ mà mọi nhà phát triển thực sự nên hiểu](/en/blog/ssh-scp)
+- [Phát triển cục bộ Docker: Hướng dẫn còn thiếu](/en/blog/docker-compose-local-development)

@@ -1,0 +1,315 @@
+---
+title: "Xây dựng RAG sản xuất với pgvector & Hybrid Search"
+date: '2026-09-02'
+lastUpdated: '2026-09-22'
+summary: "Tìm hiểu cách xây dựng kiến trúc Retrieval-Augmented Generation (RAG) mạnh mẽ bằng pgvector cho tìm kiếm kết hợp, kết hợp tìm kiếm vector toàn văn bản và BM25 để đạt độ chính xác truy xuất tốt hơn, điều chỉnh chỉ mục HNSW và triển khai một client Python sản xuất."
+tags: ['ai', 'postgresql', 'backend', 'database']
+draft: false
+images: ['/static/images/pgvector-hybrid-search-rag-guide.png']
+---
+
+Khi xây dựng hệ thống Retrieval-Augmented Generation (RAG), độ chính xác của việc truy xuất là tất cả. Nếu các tài liệu được truy xuất không liên quan, phản hồi của LLM của bạn cũng sẽ không liên quan. Đây là lúc **tìm kiếm lai pgvector** phát huy tác dụng. Bằng cách kết hợp tìm kiếm toàn văn truyền thống với nhúng vector, bạn sẽ có được những điều tốt nhất của cả hai thế giới.
+
+Trong hướng dẫn này, chúng ta sẽ khám phá cách xây dựng kiến trúc RAG sẵn sàng cho sản xuất bằng cách sử dụng PostgreSQL, tiện ích mở rộng `pgvector`, Reciprocal Rank Fusion (RRF) và một client Python hoàn chỉnh — bao gồm điều chỉnh HNSW, phân tích kế hoạch truy vấn và danh sách kiểm tra sản xuất.
+
+Nếu bạn đang khám phá các thành phần ngăn xếp AI khác, hãy nhớ xem tổng quan của chúng tôi về [Công cụ AI](/en/blog/ai-tools).
+
+<AudioPlayer src="/static/audio/pgvector-hybrid-search-rag-guide.mp3" title="Tóm tắt âm thanh điều hành" />
+
+## Kiến trúc RAG
+
+Hãy cùng xem kiến trúc RAG tìm kiếm lai hoạt động như thế nào. Hệ thống thực hiện hai tìm kiếm song song: tìm kiếm vector dày đặc cho ý nghĩa ngữ nghĩa và tìm kiếm từ khóa thưa thớt (BM25) cho các kết quả khớp chính xác. Sau đó, nó hợp nhất các kết quả bằng cách sử dụng Reciprocal Rank Fusion (RRF).
+
+<Mermaid chart={`
+graph TD
+    UserQuery["User Query"] --> EmbedModel["Embedding Model"]
+    UserQuery --> KeywordSearch["PostgreSQL Full-Text Search (BM25)"]
+    EmbedModel --> DenseVector["Dense Vector Embedding"]
+    DenseVector --> VectorSearch["pgvector HNSW Index"]
+    
+    KeywordSearch -..->|Sparse Results| RRF["Reciprocal Rank Fusion (RRF)"]
+    VectorSearch -..->|Dense Results| RRF
+    
+    RRF --> TopK["Top-K Documents"]
+    TopK --> LLM["LLM Synthesis"]
+    LLM --> FinalResponse["Final Response"]
+    
+    classDef main fill:#3b82f6,stroke:#1e40af,stroke-width:2px,color:white;
+    classDef search fill:#10b981,stroke:#047857,stroke-width:2px,color:white;
+    classDef fusion fill:#8b5cf6,stroke:#6d28d9,stroke-width:2px,color:white;
+    
+    class UserQuery,LLM,FinalResponse main;
+    class KeywordSearch,VectorSearch,EmbedModel search;
+    class RRF fusion;
+`} />
+
+## Tìm kiếm dày đặc so với tìm kiếm thưa thớt
+
+Tại sao chúng ta cần một phương pháp tiếp cận lai? Hãy phân tích sự khác biệt giữa tìm kiếm vector ngữ nghĩa và khớp từ khóa truyền thống.
+
+<ConceptCompare 
+  concept1={{
+    title: "Vector dày đặc (Ngữ nghĩa)",
+    description: "Nắm bắt ý nghĩa và ngữ cảnh cơ bản của từ, cho phép khớp khái niệm ngay cả khi các từ chính xác khác nhau.",
+    features: ["Nhận biết ngữ cảnh", "Xử lý tốt các từ đồng nghĩa", "Khả năng đa ngôn ngữ"]
+  }}
+  concept2={{
+    title: "Tìm kiếm thưa thớt (BM25)",
+    description: "Khớp các từ khóa chính xác và tính toán mức độ liên quan dựa trên tần suất thuật ngữ và tần suất tài liệu nghịch đảo.",
+    features: ["Khớp từ khóa chính xác", "Tuyệt vời cho các ID hoặc tên cụ thể", "Độ trễ thấp"]
+  }}
+/>
+
+Mặc dù tìm kiếm ngữ nghĩa rất mạnh mẽ, nhưng đôi khi nó thất bại khi người dùng tìm kiếm số sê-ri, từ viết tắt hoặc tên chính xác cụ thể. Kết hợp nó với tìm kiếm toàn văn PostgreSQL đảm bảo bạn nắm bắt cả các thuật ngữ chính xác và các kết quả khớp khái niệm.
+
+## Chọn kích thước nhúng của bạn
+
+Trước khi thiết lập lược đồ, hãy quyết định mô hình nhúng của bạn. Kích thước bạn chọn là vĩnh viễn — thay đổi nó yêu cầu lập chỉ mục lại tất cả các tài liệu.
+
+| Mô hình | Kích thước | Ghi chú |
+|---|---|---|
+| OpenAI `text-embedding-3-small` | 1536 | Cân bằng tốt giữa chi phí và chất lượng |
+| OpenAI `text-embedding-3-large` | 3072 | Chất lượng cao nhất, dung lượng lưu trữ gấp 2 lần |
+| Cohere `embed-english-v3.0` | 1024 | Tùy chọn đa ngôn ngữ mạnh mẽ |
+| `BAAI/bge-m3` (mã nguồn mở) | 1024 | Mã nguồn mở tốt nhất, tự lưu trữ |
+| `all-MiniLM-L6-v2` | 384 | Nhanh, ít bộ nhớ, tốt cho thiết bị |
+
+Kích thước lớn hơn cải thiện khả năng thu hồi trên các truy vấn ngữ nghĩa sắc thái nhưng tốn kém hơn cả về lưu trữ và độ trễ tìm kiếm. Đối với hầu hết các hệ thống RAG sản xuất, 1024 hoặc 1536 là điểm tối ưu.
+
+## Thiết lập pgvector
+
+<Stepper>
+  <Step title="Bật tiện ích mở rộng">
+    Đầu tiên, bật `pgvector` trong cơ sở dữ liệu của bạn. Trên RDS hoặc Supabase, điều này có sẵn theo mặc định.
+    ```sql
+    CREATE EXTENSION IF NOT EXISTS vector;
+    ```
+  </Step>
+  <Step title="Tạo bảng">
+    Tạo một bảng lưu trữ các tài liệu của bạn, các vector tìm kiếm toàn văn của chúng (cho BM25) và các nhúng của chúng.
+    ```sql
+    CREATE TABLE documents (
+        id          bigserial PRIMARY KEY,
+        content     text      NOT NULL,
+        metadata    jsonb     DEFAULT '{}',
+        embedding   vector(1536),  -- match your model's dimension
+        fts         tsvector  GENERATED ALWAYS AS
+                      (to_tsvector('english', content)) STORED,
+        created_at  timestamptz DEFAULT now()
+    );
+    ```
+  </Step>
+  <Step title="Tạo chỉ mục HNSW">
+    HNSW cung cấp thời gian truy vấn nhanh hơn và khả năng thu hồi tốt hơn IVFFlat. Điều chỉnh `m` (kết nối đồ thị) và `ef_construction` (độ sâu tìm kiếm thời gian xây dựng) để phù hợp với khối lượng công việc của bạn.
+    ```sql
+    CREATE INDEX documents_embedding_hnsw_idx
+        ON documents
+        USING hnsw (embedding vector_cosine_ops)
+        WITH (m = 16, ef_construction = 64);
+    ```
+    - **`m = 16`**: số kết nối trên mỗi nút — cao hơn cải thiện khả năng thu hồi nhưng sử dụng nhiều bộ nhớ hơn
+    - **`ef_construction = 64`**: độ sâu tìm kiếm tại thời điểm xây dựng — cao hơn cải thiện chất lượng chỉ mục, xây dựng chậm hơn
+  </Step>
+  <Step title="Tạo chỉ mục toàn văn">
+    Thêm chỉ mục GIN để tăng tốc các truy vấn từ khóa kiểu BM25.
+    ```sql
+    CREATE INDEX documents_fts_gin_idx ON documents USING GIN (fts);
+    ```
+  </Step>
+  <Step title="Đặt tham số HNSW thời gian truy vấn">
+    Tại thời điểm truy vấn, kiểm soát sự đánh đổi giữa khả năng thu hồi và độ trễ với `hnsw.ef_search`. Giá trị cao hơn cải thiện khả năng thu hồi với chi phí độ trễ.
+    ```sql
+    SET hnsw.ef_search = 100; -- default is 40; 100 is good for production
+    ```
+    Đặt giá trị này cho mỗi phiên hoặc trong cấu hình nhóm kết nối của bạn.
+  </Step>
+</Stepper>
+
+## Triển khai tìm kiếm lai với RRF
+
+Reciprocal Rank Fusion kết hợp các kết quả được xếp hạng từ cả hai tìm kiếm. Một tài liệu xếp hạng #2 trong tìm kiếm vector và #3 trong tìm kiếm từ khóa sẽ nhận được điểm hợp nhất cao hơn so với một tài liệu xếp hạng #1 chỉ trong một trong số đó.
+
+```sql
+WITH vector_search AS (
+  SELECT id, content, metadata,
+         RANK() OVER (ORDER BY embedding <=> $1) AS rank
+  FROM documents
+  ORDER BY embedding <=> $1
+  LIMIT 50
+),
+keyword_search AS (
+  SELECT id, content, metadata,
+         RANK() OVER (
+           ORDER BY ts_rank_cd(fts, plainto_tsquery('english', $2)) DESC
+         ) AS rank
+  FROM documents
+  WHERE fts @@ plainto_tsquery('english', $2)
+  ORDER BY ts_rank_cd(fts, plainto_tsquery('english', $2)) DESC
+  LIMIT 50
+)
+SELECT
+  COALESCE(v.id, k.id)               AS id,
+  COALESCE(v.content, k.content)     AS content,
+  COALESCE(v.metadata, k.metadata)   AS metadata,
+  (
+    COALESCE(1.0 / (60 + v.rank), 0.0) +
+    COALESCE(1.0 / (60 + k.rank), 0.0)
+  )                                   AS rrf_score
+FROM vector_search v
+FULL OUTER JOIN keyword_search k ON v.id = k.id
+ORDER BY rrf_score DESC
+LIMIT 10;
+-- $1: embedding vector, $2: query text string
+```
+
+Hằng số `60` trong mẫu số là hằng số RRF `k` — nó làm giảm trọng số của các tài liệu được xếp hạng cao nhất và ngăn bất kỳ danh sách nào thống trị. Giá trị 60 là tiêu chuẩn được sử dụng trong bài báo RRF gốc.
+
+## Xác minh kế hoạch truy vấn của bạn
+
+Trước khi đưa vào sản xuất, hãy chạy `EXPLAIN ANALYZE` để xác nhận chỉ mục HNSW đang được sử dụng và kiểm tra số hàng thực tế so với ước tính:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT id, content, embedding <=> '[0.1, 0.2, ...]' AS dist
+FROM documents
+ORDER BY embedding <=> '[0.1, 0.2, ...]'
+LIMIT 10;
+```
+
+Tìm `Index Scan using documents_embedding_hnsw_idx` trong đầu ra. Nếu bạn thấy một lần quét tuần tự thay vào đó, `ef_search` của bạn có thể quá cao hoặc số liệu thống kê cần được cập nhật (`ANALYZE documents;`).
+
+## Client Python với asyncpg
+
+Đây là một triển khai Python cấp sản xuất sử dụng `asyncpg` và nhúng OpenAI:
+
+```python
+import asyncpg
+import openai
+from typing import Any
+
+async def embed(text: str) -> list[float]:
+    resp = await openai.AsyncOpenAI().embeddings.create(
+        model="text-embedding-3-small",
+        input=text,
+    )
+    return resp.data[0].embedding
+
+async def hybrid_search(
+    pool: asyncpg.Pool,
+    query: str,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    embedding = await embed(query)
+    # asyncpg expects vectors as lists of floats
+    vector_str = "[" + ",".join(str(x) for x in embedding) + "]"
+
+    rows = await pool.fetch(
+        """
+        WITH vector_search AS (
+          SELECT id, content, metadata,
+                 RANK() OVER (ORDER BY embedding <=> $1::vector) AS rank
+          FROM documents ORDER BY embedding <=> $1::vector LIMIT 50
+        ),
+        keyword_search AS (
+          SELECT id, content, metadata,
+                 RANK() OVER (
+                   ORDER BY ts_rank_cd(fts, plainto_tsquery('english', $2)) DESC
+                 ) AS rank
+          FROM documents
+          WHERE fts @@ plainto_tsquery('english', $2)
+          LIMIT 50
+        )
+        SELECT
+          COALESCE(v.id, k.id)             AS id,
+          COALESCE(v.content, k.content)   AS content,
+          COALESCE(v.metadata, k.metadata) AS metadata,
+          (COALESCE(1.0/(60+v.rank),0) + COALESCE(1.0/(60+k.rank),0)) AS score
+        FROM vector_search v
+        FULL OUTER JOIN keyword_search k ON v.id = k.id
+        ORDER BY score DESC LIMIT $3
+        """,
+        vector_str,
+        query,
+        limit,
+    )
+    return [dict(r) for r in rows]
+```
+
+## Chiến lược phân đoạn
+
+Cách bạn chia tài liệu của mình trước khi nhúng cũng quan trọng như cấu hình chỉ mục. Phân đoạn kém gây ra hai chế độ lỗi:
+
+- **Các phân đoạn quá nhỏ**: Nhúng chỉ nắm bắt một phần của khái niệm, tìm kiếm ngữ nghĩa bỏ lỡ ngữ cảnh.
+- **Các phân đoạn quá lớn**: Một phân đoạn duy nhất làm loãng mức độ liên quan — một câu liên quan bị chôn vùi trong 2.000 token.
+
+| Chiến lược | Kích thước phân đoạn | Chồng chéo | Tốt nhất cho |
+|---|---|---|---|
+| Token cố định | 512 token | 50 token | Mục đích chung, dễ triển khai |
+| Ranh giới câu | 3-5 câu | 1 câu | Tài liệu đàm thoại, hệ thống QA |
+| Ranh giới đoạn văn | 1 đoạn văn | — | Bài đăng trên blog, bài viết |
+| Phân đoạn ngữ nghĩa | Biến đổi | — | Tài liệu kỹ thuật dài với các phần logic |
+
+Đối với hầu hết các ứng dụng RAG, **512 token với 50 token chồng chéo** là một điểm khởi đầu vững chắc. Chồng chéo đảm bảo một khái niệm được chia trên ranh giới phân đoạn vẫn xuất hiện trong ngữ cảnh của ít nhất một phân đoạn.
+
+## Tùy chọn: Xếp hạng lại với bộ mã hóa chéo
+
+RRF là một bộ hợp nhất tốt, nhưng nó không hiểu mối quan hệ truy vấn-tài liệu — nó chỉ kết hợp các xếp hạng. Đối với RAG có tính rủi ro cao (y tế, pháp lý, tài chính), hãy thêm bước xếp hạng lại bộ mã hóa chéo sau khi truy xuất:
+
+```python
+from sentence_transformers import CrossEncoder
+
+reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+
+def rerank(query: str, docs: list[dict]) -> list[dict]:
+    pairs = [(query, d['content']) for d in docs]
+    scores = reranker.predict(pairs)
+    ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
+    return [d for d, _ in ranked]
+```
+
+Bộ mã hóa chéo chậm hơn bộ mã hóa hai chiều (chúng xử lý từng cặp truy vấn-tài liệu cùng nhau), vì vậy chỉ xếp hạng lại 20-50 kết quả hàng đầu từ tìm kiếm lai, sau đó chuyển 5-10 kết quả hàng đầu cho LLM.
+
+## Câu hỏi thường gặp
+
+<FAQ
+  items={[
+    {
+      question: "Tại sao nên sử dụng HNSW thay vì IVFFlat trong pgvector?",
+      answer: "HNSW xây dựng một đồ thị đa lớp cho phép thời gian tìm kiếm nhanh hơn đáng kể và khả năng thu hồi cao hơn so với IVFFlat, vốn dựa vào phân cụm. Mặc dù HNSW sử dụng nhiều bộ nhớ hơn và mất nhiều thời gian hơn để xây dựng, nhưng nó mang lại độ trễ nhất quán và khả năng thu hồi tốt hơn cho các hệ thống RAG sản xuất. IVFFlat có thể nhanh hơn để xây dựng nhưng yêu cầu điều chỉnh số lượng danh sách và thăm dò, và khả năng thu hồi giảm nếu số lượng cụm của bạn sai."
+    },
+    {
+      question: "Reciprocal Rank Fusion (RRF) là gì?",
+      answer: "RRF là một thuật toán kết hợp thứ hạng được sử dụng để hợp nhất các kết quả từ nhiều phương pháp truy xuất. Nó gán điểm dựa trên thứ hạng của tài liệu trong mỗi tập kết quả bằng công thức 1/(k+rank), trong đó k=60 là hằng số tiêu chuẩn. Không giống như hợp nhất dựa trên điểm số, RRF mạnh mẽ đối với sự khác biệt về thang điểm giữa độ tương đồng vector và mức độ liên quan của BM25."
+    },
+    {
+      question: "Làm cách nào để xử lý các tài liệu đa ngôn ngữ?",
+      answer: "Đối với nội dung đa ngôn ngữ, hãy sử dụng mô hình nhúng đa ngôn ngữ (ví dụ: BAAI/bge-m3 hoặc Cohere embed-multilingual-v3.0) và tạo tsvector nhận biết ngôn ngữ bằng cách sử dụng từ điển thích hợp (ví dụ: to_tsvector('french', content)). Cân nhắc lưu trữ ngôn ngữ được phát hiện cho mỗi tài liệu và định tuyến tìm kiếm từ khóa đến từ điển chính xác."
+    },
+    {
+      question: "Tôi có thể sử dụng các kích thước nhúng khác không?",
+      answer: "Có, bạn có thể định nghĩa vector(N) trong đó N là kích thước nhúng của bạn. Ví dụ, nhúng Cohere có thể là vector(1024), trong khi các mô hình mã nguồn mở có thể sử dụng vector(384) hoặc vector(768). Kích thước được cố định tại thời điểm tạo bảng — thay đổi nó yêu cầu tạo lại cột và nhúng lại tất cả các tài liệu."
+    }
+  ]}
+/>
+
+## Danh sách kiểm tra sản xuất
+
+Trước khi đưa pipeline RAG lai của bạn vào hoạt động:
+
+- ☑ Đặt `hnsw.ef_search = 100` (hoặc cao hơn) trên nhóm kết nối của bạn — mặc định 40 làm mất quá nhiều khả năng thu hồi
+- ☑ Xác minh kế hoạch truy vấn sử dụng chỉ mục HNSW với `EXPLAIN ANALYZE`
+- ☑ Chạy `VACUUM ANALYZE documents` sau khi chèn hàng loạt để cập nhật số liệu thống kê
+- ☑ Lưu trữ `metadata` (URL nguồn, phần, ngày) trong `jsonb` để lọc sau khi truy xuất
+- ☑ Thêm `WHERE metadata @> '{"source": "docs"}'::jsonb` để lọc theo nguồn trước khi xếp hạng
+- ☑ Giám sát độ trễ API nhúng riêng biệt với độ trễ truy vấn DB trong ngăn xếp quan sát của bạn
+- ☑ Đặt `statement_timeout` trên các truy vấn tìm kiếm lai để tránh các truy vấn chậm chặn pipeline LLM của bạn
+- ☑ Sử dụng nhóm kết nối `asyncpg` (tối thiểu 2, tối đa 20) — tránh tạo kết nối mới cho mỗi yêu cầu
+
+Bằng cách kết hợp các phương pháp này vào một pipeline RAG tìm kiếm lai PostgreSQL gắn kết, bạn cải thiện đáng kể độ chính xác và độ tin cậy của ứng dụng AI của mình.
+
+## Bạn cũng có thể thích
+
+- [pgvector trong sản xuất: Tìm kiếm vector quy mô lớn & RRF lai trong PostgreSQL](/en/blog/postgres-vector-search)
+- [Mở rộng quy mô tìm kiếm vector với pgvector](/en/blog/postgres-vector-search-pgvector)
+- [Trợ lý mã hóa AI: Các phương pháp hay nhất cho năm 2026](/en/blog/ai-coding-assistants)
+- [Cursor vs Claude Code: Công cụ mã hóa AI nào thực sự thắng vào năm 2026?](/en/blog/cursor-and-claude)

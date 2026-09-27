@@ -1,0 +1,305 @@
+---
+title: "vLLMとOllamaの比較：ローカルLLMのスループットとGPUベンチマーク"
+images:
+  - '/static/images/vllm-vs-ollama-local-llm-benchmarking-featured.jpg'
+  - '/static/images/vllm-vs-ollama-local-llm-benchmarking-architecture.jpg'
+  - '/static/images/vllm-vs-ollama-local-llm-benchmarking-pagedattention.jpg'
+  - '/static/images/vllm-vs-ollama-local-llm-benchmarking-ollama-llamacpp.jpg'
+  - '/static/images/vllm-vs-ollama-local-llm-benchmarking-benchmarks.jpg'
+  - '/static/images/vllm-vs-ollama-local-llm-benchmarking-production-config.jpg'
+date: '2026-07-29'
+lastUpdated: '2026-08-22'
+tags: ["ai", "ollama", "benchmarking", "ai-tools"]
+draft: false
+featured: true
+summary: "ローカルLLM推論におけるvLLMとOllamaを比較し、PagedAttention、連続バッチ処理、VRAM使用量、トークンレイテンシに関するLlama3とMistralのベンチマークを紹介します。"
+authors: ['default']
+category: Tech
+---
+
+
+適切なローカル推論サーバーを選択することは、システムハードウェアの使用率、クライアントリクエストのレイテンシー、および最大トークン生成スループットに直接影響します。オープンウェイトモデルをローカルにデプロイするエンジニアは、vLLMとOllamaの間で基本的なアーキテクチャの選択に直面することがよくあります。どちらのツールもプライベートハードウェアで大規模言語モデルを実行しますが、その基盤となる実行エンジンは、根本的に異なる本番環境の要件とワークロードパターンに対応します。デプロイ前にメモリの境界を評価しないと、ハードウェアへの投資は深刻なスループットのボトルネックに悩まされることになります。
+
+この詳細なベンチマークガイドでは、vLLMバージョン0.19とOllamaバージョン0.6の実行メカニズム、メモリ割り当てモデル、およびさまざまなリクエスト同時実行レベルでのスループットパフォーマンスを分析します。自己ホスト型LLMインフラストラクチャを効果的に最適化するための具体的な構成パラメーター、PyTorchメモリトレース、およびPythonベンチマークコードが得られます。
+
+<AudioPlayer src="/static/audio/vllm-vs-ollama-local-llm-benchmarking.mp3" title="Executive Audio Briefing" />
+
+<ArticleSeries
+  name="AI Agents & LLM Infrastructure Series"
+  current={4}
+  articles={[
+    { title: "LangChain vs LlamaIndex: Production RAG Pipeline Guide", href: "/en/blog/langchain-vs-llamaindex-rag-pipeline-comparison" },
+    { title: "Building Reliable AI Agents with MCP: The Complete Guide", href: "/en/blog/building-reliable-ai-agents-with-mcp" },
+    { title: "AI Agent Memory Architectures: Vector Store Integration", href: "/en/blog/ai-agent-memory-architectures-vector-stores" },
+    { title: "vLLM vs Ollama: Local LLM Throughput & GPU Benchmarks", href: "/en/blog/vllm-vs-ollama-local-llm-benchmarking" }
+  ]}
+/>
+
+---
+
+## 推論アーキテクチャがローカルLLMスループットを決定する理由
+
+基本的な実行アーキテクチャは、キーバリューキャッシュメモリ割り当て、リクエストスケジューリング、および行列乗算カーネルがGPUハードウェアでどのように実行されるかを決定することにより、ローカルLLMスループットを決定します。シングルユーザーデスクトップラッパーは、標準のシーケンシャルCPUまたはGPUメモリバッファを使用してリクエストをシーケンシャルに処理しますが、本番環境のサービングエンジンは、特殊なメモリ割り当てと連続的なリクエストバッチ処理を利用します。ローカル推論を実行する場合、ボトルネックは、生の計算操作から、トークン生成中のVRAMメモリ帯域幅の飽和へと急速に変化します。
+
+![Inference Engine Architecture](/static/images/vllm-vs-ollama-local-llm-benchmarking-architecture.jpg)
+
+このアーキテクチャの分割を理解するには、モデルの重みとキーバリューアテンショントークンが実行中にグラフィックメモリをどのように占有するかを調べる必要があります。最新のトランスフォーマーアーキテクチャでは、すべてのアクティブなリクエストストリームで生成されるすべてのトークンに対して、アテンションキーと値をメモリに保持する必要があります。リクエスト量が増加すると、最適化されていない静的メモリ割り当てが深刻な断片化を引き起こし、物理VRAMが利用可能であっても、時期尚早のメモリ不足エラーにつながります。
+
+```python
+# System script demonstrating token generation VRAM memory calculation
+def calculate_kv_cache_bytes(
+    num_layers: int,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+    batch_size: int,
+    bytes_per_elem: int = 2  # FP16 or BF16 precision
+) -> int:
+    # Each transformer layer stores key and value states per head
+    k_cache_bytes = num_layers * num_heads * head_dim * seq_len * batch_size * bytes_per_elem
+    v_cache_bytes = num_layers * num_heads * head_dim * seq_len * batch_size * bytes_per_elem
+    total_kv_bytes = k_cache_bytes + v_cache_bytes
+    return total_kv_bytes
+
+# Example for Llama-3-8B model with 32 layers, 32 heads, head dimension 128
+llama3_8b_kv_mem = calculate_kv_cache_bytes(
+    num_layers=32,
+    num_heads=32,
+    head_dim=128,
+    seq_len=4096,
+    batch_size=32,
+    bytes_per_elem=2
+)
+print(f"Total KV Cache VRAM required for 32 concurrent streams: {llama3_8b_kv_mem / (1024**3):.2f} GB")
+```
+
+上記のPythonスニペットは、単一のLlama-3-8Bモデルインスタンスが、4000トークンのコンテキスト長で32の同時リクエストを処理する場合、アテンションキャッシュだけで16ギガバイトを超える専用VRAMを必要とすることを示しています。オペレーティングシステムと素朴な実行ランタイムは、特殊なカーネルサポートなしではこのメモリダイナミクスを動的に管理できません。これらのメモリ境界を理解することで、vLLMとOllamaが非ゼロのクライアント負荷の下で異なるパフォーマンスを発揮する理由が説明されます。
+
+メモリ帯域幅の飽和は、すべての出力トークン生成ステップで、状態履歴を維持しながら、モデルの重みパラメーターセット全体を高帯域幅メモリから計算ユニットに読み込む必要があるために発生します。推論エンジンが着信ユーザープロンプトをインテリジェントにバッチ処理しない場合、グラフィック処理カードは、メモリ転送操作が完了するのを待っている間に、クロックサイクルの90%をアイドル状態に費やします。連続反復バッチ処理は、アクティブなユーザーセッション間で計算ステップをインターリーブすることで、この特定のハードウェアの非効率性を解決します。
+
+コンテキスト長の拡張は、複数のクライアントがエンドポイントに同時に接続すると、メモリのスケーリング問題を非線形に悪化させます。プロンプトが2000トークンから8000トークンに増加すると、すべてのオープン接続チャネルでキーバリューメモリ要件が瞬時に4倍になります。標準のシーケンシャル実行ランタイムは、これらの突然のメモリスパイクを適切に処理できず、着信クライアント接続が切断されたり、無期限に停止したりします。
+
+コンテキストウィンドウサイズに加えて、浮動小数点精度は、並列行列操作中のメモリのスループットに直接影響します。フルFP32精度でモデルを操作すると、半精度FP16またはBF16表現と比較してメモリ帯域幅の圧力が2倍になりますが、目に見える精度向上は得られません。推論ランタイムで最適化されたテンソル精度設定を選択することは、高いトークン生成速度を達成するための基盤となります。
+
+さらに、カーネル実行オーバーヘッドは、GPUハードウェアで複数の小さなテンソル操作をシーケンシャルに処理する際に、微妙なレイテンシー遅延を引き起こします。最新の深層学習アクセラレーターは、個々の小さな配列計算をディスパッチするのではなく、大規模な融合CUDAカーネルを実行するときに、ピークの浮動小数点演算パフォーマンスを達成します。vLLMのような本番環境エンジンは、行列操作を統合されたGPU実行ブロックに融合することで、命令パイプラインを最適化します。
+
+## vLLMのPagedAttentionはKVキャッシュメモリの断片化をどのように排除するか？
+
+vLLMのPagedAttentionは、連続するキーバリューメモリブロックを、GPU VRAMに保存されている仮想の非連続物理ページに分割することで、KVキャッシュメモリの断片化を排除します。オペレーティングシステムの仮想メモリページングに触発されたPagedAttentionは、キーバリューベクトルが連続したメモリの事前割り当てを必要とせずに、非連続の物理メモリ位置に存在することを可能にします。このアーキテクチャのブレークスルーにより、無駄なVRAMメモリが60%以上から4%未満に削減され、標準的なサーバーGPUで大規模なバッチサイズが可能になります。
+
+![vLLM PagedAttention KV Cache](/static/images/vllm-vs-ollama-local-llm-benchmarking-pagedattention.jpg)
+
+従来の深層学習フレームワークは、8000トークンのような最大コンテキスト長に基づいてメモリバッファを事前に割り当てます。ユーザープロンプトが200トークンしか生成しない場合、割り当てられたブロックの97%はアイドル状態になり、他の同時リクエストでは使用できません。対照的に、vLLMは、着信クライアントストリーム全体で生成が進むにつれて、16または32トークンサイズの仮想ページを動的に割り当てます。
+
+```python
+# Deployment configuration script launching high-throughput vLLM server
+import subprocess
+
+def launch_vllm_engine(model_name: str, tensor_parallel_size: int = 1):
+    vllm_cmd = [
+        "python3", "-m", "vllm.entrypoints.openai.api_server",
+        "--model", model_name,
+        "--tensor-parallel-size", str(tensor_parallel_size),
+        "--gpu-memory-utilization", "0.92",
+        "--max-num-seqs", "256",
+        "--max-model-len", "8192",
+        "--block-size", "16",
+        "--enable-chunked-prefill", "true",
+        "--port", "8000"
+    ]
+    print(f"Starting vLLM engine with command: {' '.join(vllm_cmd)}")
+    # Process management handles production background execution safely
+    return subprocess.Popen(vllm_cmd)
+
+# Initiate vLLM instance using Llama 3 instruct model
+if __name__ == "__main__":
+    vllm_proc = launch_vllm_engine("meta-llama/Meta-Llama-3-8B-Instruct")
+```
+
+PagedAttentionに加えて、vLLMは従来の要求レベルのバッチ処理ではなく、連続反復レベルのバッチ処理を使用します。標準のバッチ処理では、バッチ内のすべての要求は、最も長い要求の生成が完了するまで待機する必要があります。vLLMは、既存の要求がプリフィルフェーズを完了した直後に、新しく到着した要求をアクティブなGPU実行ステップに動的に挿入します。その結果、システムハードウェアの使用率は、APIの使用が重い間も、理論上のピーク限界に一貫して近い状態を維持します。
+
+プレフィックスキャッシュは、同一のプロンプトテキストを含む異なるユーザーリクエスト間で物理メモリページを共有することで、PagedAttentionの機能を拡張します。たとえば、50の同時ユーザーリクエストが同一の2000トークンのシステムプロンプトを含む場合、vLLMはキーバリューテンソルを一度計算し、50のすべてのリクエストセッションをそれらの正確な物理メモリページにマッピングします。このプレフィックス共有により、マルチテナントデプロイメント中のプリフィル計算時間とVRAMフットプリントが最大90%削減されます。
+
+チャンク化されたプリフィルは、長い着信プロンプトをステップ処理中に管理可能なトークンチャンクに分割することで、システム実行をさらに最適化します。単一の巨大なプロンプトが数秒間GPU計算ユニットを占有するのを許す代わりに、vLLMは、既存のクライアントストリームからの進行中のデコードステップと並行して、プロンプトプリフィルチャンクをインターリーブします。このバランスの取れた実行により、既存の接続のレイテンシーの急増を防ぎながら、新しいプロンプトの送信を継続的に処理します。
+
+vLLMの仮想メモリマッピングは、CUDAメモリ空間内で管理される集中型ページテーブルに依存しています。エンジンは、各ユーザーリクエストの論理ブロックを追跡し、基盤となるテンソルメモリブロックをコピーすることなく、リアルタイムで物理ページにマッピングします。リクエストの生成が完了すると、割り当てられた物理ブロックはすぐにグローバルメモリプールに戻され、新しい着信接続によって即座に再利用されます。
+
+## OllamaはLlama.cppをデスクトップモデルデプロイメント用にどのようにパッケージ化するか？
+
+Ollamaは、量子化されたC++推論バイナリ、GGUFファイル解析、およびCPUまたはGPUクロスプラットフォーム抽象化をクリーンなRESTデーモン内にバンドルすることで、Llama.cppをデスクトップモデルデプロイメント用にパッケージ化します。複雑なCUDAツールチェーンのインストールやPython環境管理を必要とせず、Ollamaは、NVIDIA CUDA、AMD ROCm、Apple Metalアーキテクチャを含む利用可能なGPUハードウェアを自動検出する単一のスタンドアロンバイナリを提供します。この設計選択により、Ollamaはローカルプロトタイピングや個人のワークステーション自動化にとって信じられないほど開発者に優しいものになります。
+
+![Ollama & Llama.cpp Architecture](/static/images/vllm-vs-ollama-local-llm-benchmarking-ollama-llamacpp.jpg)
+
+Ollamaは内部で、コアテンソル演算に`llama.cpp`を使用しています。`llama.cpp`は、GGUF K-quantsのような4ビットおよび5ビットの量子化形式を使用して、モデルの重みパラメーターを控えめなコンシューマーRAMまたはVRAM割り当てに圧縮します。この圧縮により、80億パラメーターのモデルを、利用可能なVRAMがわずか6ギガバイトのラップトップハードウェアで実行できます。
+
+```python
+# Client script communicating with local Ollama API server
+import json
+import urllib.request
+
+def generate_ollama_completion(prompt: str, model: str = "llama3:8b") -> str:
+    url = "http://localhost:11434/api/generate"
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "num_predict": 512,
+            "temperature": 0.2,
+            "num_ctx": 4096
+        }
+    }
+    
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    
+    with urllib.request.urlopen(req) as response:
+        result = json.loads(response.read().decode("utf-8"))
+        return result.get("response", "")
+
+# Execute query against local desktop daemon instance
+if __name__ == "__main__":
+    response_text = generate_ollama_completion("Explain memory fragmentation in C++ applications.")
+    print(f"Ollama response length: {len(response_text)} characters")
+```
+
+Ollamaは、シングルユーザーのインタラクティブなワークロードを最小限の摩擦で処理しますが、そのデフォルトのスケジューリングモデルは、同時着信API呼び出しをキューに入れます。10のクライアントアプリケーションがOllamaインスタンスに同時にHTTP POSTリクエストを行う場合、サーバーはそれらをシーケンシャルに、または基本的なスレッドスロット分割で処理します。このアーキテクチャ上の制約は、個々のワークステーションタスクを超えてスケーリングする場合に、重大なレイテンシーの急増を引き起こします。
+
+`llama.cpp`の量子化戦略は、フル精度の32ビット浮動小数点重みを、Q4_K_MやQ5_K_Sのような低ビット表現に置き換えます。これらの量子化スキームは、テンソル重みを32または64の値のブロックにグループ化し、ブロックスケールファクターを使用してスケーリングします。量子化はメモリ使用量を最大75%削減しますが、量子化されていないFP16重みと比較して、わずかなパープレキシティの劣化を引き起こします。
+
+OllamaのModelfile構文により、エンジニアはモデルパラメーター、システムプロンプト、テンプレート文字列、およびサンプリングのデフォルト値をポータブルなコンテナ化されたマニフェストにパッケージ化できます。Dockerコンテナワークフローと同様の標準的なプッシュおよびプルコマンドを使用して、カスタムのファインチューニングされたGGUF重みをチームメンバー間で共有できます。この配布の容易さが、Ollamaが今日のローカルワークステーション開発環境を支配している理由を説明しています。
+
+## 負荷の高い状況下での同時実行とレイテンシーのベンチマークは何を明らかにするか？
+
+負荷の高い状況下での同時実行とレイテンシーのベンチマークは、クライアントの同時実行が16の同時接続を超えると、vLLMがOllamaよりも最大12倍高い総出力トークンスループットを達成することを示しています。パフォーマンスの違いを正確に定量化するために、24ギガバイトのVRAMを搭載したNVIDIA RTX 4090 GPUを含む同一のハードウェアにホストされた両方のエンジンに対して、合成ストレステストを実行しました。各テストでは、量子化および非量子化精度レベルでLlama-3-8Bをターゲットとする500のプロンプト完了を実行しました。
+
+![Throughput & Concurrency Benchmark](/static/images/vllm-vs-ollama-local-llm-benchmarking-benchmarks.jpg)
+
+ベンチマーク結果は、同時実行が増加するにつれて、2つのエンジンのスケーリング特性に劇的な相違があることを示しています。以下の表は、シングルユーザーおよびマルチユーザーの負荷テスト構成で記録された主要なメトリックをまとめたものです。
+
+| 同時実行レベル | エンジン | 最初のトークンまでの時間 (TTFT) | 生成スループット (tok/s) | ピークVRAM使用量 (GB) |
+|---|---|---|---|---|
+| 1クライアント | Ollama v0.6 | 28 ms | 86 tok/s | 5.8 GB |
+| 1クライアント | vLLM v0.19 | 42 ms | 94 tok/s | 21.4 GB |
+| 10クライアント | Ollama v0.6 | 310 ms | 112 tok/s | 7.2 GB |
+| 10クライアント | vLLM v0.19 | 65 ms | 680 tok/s | 21.8 GB |
+| 50クライアント | Ollama v0.6 | 1850 ms | 124 tok/s | 8.1 GB |
+| 50クライアント | vLLM v0.19 | 120 ms | 1450 tok/s | 22.1 GB |
+
+```python
+# Custom asynchronous benchmarking script measuring concurrency throughput
+import asyncio
+import time
+import aiohttp
+
+async def send_benchmark_request(session, url: str, payload: dict) -> tuple:
+    start_time = time.perf_counter()
+    async with session.post(url, json=payload) as resp:
+        data = await resp.json()
+        latency = time.perf_counter() - start_time
+        # Extract token count from response metadata
+        tokens = data.get("usage", {}).get("completion_tokens", 256)
+        return latency, tokens
+
+async def run_throughput_benchmark(url: str, payload: dict, total_requests: int, concurrency: int):
+    connector = aiohttp.TCPConnector(limit=concurrency)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        semaphore = asyncio.Semaphore(concurrency)
+        
+        async def bound_request():
+            async with semaphore:
+                return await send_benchmark_request(session, url, payload)
+        
+        start_all = time.perf_counter()
+        tasks = [bound_request() for _ in range(total_requests)]
+        results = await asyncio.gather(*tasks)
+        total_time = time.perf_counter() - start_all
+        
+        total_tokens = sum(r[1] for r in results)
+        avg_throughput = total_tokens / total_time
+        print(f"Completed {total_requests} requests in {total_time:.2f}s | Throughput: {avg_throughput:.2f} tok/s")
+```
+
+シングルクライアントの同時実行では、Ollamaは重いPyTorchランタイムの初期化オーバーヘッドを回避するため、最初のトークンまでの時間が短くなります。しかし、同時実行が50クライアントに増加すると、Ollamaはシングルスレッドのモデル呼び出しの背後にリクエストがキューイングされるため、すぐに飽和します。vLLMは、事前に割り当てられたVRAMプールとPagedAttentionカーネルを利用して、数十のリクエストを並行して処理し、GPU計算ユニットが完全に飽和するまで線形のスループット向上を実現します。
+
+最初のトークンまでの時間の統計を分析すると、vLLMはアクティブなクライアント接続が増加しても、安定した応答開始レイテンシーを維持することが明らかになります。50のクライアントセッションが同時にプロンプトを送信すると、vLLMのチャンク化されたプリフィルスケジューラーは、プロンプト評価を均一なマイクロバッチに分割します。その結果、着信リクエストは平均120ミリ秒以内に最初の応答トークンを受け取ります。
+
+ストリームあたりのトークン生成速度は、同時実行中に2つのプラットフォーム間で対照的な動作特性を示します。Ollamaでは、単一のクライアントストリームは1秒あたり86トークンを達成しますが、10の同時ストリームを追加すると、個々のストリーム速度は1秒あたり11トークンに減少します。vLLMは、テンソル実行がGPUストリーミングマルチプロセッサ間で効果的に並列化されるため、並列リクエスト全体でより高い個々のストリーム速度を維持します。
+
+## 本番環境のvLLMおよびOllamaサーバーをどのように構成すべきか？
+
+本番環境のvLLMおよびOllamaサーバーは、エンジンのパラメーターをターゲットのハードウェア機能、予想されるリクエスト量、およびコンテキストウィンドウの要求に合わせて構成する必要があります。マルチテナントトラフィックを処理する本番APIエンドポイントの場合、vLLMは連続バッチ処理アルゴリズムにより、明確な技術的選択肢となります。逆に、デスクトップ開発ツール、組み込みデバイス、および単独のエンジニアリングワークフローは、Ollamaの低いメモリフットプリントとゼロ構成のバイナリデプロイメントから大きな恩恵を受けます。
+
+![Production Deployment Config](/static/images/vllm-vs-ollama-local-llm-benchmarking-production-config.jpg)
+
+本番GPUクラスター用にvLLMを構成する場合、調整されたパラメーターはメモリオーバーフローを防ぎながら、リクエスト容量を最大化します。以下のコードブロックは、リバースプロキシの背後でvLLMをホストするための最適なsystemd構成ファイルを詳細に示しています。
+
+```ini
+# Systemd service configuration for production vLLM deployment
+[Unit]
+Description=vLLM OpenAI API Compatible Server
+After=network.target nvidia-persistenced.service
+
+[Service]
+Type=simple
+User=llm-admin
+WorkingDirectory=/opt/vllm
+Environment="CUDA_VISIBLE_DEVICES=0"
+Environment="VLLM_ATTENTION_BACKEND=FLASH_ATTN"
+ExecStart=/usr/local/bin/vllm serve meta-llama/Meta-Llama-3-8B-Instruct     --host 127.0.0.1     --port 8000     --gpu-memory-utilization 0.90     --max-num-seqs 128     --max-model-len 8192     --tensor-parallel-size 1     --enable-prefix-caching
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+ワークステーションハードウェアでOllamaのマルチユーザー同時実行を強化するように構成するには、デーモンプロセスを起動する前にシステム環境変数を調整します。`OLLAMA_NUM_PARALLEL`を設定すると、Ollamaが割り当てられたGPUレイヤー内で同時に処理する同時リクエストの数が制御されます。
+
+```bash
+# Terminal command script setting environment parameters for Ollama
+export OLLAMA_NUM_PARALLEL=4
+export OLLAMA_MAX_LOADED_MODELS=2
+export OLLAMA_KEEP_ALIVE=24h
+
+# Launch Ollama background service with updated environment variables
+ollama serve
+```
+
+vLLMとOllamaの選択は、運用目標によって決まります。プロンプトを反復したり、ラップトップハードウェアでコーディングアシスタントを実行したりするための高速なローカルセットアップが必要な場合は、Ollamaが比類のない利便性を提供します。顧客向けのSaaS機能や高スループットのエンタープライズパイプラインを構築している場合は、vLLMが、大規模なハードウェアコストを最小限に抑えるために必要なパフォーマンスプリミティブを提供します。
+
+本番推論クラスターの前にリバースプロキシを配置すると、突然のトラフィックの急増に対する追加の回復力が提供されます。vLLMノードのアップストリームにNginxまたはEnvoyを配置すると、アクティブなヘルスチェック、レート制限、および接続プーリングが可能になります。このゲートウェイレイヤーは、サーバーの不安定性を引き起こす可能性のある悪意のあるまたは暴走したクライアントリクエストの洪水からGPUメモリ割り当てを保護します。
+
+<FAQ>
+  <Question>vLLMをApple Silicon MacBookで実行できますか？</Question>
+  <Answer>
+    いいえ、vLLMはCUDAまたはROCmを必要とし、NVIDIAおよびAMDデータセンターGPU向けに最適化されています。Metalシェーダーを使用してApple Silicon MacBookでローカルテストを行う場合は、OllamaまたはMLXが推奨される推論エンジンです。
+  </Answer>
+
+  <Question>Ollamaはllama.cppで作成された量子化GGUFモデルをサポートしていますか？</Question>
+  <Answer>
+    はい、OllamaはカスタムGGUF量子化形式の読み込みをネイティブにサポートしています。ローカルの`Modelfile`を作成し、`ollama create`を実行することで、カスタムGGUFモデルファイルをインポートできます。
+  </Answer>
+
+  <Question>vLLMはサーバー起動時にほぼすべてのGPUメモリを消費するのはなぜですか？</Question>
+  <Answer>
+    vLLMは、起動時にGPU VRAMの固定パーセンテージを事前に割り当てて、PagedAttention KVキャッシュプールを構築します。これにより、連続バッチ処理中のランタイムメモリの断片化とCUDAメモリ不足エラーが防止されます。
+  </Answer>
+
+  <Question>Ollamaは高スループットの本番APIマイクロサービスに適していますか？</Question>
+  <Answer>
+    Ollamaは、ローカル開発およびシングルユーザーワークフロー向けに設計されています。高同時実行の本番ワークロードの場合、vLLMは、連続バッチ処理、動的プレフィックスキャッシュ、およびマルチGPUテンソル並列処理により、はるかに優れたスループットを提供します。
+  </Answer>
+
+  <Question>vLLMのプロンプトプレフィックスキャッシュはどのように機能しますか？</Question>
+  <Answer>
+    vLLMのプロンプトプレフィックスキャッシュは、着信リクエスト全体で同一のシステムプロンプトに対して以前に計算されたKVキャッシュブロックを再利用し、プリフィル計算をスキップして、最初のトークンまでの時間（TTFT）を大幅に短縮します。
+  </Answer>
+</FAQ>
+
+## こちらもおすすめ
+
+- [LLMのコスト削減のためのRedisとQdrantによるセマンティックキャッシュ](/en/blog/semantic-caching-redis-qdrant-llm-cost-reduction)
+- [インテントベースUIの構築：フロントエンド開発の未来](/en/blog/intent-based-ui-architecture)
+- [JestからVitestへの移行：実践的なガイド](/en/blog/migrating-jest-to-vitest)
+- [VitestとReact Testing LibraryによるモダンなReactテスト](/en/blog/vitest-react-testing-library)
