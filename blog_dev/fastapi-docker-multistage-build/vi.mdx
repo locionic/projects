@@ -1,0 +1,269 @@
+---
+draft: false
+title: "FastAPI Docker Multistage Builds: Giảm 70% kích thước ảnh"
+category: devops
+date: '2026-07-29'
+lastUpdated: '2026-09-22'
+tags: ["docker", "python", "fastapi", "devops", "uv"]
+summary: "Đừng đưa trình biên dịch vào môi trường production. Cách sử dụng Docker multistage builds với uv và BuildKit caching cho FastAPI — từ 1,2 GB xuống dưới 100 MB, với thời gian CI rebuild nhanh chóng."
+images: ['/static/images/fastapi-docker-multistage-build.jpg']
+authors: ['default']
+---
+
+Hầu hết các nhà phát triển Python bắt đầu với một `Dockerfile` đơn giản. Bạn kéo `python:3.12`, cài đặt các yêu cầu, sao chép ứng dụng FastAPI của mình và triển khai nó.
+
+Vấn đề là gì? Image của bạn bây giờ là 1.2 GB. Nó chứa các công cụ build, trình biên dịch C và các header phát triển mà máy chủ sản xuất của bạn không bao giờ sử dụng. Việc kéo image này mất rất nhiều thời gian trong quá trình triển khai và làm tăng bề mặt tấn công của bạn.
+
+Nếu bạn triển khai các ứng dụng Python, Docker build nhiều giai đoạn là bắt buộc.
+
+Hướng dẫn này bao gồm ba phiên bản của cùng một Dockerfile, mỗi phiên bản được xây dựng dựa trên phiên bản trước:
+1. **Multistage cổ điển** — giải pháp cơ bản
+2. **BuildKit cache mounts** — build lại nhanh trong CI
+3. **Dựa trên uv** — phương pháp hiện đại nhanh nhất
+
+![FastAPI Docker Multistage Builds](/static/images/fastapi-docker-multistage-build.jpg)
+
+<AudioPlayer src="/static/audio/fastapi-docker-multistage-build.mp3" title="Tóm tắt âm thanh điều hành" />
+
+## Tại sao Single-Stage Python Builds thất bại
+
+Python cần một trình biên dịch để build các C-extension cho các thư viện phổ biến như `psycopg2`, `cryptography`, hoặc `lxml`.
+
+Khi bạn chạy `pip install`, nó thường tải xuống mã nguồn và biên dịch nó. Để làm được điều này, Docker image cơ sở của bạn cần `build-essential` và `python3-dev`. Nếu bạn chuyển cùng một giai đoạn đó sang môi trường sản xuất, bạn đang chuyển trình biên dịch.
+
+Hacker rất thích tìm thấy trình biên dịch trên các máy chủ web sản xuất. Nó làm cho việc biên dịch các khai thác trở nên dễ dàng.
+
+![Tại sao single-stage Python builds thất bại](/static/images/why-single-stage-python-builds-fail.jpg)
+
+## Phiên bản 1: Multistage Build cổ điển
+
+Một multistage build chia `Dockerfile` của bạn thành các giai đoạn riêng biệt:
+
+1. **Giai đoạn Builder**: Image cơ sở nặng. Cài đặt trình biên dịch, build môi trường ảo.
+2. **Giai đoạn Runtime**: Image slim nhẹ. Chỉ sao chép venv đã biên dịch và mã ứng dụng.
+
+Các trình biên dịch không bao giờ đến môi trường sản xuất.
+
+![Giải pháp Multistage](/static/images/the-multistage-solution.jpg)
+
+```dockerfile
+# Stage 1: Builder
+FROM python:3.12-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a self-contained virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Stage 2: Runtime
+FROM python:3.12-slim
+
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+WORKDIR /app
+
+# Runtime-only native lib (no compiler)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Transfer the fully-built venv — no build tools come with it
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY . .
+RUN chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+**Kết quả**: Image ~150 MB thay vì ~1.2 GB.
+
+### Alpine vs. Slim — Đừng dùng Alpine cho Python
+
+Alpine sử dụng `musl libc` thay vì `glibc`. Nhiều gói Python (`numpy`, `pandas`, `cryptography`) chỉ cung cấp các wheel đã biên dịch sẵn cho `glibc`. Với Alpine, `pip` phải biên dịch mọi thứ từ mã nguồn — quá trình build chậm hơn đáng kể và thường xuyên gặp lỗi C khó hiểu.
+
+Luôn sử dụng `python:X.Y-slim`. Nó dựa trên Debian, sử dụng `glibc` và đủ nhỏ cho môi trường sản xuất.
+
+### Tại sao Non-Root lại quan trọng
+
+Docker chạy các container dưới dạng `root` theo mặc định. Một tiến trình FastAPI bị xâm nhập với quyền root bên trong container có thể ghi vào bất kỳ tệp nào, cài đặt công cụ và chuyển sang các container khác thông qua các volume được chia sẻ. Dòng `USER appuser` chuyển sang người dùng có đặc quyền thấp trước khi tiến trình bắt đầu. Điều này là bắt buộc đối với các môi trường Kubernetes có thực thi PodSecurityAdmission.
+
+## Phiên bản 2: BuildKit Cache Mounts (Build lại nhanh trong CI)
+
+Multistage build cổ điển tải lại mọi gói pip trên mỗi lần build nếu `requirements.txt` thay đổi dù chỉ một chút. BuildKit cache mounts khắc phục điều này.
+
+```dockerfile
+# syntax=docker/dockerfile:1.4
+FROM python:3.12-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY requirements.txt .
+
+# --mount=type=cache persists pip's HTTP cache across builds
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+
+FROM python:3.12-slim
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+COPY . .
+RUN chown -R appuser:appuser /app
+USER appuser
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+BuildKit được bật theo mặc định trong Docker 23+. Đối với các phiên bản cũ hơn, hãy đặt `DOCKER_BUILDKIT=1` trước khi build.
+
+**Tác động đến CI**: Trên GitHub Actions với bộ nhớ đệm nóng, một lần build lại hoàn chỉnh trước đây mất 4m30s giảm xuống còn ~45s vì pip đọc các wheel đã biên dịch trực tiếp từ cache mount thay vì tải xuống và biên dịch chúng.
+
+## Phiên bản 3: uv — Phương pháp hiện đại nhanh nhất
+
+[`uv`](https://github.com/astral-sh/uv) là một công cụ thay thế pip dựa trên Rust nhanh hơn 10–100 lần. Astral cung cấp một Docker image (`ghcr.io/astral-sh/uv`) giúp việc tích hợp nó trở nên dễ dàng:
+
+```dockerfile
+# syntax=docker/dockerfile:1.4
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
+
+WORKDIR /app
+
+# Install dependencies with uv — uses BuildKit cache automatically
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    uv sync --frozen --no-install-project --no-dev
+
+# Copy application code and install the project itself
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+# Runtime stage — no uv needed here
+FROM python:3.12-slim
+
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+WORKDIR /app
+
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app /app
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+ENV PATH="/app/.venv/bin:$PATH"
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+Điều này sử dụng `pyproject.toml` + `uv.lock` thay vì `requirements.txt`, mang lại cho bạn các bản build có thể tái tạo, được ghim trên các môi trường.
+
+**Di chuyển**: Nếu bạn vẫn đang dùng `requirements.txt`, hãy chạy `uv init` và `uv add $(cat requirements.txt)` để tạo `pyproject.toml` và `uv.lock`.
+
+## So sánh kích thước Image
+
+| Phương pháp | Image cơ sở | Kích thước Image | Build lạnh | Build lại nóng |
+|---|---|---|---|---|
+| Single-stage | python:3.12 | ~1.2 GB | 4m 30s | 4m 30s |
+| Multistage (cổ điển) | python:3.12-slim | ~150 MB | 2m 15s | 2m 15s |
+| Multistage + BuildKit cache | python:3.12-slim | ~150 MB | 2m 15s | ~45s |
+| uv multistage + BuildKit | uv:python3.12 | ~95 MB | ~60s | ~12s |
+
+Phương pháp uv đạt được cả kích thước image nhỏ nhất và thời gian build lại nhanh nhất — hai chỉ số quan trọng nhất đối với tốc độ lặp lại CI/CD và thời gian triển khai.
+
+## Uvicorn Workers trong môi trường sản xuất
+
+`CMD` trong các ví dụ trên khởi động một Uvicorn worker duy nhất. Đối với môi trường sản xuất với nhiều lõi CPU, hãy sử dụng Gunicorn làm trình quản lý tiến trình:
+
+```dockerfile
+CMD ["gunicorn", "main:app", \
+     "--workers", "4", \
+     "--worker-class", "uvicorn.workers.UvicornWorker", \
+     "--bind", "0.0.0.0:8000", \
+     "--timeout", "120", \
+     "--access-logfile", "-"]
+```
+
+Hoặc sử dụng cờ `--workers` tích hợp của Uvicorn (đơn giản hơn, nhưng Gunicorn xử lý việc khởi động lại nhẹ nhàng tốt hơn):
+
+```dockerfile
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+```
+
+Quy tắc chung: `--workers = 2 × CPU cores + 1` cho các ứng dụng FastAPI bị giới hạn bởi I/O. Đối với các tác vụ bị giới hạn bởi CPU, hãy khớp số lượng worker với số lượng CPU một cách chính xác.
+
+## Tích hợp GitHub Actions CI
+
+```yaml
+# .github/workflows/build.yml
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          # GitHub Actions cache backend — persists BuildKit layers between runs
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+Cặp `cache-from: type=gha` / `cache-to: type=gha,mode=max` là bộ nhớ đệm BuildKit gốc của GitHub Actions. Kết hợp với cache mounts của uv, nó giúp việc build lại CI gần như tức thì khi chỉ có mã ứng dụng thay đổi (không có thay đổi dependency).
+
+## Nên sử dụng khi nào
+
+| Kịch bản | Khuyến nghị |
+|---|---|
+| Dự án mới với pyproject.toml | uv multistage + BuildKit |
+| Dự án cũ với requirements.txt | Multistage cổ điển, thêm BuildKit cache |
+| Kubernetes với chính sách bảo mật nghiêm ngặt | Một trong hai, đảm bảo USER không phải root |
+| Build đa kiến trúc (ARM + x86) | Thêm `--platform linux/amd64,linux/arm64` vào buildx |
+
+Đừng chuyển `build-essential` vào môi trường sản xuất nữa. Ngay cả phương pháp multistage cổ điển cũng giảm kích thước image của bạn 87% và loại bỏ bề mặt tấn công của bạn. Chuyển sang uv sẽ giúp bạn đạt được điều đó nhanh hơn.
+
+## Bạn cũng có thể thích
+
+- [Tối ưu hóa Docker BuildKit Cache Mount và Multi-Stage](/en/blog/docker-buildkit-cache-mount-optimization)
+- [Docker Compose cho Phát triển cục bộ: Hướng dẫn thiết lập hoàn chỉnh](/en/blog/docker-compose-local-development)
+- [Astral uv trong Docker: Multi-Stage Builds, BuildKit Caching & Fast CI](/en/blog/python-uv-package-manager-guide)
+- [FastAPI vs Litestar 2026: So sánh hiệu suất và tính năng](/en/blog/fastapi-vs-litestar-comparison)

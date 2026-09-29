@@ -1,0 +1,300 @@
+---
+title: "CRDTsでローカルファーストなWebアプリを構築する：YjsとIndexedDBの完全なアーキテクチャ"
+date: "2026-08-04"
+lastUpdated: "2026-09-18"
+summary: "Conflict-freeReplicatedDataTypes(CRDTs)、Yjs、IndexedDBによる永続化、WebRTCによるピアツーピア同期を用いたローカルファーストソフトウェアアーキテクチャを深く掘り下げます。"
+tags: ["local-first", "crdt", "yjs", "web-development", "offline-first"]
+images: ['/static/images/crdts-collaboration.png']
+category: Tech
+draft: false
+---
+
+過去15年間、ソフトウェア業界は単一の支配的なアーキテクチャ、すなわち集中型クラウドクライアントサーバーモデルの下で運用されてきました。アプリケーションの信頼できる情報源はリモートデータベースサーバーに存在し、クライアント（ブラウザまたはモバイルアプリ）は、HTTPリクエストが解決されるのを待つことにそのライフサイクルを費やす薄いプレゼンテーション層として機能します。
+
+このラウンドトリップアーキテクチャのレイテンシを隠すために、フロントエンド開発者は何千時間ものエンジニアリング作業を費やして回避策を講じてきました。ローディングスケルトン、スピナーオーバーレイ、そして電車がトンネルに入ったりモバイル信号が途切れたりすると頻繁にロールバックされる楽観的なUIミューテーションなどです。
+
+**ローカルファーストソフトウェア**は、Martin KleppmannとInk & Switchの研究者によって体系化されたパラダイムであり、この関係を根本的に逆転させます。ローカルファーストアプリケーションでは、**信頼できる情報源はユーザーのデバイス上にローカルに存在します**（IndexedDBまたはOPFS経由のSQLite内）。ネットワーク同期は、オプションのトランスポート層としてバックグラウンドで非同期に行われます。
+
+このガイドでは、**競合のないレプリケートされたデータ型（CRDT）**の数学的原則を分解し、**Yjs**とIndexedDBを使用して回復力のあるローカルファースト同期パイプラインを実装し、実際のピアツーピアコラボレーションを処理する方法を検討します。
+
+---
+
+<AudioPlayer src="/static/audio/local-first-web-apps-crdts.mp3" title="エグゼクティブオーディオブリーフィング" />
+
+## ローカルファーストソフトウェアの核となる原則
+
+ローカルファーストアプリケーションは、7つの基本的な理念に準拠しています。
+
+1.  **ゼロレイテンシの読み書き**: すべてのインタラクション（クリック、タイピング、並べ替え）は、ローカルディスクストレージを瞬時に変更します。ユーザーはローディングスピナーを見ることはありません。
+2.  **マルチデバイスのシームレスな同期**: ラップトップで作成された作業は、接続が利用可能になったときにスマートフォンやデスクトップにシームレスに同期されます。
+3.  **ネットワークオプション**: アプリケーションは、機能が低下することなく、完全な機内モードで100%動作します。
+4.  **デフォルトでのコラボレーション**: 2人以上のユーザーが、互いの貢献を上書きすることなく、同じドキュメントを同時に編集できます。
+5.  **データの永続性**: クラウド同期サーバーを提供する会社が倒産したり閉鎖されたりしても、ユーザーのデータはローカルディスク上で完全にアクセス可能なまま永続的に保持されます。
+
+```
+[Traditional Cloud App vs Local-First Architecture]
+
+  Traditional Cloud Architecture (Central Source of Truth)
+  User Interaction ──► [Wait...] ──► Remote API Server ──► PostgreSQL
+                           ▲
+                    Network Flake = Broken UI
+
+  Local-First Architecture (Local Source of Truth)
+  User Interaction ──► Local Disk (IndexedDB / SQLite OPFS) ──► Instant 0ms Render
+                             │
+                             ▼ (Background Async Transport)
+                      CRDT State Sync Layer (P2P WebRTC / WebSocket Relay)
+```
+
+---
+
+## CRDTの数学：マージ順序が重要ではない理由
+
+分散オフラインシステムにおける主要なエンジニアリング上の障害は、**競合解決**です。ユーザーAがフライト中にオフラインで段落1を編集し、ユーザーBがオフィスでオフラインで同じ段落を編集した場合、両者が再接続したときにシステムはどのように編集をマージするのでしょうか？
+
+初期のGoogle Docsで使用されていたOperational Transformation（OT）のような従来のアルゴリズムは、すべて操作を線形に順序付けるために、集中型の権威あるサーバーを必要とします。中央サーバーに到達できない場合、コラボレーションは停止します。
+
+**競合のないレプリケートされたデータ型（CRDT）**は、集中型の調整なしに複数の分散ノード間でレプリケートされるように設計された数学的構造です。これらは3つの核となる数学的特性を満たします。
+
+1.  **可換性**: $A \cdot B = B \cdot A$（更新が受信される順序は関係ありません）。
+2.  **結合性**: $(A \cdot B) \cdot C = A \cdot (B \cdot C)$（着信パケットのグループ化は結果に影響しません）。
+3.  **冪等性**: $A \cdot A = A$（同じ更新を複数回適用しても同じ結果が生成され、重複パケットのバグが解消されます）。
+
+ノードの更新が順序通りに、順不同で、または不安定なネットワーク上で重複して到着しても、**すべてのクライアントは数学的にまったく同じ状態に収束することが保証されます**。
+
+---
+
+## YjsとIndexedDBによる本番環境での実装
+
+**Yjs**は、JavaScriptエコシステムで最高のパフォーマンスを誇るCRDTライブラリです。ドキュメントを状態ベクトルの内部リンクリストとして表現し、初期のJSON CRDTよりも桁違いに高速なメモリフットプリントと実行速度を実現します。
+
+### ステップ1：依存関係のインストール
+
+```bash
+npm install yjs y-indexeddb y-webrtc y-websocket
+```
+
+### ステップ2：ローカルドキュメントと永続化層の初期化
+
+`Y.Doc`を初期化し、ブラウザのIndexedDBストレージに`y-indexeddb`を使用してすぐにバインドします。すべての状態はミリ秒単位でローカルディスクからロードされます。
+
+```typescript
+// local-store.ts
+import * as Y from 'yjs';
+import { IndexeddbPersistence } from 'y-indexeddb';
+import { WebrtcProvider } from 'y-webrtc';
+import { WebsocketProvider } from 'y-websocket';
+
+export interface TaskItem {
+  id: string;
+  title: string;
+  completed: boolean;
+  updatedAt: number;
+}
+
+export class LocalFirstTaskStore {
+  doc: Y.Doc;
+  tasksMap: Y.Map<TaskItem>;
+  persistence: IndexeddbPersistence;
+  webrtcProvider: WebrtcProvider | null = null;
+  wsProvider: WebsocketProvider | null = null;
+
+  constructor(boardId: string) {
+    // 1. Instantiate the root CRDT Document
+    this.doc = new Y.Doc();
+
+    // 2. Bind to local IndexedDB (Persistence First)
+    this.persistence = new IndexeddbPersistence(`kanban-board-${boardId}`, this.doc);
+
+    // 3. Define shared state maps
+    this.tasksMap = this.doc.getMap<TaskItem>('tasks');
+
+    this.persistence.on('synced', () => {
+      console.log('Local IndexedDB loaded into memory successfully!');
+    });
+
+    // 4. Initialize Multi-Transport Network Providers
+    this.initNetworkSync(boardId);
+  }
+
+  private initNetworkSync(boardId: string) {
+    // P2P WebRTC Mesh: Direct browser-to-browser syncing over local LAN/STUN
+    this.webrtcProvider = new WebrtcProvider(`room-${boardId}`, this.doc, {
+      signaling: ['wss://signaling.yjs.dev', 'wss://y-webrtc-signaling-eu.herokuapp.com'],
+    });
+
+    // Central WebSocket Relay fallback (for reliable cross-firewall sync)
+    this.wsProvider = new WebsocketProvider(
+      'wss://demos.yjs.dev',
+      `room-${boardId}`,
+      this.doc
+    );
+  }
+
+  // --- CRUD Operations (All 100% Synchronous and Zero-Latency) ---
+
+  addTask(id: string, title: string) {
+    this.doc.transact(() => {
+      this.tasksMap.set(id, {
+        id,
+        title,
+        completed: false,
+        updatedAt: Date.now(),
+      });
+    });
+  }
+
+  toggleTask(id: string) {
+    const existing = this.tasksMap.get(id);
+    if (!existing) return;
+
+    this.doc.transact(() => {
+      this.tasksMap.set(id, {
+        ...existing,
+        completed: !existing.completed,
+        updatedAt: Date.now(),
+      });
+    });
+  }
+
+  deleteTask(id: string) {
+    this.tasksMap.delete(id);
+  }
+
+  subscribe(callback: (tasks: TaskItem[]) => void) {
+    const observer = () => {
+      const items = Array.from(this.tasksMap.values());
+      callback(items);
+    };
+
+    this.tasksMap.observe(observer);
+    // Initial emission
+    observer();
+
+    return () => {
+      this.tasksMap.unobserve(observer);
+    };
+  }
+
+  destroy() {
+    this.webrtcProvider?.destroy();
+    this.wsProvider?.destroy();
+    this.persistence.destroy();
+    this.doc.destroy();
+  }
+}
+```
+
+---
+
+## React 19との統合
+
+Reactコンポーネント内でこのストアを使用する場合、フェッチリクエストは不要です。ローカルCRDTオブザーバーに直接サブスクライブします。
+
+```tsx
+'use client';
+
+import { useEffect, useState, useMemo } from 'react';
+import { LocalFirstTaskStore, TaskItem } from './local-store';
+
+export function KanbanBoard({ boardId }: { boardId: string }) {
+  const [tasks, setTasks] = useState<TaskItem[]>([]);
+  const [inputTitle, setInputTitle] = useState('');
+
+  const store = useMemo(() => new LocalFirstTaskStore(boardId), [boardId]);
+
+  useEffect(() => {
+    const unsubscribe = store.subscribe((updatedTasks) => {
+      setTasks(updatedTasks);
+    });
+
+    return () => {
+      unsubscribe();
+      store.destroy();
+    };
+  }, [store]);
+
+  function handleCreate(e: React.FormEvent) {
+    e.preventDefault();
+    if (!inputTitle.trim()) return;
+
+    store.addTask(crypto.randomUUID(), inputTitle.trim());
+    setInputTitle('');
+  }
+
+  return (
+    <div className="p-6 max-w-xl mx-auto space-y-4">
+      <h1 className="text-2xl font-bold">Offline-First Tasks</h1>
+
+      <form onSubmit={handleCreate} className="flex gap-2">
+        <input
+          type="text"
+          value={inputTitle}
+          onChange={(e) => setInputTitle(e.target.value)}
+          placeholder="New task (works offline)..."
+          className="flex-1 rounded border px-3 py-2 text-sm"
+        />
+        <button type="submit" className="rounded bg-blue-600 px-4 py-2 text-white text-sm font-medium">
+          Add Task
+        </button>
+      </form>
+
+      <ul className="divide-y border rounded-xl overflow-hidden bg-white dark:bg-gray-900">
+        {tasks.map((task) => (
+          <li key={task.id} className="flex items-center justify-between p-3">
+            <span className={task.completed ? 'line-through text-gray-400' : ''}>
+              {task.title}
+            </span>
+            <div className="flex gap-2">
+              <button
+                onClick={() => store.toggleTask(task.id)}
+                className="text-xs px-2 py-1 rounded bg-gray-100 dark:bg-gray-800"
+              >
+                {task.completed ? 'Undo' : 'Done'}
+              </button>
+              <button
+                onClick={() => store.deleteTask(task.id)}
+                className="text-xs px-2 py-1 rounded bg-red-50 text-red-600"
+              >
+                Delete
+              </button>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+```
+
+---
+
+## 本番環境の現実とエンジニアリング上のトレードオフ
+
+ローカルファーストは究極のユーザーエクスペリエンスを提供しますが、独自のアーキテクチャ上のトレードオフがあります。
+
+1.  **ストレージ制限**: モバイルSafariは、ユーザーが明示的な許可を与えない限り、IndexedDBを1GBに制限する歴史があります。メディアを多用するアプリの場合、バイナリ（写真、ビデオ）はクラウドオブジェクトストレージ（S3）に保存し、CRDTメタデータ参照はローカルに保持します。
+2.  **スキーマの進化と移行**: 従来のクラウドデータベースでは、`prisma migrate`を実行すると単一の中央スキーマが更新されます。ローカルファーストでは、何千ものクライアントデバイスが6ヶ月前のコードバージョンを実行している可能性があります。CRDTスキーマの変更は、常に厳密に後方互換性がある必要があります。
+3.  **エンドツーエンド暗号化**: 同期リレーはバイナリCRDT状態ベクトルをルーティングするだけなので、送信前にWeb Crypto（`AES-GCM-256`）を使用してクライアント上でデータペイロードを簡単に暗号化できます。同期サーバーは、ユーザーデータを読み取ることなく、不透明な暗号化されたブロブをルーティングします。
+
+---
+
+## よくある質問
+
+### YjsとAutomergeの違いは何ですか？
+どちらも業界をリードするCRDTの実装です。YjsはJavaScriptで書かれており、リアルタイムの共同テキスト編集と低メモリ使用量に特化して最適化されています。AutomergeはRust（WebAssemblyバインディング付き）で実装されており、リッチなJSONドキュメント構造、タイムトラベルバージョニング、および正式な暗号証明に重点を置いています。
+
+### ローカルファーストアプリは従来のリレーショナルデータベースと連携できますか？
+はい、できます！ハイブリッドアーキテクチャでは、ElectricSQL、PowerSync、またはZero（Rocicorp製）のようなツールを使用します。これらのツールは、クライアント上でSQLiteエンジンをローカルに実行し、双方向同期デルタを中央のPostgreSQLデータベースに継続的にストリーミングします。
+
+### Yjsは状態ベクトルが無限に増大するのをどのように防ぎますか？
+CRDTは操作履歴（墓石）を追跡します。ユーザーが10,000個のアイテムを削除した場合、単純なCRDTは削除の墓石を永遠に保持します。Yjsは**状態ベクトル圧縮**を実装しています。すべてのアクティブなピアが状態スナップショットを承認すると、墓石はガベージコレクションされ、コンパクトなバイナリ表現に統合されます。
+
+---
+
+## こちらもおすすめです
+
+- [WebGLとThree.jsのパフォーマンス](/en/blog/webgl-threejs-performance)
+- [Apache Kafkaによるリアルタイムデータストリーミング：バックエンドエンジニア向けガイド](/en/blog/real-time-kafka)
+- [Goの高度な並行処理パターン](/en/blog/advanced-go-concurrency)
+- [Go 1.23イテレータ：実践ガイド](/en/blog/go-1-23-iterators)

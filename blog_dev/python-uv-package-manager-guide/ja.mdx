@@ -1,0 +1,227 @@
+---
+title: "DockerにおけるAstral uv: マルチステージビルド、BuildKitキャッシュ、高速CI"
+date: "2026-09-18"
+summary: "Astral uv、マルチステージターゲット、BuildKit永続キャッシュマウント、軽量runtimeイメージを活用して、Python Dockerビルドを数分から数秒に高速化します。"
+tags: ["python", "docker", "devops", "performance", "cicd"]
+draft: false
+proficiencyLevel: "Intermediate"
+programmingLanguage: "Python"
+images: 
+  - "/static/images/python-uv-docker-multistage-build-featured.jpg"
+  - "/static/images/python-uv-docker-multistage-build-infographic.png"
+---
+
+Pythonコンテナを構築するすべての開発者は、Dockerレイヤーの無効化によるフィードバックループの遅さを経験しています。アプリケーションコードを1行変更し、`docker build`を実行すると、PyTorch、Pandas、または重いC拡張機能をPyPIから再ダウンロードするために、ターミナルが4分間も費やすのを目にすることになります。
+
+AstralのRustベースのパッケージマネージャー`uv`とDocker BuildKitキャッシュマウントを使用すれば、再ビルド時間を2秒未満に短縮できます。
+
+**ビルド比較の概要:**
+
+<AudioPlayer src="/static/audio/python-uv-package-manager-guide.mp3" title="Executive Audio Briefing" />
+
+| 戦略 | コールドビルド時間 | コードのみの再ビルド | 最終イメージサイズ | CVE攻撃対象領域 |
+| :--- | :--- | :--- | :--- | :--- |
+| `pip install -r reqs.txt` | 約65秒 | 約45秒（無効化された場合） | 約850MB | 高（コンパイラが残る） |
+| `poetry install` | 約110秒 | 約60秒 | 約920MB | 高（poetryランタイムが残る） |
+| **uvマルチステージ + BuildKit** | **約4.5秒** | **約1.2秒** | **約140MB** | **最小限（純粋な仮想環境）** |
+
+![Optimized Python Docker Builds with uv](/static/images/python-uv-docker-multistage-build-infographic.png)
+
+---
+
+## 従来のPython Dockerfileの3つの欠点
+
+ほとんどのプロダクションDockerfileには、構造的なパフォーマンスの問題が3つあります。
+
+1.  **コンパイラが最終イメージに残る:** シングルステージのDockerfile内で`apt-get install gcc build-essential`を実行すると、コンパイラ、ヘッダーファイル、パッケージマネージャーのキャッシュがプロダクションコンテナ内に残り、イメージサイズが1GBを超えて肥大化します。
+2.  **レイヤーキャッシュのスラッシング:** 依存関係をインストールする前に`COPY . .`を配置すると、コミットごとに依存関係キャッシュが無効になります。
+3.  **CIでの永続的なホイールキャッシュがない:** 新しいGitHub Actionsランナーで`docker build`を実行すると、プルリクエストごとにPyPIからすべてのホイールが再ダウンロードされます。
+
+解決策は、公式のスタンドアロン`uv`バイナリとBuildKit永続キャッシュマウントを使用したクリーンなマルチステージパイプラインです。
+
+---
+
+## フェーズ1: スタンドアロンのuvバイナリの取得
+
+`RUN pip install uv`を実行する（Pythonが必要で不要なレイヤーを追加する）代わりに、コンパイル済みのRustバイナリをAstralの公式イメージから直接コピーします。
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+FROM python:3.12-slim AS builder
+
+# Copy the standalone uv binary directly (sub-millisecond copy)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+```
+
+これにより、ビルドオーバーヘッドなしで`uv`がすぐに利用可能になります。
+
+---
+
+## フェーズ2: 2段階の依存関係同期
+
+ソースコードの編集によって依存関係のダウンロードが再実行されるのを防ぐため、インストールを2つの異なるステージに分割します。
+
+```dockerfile
+WORKDIR /app
+
+# Enable bytecode compilation and standalone copy linking
+ENV UV_COMPILE_BYTECODE=1
+ENV UV_LINK_MODE=copy
+
+# Step A: Copy ONLY lockfiles first
+COPY pyproject.toml uv.lock ./
+
+# Step B: Install dependencies without installing the root project
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project
+```
+
+`--no-install-project`に注目してください。これは`uv`に対し、アプリケーションのソースコードがまだ存在しないことを前提として、仮想環境を構築し、すべてのサードパーティの依存関係をダウンロードするように指示します。
+
+次に、ソースコードをコピーして最終同期を実行します。
+
+```dockerfile
+# Step C: Copy application source code
+COPY src/ ./src/
+
+# Step D: Fast sync to install your project into the existing virtualenv
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+```
+
+`src/main.py`を編集すると、DockerはステップBのキャッシュされたレイヤーを再利用します。すべてのホイールがすでに`.venv`に存在するため、ステップDは300ミリ秒未満で実行されます。
+
+---
+
+## フェーズ3: 軽量なプロダクションランナー
+
+ビルダー段階には、`uv`、パッケージメタデータ、および中間ビルドツールが含まれています。これらはどれもプロダクションには不要です。
+
+ステージ2では、クリーンな`python:3.12-slim`ベースから開始し、非ルートユーザーを作成し、`.venv`ディレクトリのみをコピーします。
+
+```dockerfile
+FROM python:3.12-slim AS runner
+
+# Create non-root system user
+RUN groupadd -r appgroup && useradd -r -g appgroup appuser
+
+WORKDIR /app
+
+# Copy the pre-built virtual environment from builder
+COPY --from=builder --chown=appuser:appgroup /app/.venv /app/.venv
+COPY --from=builder --chown=appuser:appgroup /app/src /app/src
+
+# Put virtualenv binaries at the front of PATH
+ENV PATH="/app/.venv/bin:$PATH"
+
+USER appuser
+
+EXPOSE 8000
+
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+`PATH`が`/app/.venv/bin`を指しているため、`uvicorn`を実行すると、`python -m`やアクティベーションスクリプトを必要とせずに、仮想環境内のバイナリが直接実行されます。
+
+このコンテナ内で実行するASGIスタックを選択する場合は、[FastAPI vs Litestar: Performance & Memory](/en/blog/fastapi-vs-litestar-comparison)に関するベンチマーク比較をご覧ください。プロダクション負荷の下で非同期ワーカーがOOMクラッシュなしで安定稼働するようにするには、[プロダクションでの非同期Pythonメモリリークのプロファイリング](/en/blog/python-async-memory-leak-profiling)に関するガイドと組み合わせてください。
+
+---
+
+## 完全なコピペ可能なプロダクションDockerfile
+
+以下は、プロダクション対応の完全で堅牢なマルチステージDockerfileです。
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+# Stage 1: Build virtual environment
+FROM python:3.12-slim AS builder
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /app
+
+# Optimize uv execution inside containers
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
+# 1. Cache third-party dependencies independently of source code
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project
+
+# 2. Copy source code and perform final project sync
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+# Stage 2: Final minimal production runtime
+FROM python:3.12-slim AS runner
+
+RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
+
+WORKDIR /app
+
+# Copy only the compiled virtualenv and application source
+COPY --from=builder --chown=appuser:appuser /app/.venv /app/.venv
+COPY --from=builder --chown=appuser:appuser /app/src /app/src
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+USER appuser
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+---
+
+## GitHub ActionsでのBuildKitキャッシュマウントの永続化
+
+ローカルマシンでは、Docker BuildKitはビルド間で`/root/.cache/uv`を自動的にキャッシュします。一時的なGitHub Actionsランナーでは、ランナーが終了するとそのキャッシュは消滅します。
+
+CI実行間で`uv`キャッシュを永続化するには、DockerのGitHub Actionsキャッシュバックエンドを設定します（リモートキャッシュタイプとレジストリエクスポーターについては、[Docker BuildKitキャッシュマウントとマルチステージ最適化](/en/blog/docker-buildkit-cache-mount-optimization)に関する詳細な解説をご覧ください）。
+
+```yaml
+name: Docker Build & Push
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+`cache-to: type=gha,mode=max`を追加することで、BuildKitは永続的な`/root/.cache/uv`マウントをGitHubのキャッシュストレージにエクスポートします。その後のPRビルドでは、ネットワークに触れることなくキャッシュされたホイールを直接プルします。
+
+---
+
+## 経験則
+
+通常のアプリケーション開発中にDockerビルドが依存関係の解決に5秒以上費やしている場合、レイヤーキャッシュの境界が早すぎます。
+
+ロックファイルのみをコピーし、`--no-install-project`で同期し、`/root/.cache/uv`をマウントし、最終的なランナーには`.venv`ディレクトリのみをコピーしてください。
+
+## こちらもおすすめ
+
+- [FastAPI Docker Multistage Builds: Cut Your Image Size by 70%](/en/blog/fastapi-docker-multistage-build)
+- [Why My Docker Images Were 1GB (And How I Shrank Them to 50MB)](/en/blog/docker-image-optimization)
+- [Docker Compose for Local Development: A Complete Setup Guide](/en/blog/docker-compose-local-development)
+- [Dev Containers Guide: Docker Environments in VS Code](/en/blog/devcontainers-for-consistent-environments)

@@ -1,0 +1,167 @@
+---
+title: "Cách React Compiler Thực sự Hoạt động: Tìm hiểu sâu về React Forget"
+date: "2026-11-20"
+draft: false
+summary: "Tìm hiểu chuyên sâu về React Forget và React Compiler, bao gồm các biến đổi AST, phân tích luồng dữ liệu và lý do bạn cuối cùng có thể xóa useMemo."
+image: "/static/images/react_compiler_internals_1786471417067.jpg"
+tags: ["react", "javascript", "compiler", "performance"]
+images: ['/static/images/react-compiler-internals.png']
+---
+
+# Hồi Kết Của Việc Memoization Thủ Công
+
+Trong nhiều năm, các nhà phát triển React đã cùng chia sẻ một nỗi đau chung: memoization thủ công. Nếu bạn đã từng làm việc trên một ứng dụng React từ cỡ trung bình đến lớn, bạn sẽ quen thuộc một cách sâu sắc với `useMemo`, `useCallback` và `React.memo`. Chúng là những điều cần thiết nhưng khó chịu của mô hình render của React—những công cụ chúng ta sử dụng để bọc các giá trị, hàm và component của mình nhằm ngăn framework tính toán lại các phép toán tốn kém hoặc render DOM quá mức trên mỗi lần thay đổi trạng thái.
+
+Điều này dẫn đến cái mà nhiều người gọi là "địa ngục memoization":
+
+```jsx
+// The old way: Manual dependency arrays and cognitive overhead
+function DataDashboard({ user, metrics }) {
+  const processedMetrics = useMemo(() => {
+    return heavyDataProcessing(metrics);
+  }, [metrics]);
+
+  const handleExport = useCallback(() => {
+    exportToCsv(processedMetrics, user.id);
+  }, [processedMetrics, user.id]);
+
+  return <DashboardChart data={processedMetrics} onExport={handleExport} />;
+}
+```
+
+React Compiler (ban đầu có tên mã là *React Forget*) được xây dựng với một mục tiêu duy nhất, đầy tham vọng: **làm cho React nhanh theo mặc định**. Bằng cách chuyển gánh nặng memoization từ nhà phát triển sang công cụ build, React Compiler cho phép chúng ta viết JavaScript thuần túy mà không mất đi lợi ích hiệu suất của tính bằng tham chiếu (referential equality).
+
+Hãy cùng tìm hiểu sâu hơn để xem chính xác cách thức hoạt động của điều kỳ diệu này.
+
+<AudioPlayer src="/static/audio/react-compiler-internals.mp3" title="Tóm tắt âm thanh dành cho cấp điều hành" />
+
+## Tất Cả Là Về AST (Cây Cú Pháp Trừu Tượng)
+
+React Compiler không phải là một thư viện runtime; nó là một plugin Babel (và ngày càng trở thành một bộ công cụ dựa trên Rust) hoạt động trong quá trình build, phân tích các component React của bạn trước khi chúng đến trình duyệt.
+
+Bước đầu tiên trong quá trình này là phân tích cú pháp JSX và JavaScript của bạn thành một **Cây Cú Pháp Trừu Tượng (AST)**. AST là một biểu diễn cây phân cấp của mã của bạn. Thay vì nhìn thấy `const x = 5;`, trình biên dịch nhìn thấy một `VariableDeclaration` chứa một `Identifier` ("x") và một `NumericLiteral` (5).
+
+Khi trình biên dịch có cây này, nó có thể thực hiện **Phân Tích Luồng Dữ Liệu Tĩnh (Static Data-Flow Analysis)**.
+
+### Phân Tích Luồng Dữ Liệu và Suy Luận Kiểu
+
+Không giống như các công cụ rút gọn hoặc đóng gói tiêu chuẩn, React Compiler phải hiểu *ý định* của mã của bạn. Nó cần biết biến nào phụ thuộc vào trạng thái, biến nào bị thay đổi và giá trị nào được truyền xuống dưới dạng props cho các component con.
+
+Trình biên dịch duyệt qua AST của bạn và lập bản đồ các phụ thuộc dữ liệu. Nó đặt ra các câu hỏi như:
+1. Biến này có được lấy từ một prop của React không?
+2. Đối tượng này có bị thay đổi sau đó trong hàm render không?
+3. Hàm này có gọi một API bên ngoài hoặc một React Hook không?
+
+Nếu trình biên dịch xác định rằng một giá trị là xác định (nó chỉ dựa vào đầu vào của nó và không dựa vào các thay đổi trạng thái toàn cục), nó sẽ đánh dấu giá trị đó là một ứng cử viên để memoization.
+
+## Sự Biến Đổi: Mã Thay Đổi Như Thế Nào Bên Trong
+
+Hãy xem cách React Compiler thực sự biến đổi mã của bạn.
+
+Hãy xem component React tiêu chuẩn, chưa được memoize này:
+
+```javascript
+function UserProfile({ user }) {
+    // 1. Object allocation
+    const userTheme = { color: user.preferences.themeColor };
+    
+    // 2. Heavy computation
+    const formattedData = processUserHistory(user.history);
+    
+    // 3. JSX allocation
+    return (
+        <div style={userTheme}>
+            <HistoryGraph data={formattedData} />
+        </div>
+    );
+}
+```
+
+Nếu không có trình biên dịch, mỗi khi `UserProfile` render (ngay cả khi `user` không thay đổi), React sẽ cấp phát một đối tượng `userTheme` mới trong bộ nhớ. Vì đây là một tham chiếu đối tượng mới, nếu chúng ta truyền nó cho một component con, component con đó sẽ render lại.
+
+Đây là một ước tính về những gì React Compiler xuất ra sau khi biến đổi AST:
+
+```javascript
+import { c as _useMemoCache } from "react/compiler-runtime";
+
+function UserProfile({ user }) {
+    // Allocate a cache array for this component
+    const $ = _useMemoCache(4);
+    
+    // Cache the userTheme object
+    let userTheme;
+    if ($[0] !== user.preferences.themeColor) {
+        userTheme = { color: user.preferences.themeColor };
+        $[0] = user.preferences.themeColor;
+        $[1] = userTheme;
+    } else {
+        userTheme = $[1];
+    }
+    
+    // Cache the formatted data
+    let formattedData;
+    if ($[2] !== user.history) {
+        formattedData = processUserHistory(user.history);
+        $[2] = user.history;
+        $[3] = formattedData;
+    } else {
+        formattedData = $[3];
+    }
+    
+    // Return the JSX (which can also be cached!)
+    return (
+        <div style={userTheme}>
+            <HistoryGraph data={formattedData} />
+        </div>
+    );
+}
+```
+
+### Phân Tích Sự Biến Đổi
+
+1. **`_useMemoCache(n)`**: Trình biên dịch chèn một hook nội bộ đặc biệt để cấp phát một mảng `n` khe cắm để lưu trữ giá trị. Điều này cực kỳ nhanh và hiệu quả về bộ nhớ so với việc gọi nhiều hook `useMemo`.
+2. **Theo Dõi Phụ Thuộc Chi Tiết**: Hãy chú ý cách trình biên dịch kiểm tra `$[0] !== user.preferences.themeColor`. Nó không chỉ theo dõi toàn bộ đối tượng `user`; nó theo dõi chính xác thuộc tính lồng nhau mà biến đó phụ thuộc vào!
+3. **Lưu Trữ Đối Tượng Ngầm Định**: Đối tượng `userTheme` hiện đã được lưu trữ. Định danh tham chiếu của nó vẫn hoàn toàn giống nhau qua các lần render trừ khi `themeColor` thay đổi.
+
+## Các Quy Tắc Của React Vừa Trở Nên Nghiêm Ngặt Hơn
+
+Vì trình biên dịch dựa vào phân tích tĩnh, nó giả định rằng bạn đang viết React theo cách thông thường, tuân thủ quy tắc. Nếu bạn vi phạm Quy Tắc của React, trình biên dịch không thể tối ưu hóa mã của bạn một cách an toàn.
+
+Cụ thể, trình biên dịch mong đợi rằng **các hàm render của bạn là thuần túy (pure)**.
+
+Nếu bạn thay đổi một đối tượng trong quá trình render:
+
+```javascript
+function BadComponent({ data }) {
+    // 🚨 Mutating variables during render!
+    data.lastViewed = Date.now(); 
+    return <div>{data.name}</div>;
+}
+```
+
+Trình biên dịch sẽ phát hiện sự thay đổi này. Hiện tại, nếu React Compiler phát hiện một vi phạm Quy Tắc của React mà nó không thể khắc phục một cách an toàn, nó sẽ đơn giản **bỏ qua** việc tối ưu hóa component cụ thể đó và để nó không được memoize. Nó sẽ không làm hỏng ứng dụng của bạn, nhưng bạn sẽ mất đi lợi ích về hiệu suất.
+
+Để đảm bảo codebase của bạn sẵn sàng cho trình biên dịch, bạn nên thực thi nghiêm ngặt `eslint-plugin-react-hooks` và `eslint-plugin-react-compiler` mới.
+
+## Tại Sao Không Dùng Signals?
+
+Một câu hỏi phổ biến trong hệ sinh thái frontend hiện đại là: *Nếu Vue, Solid và Preact đang sử dụng Signals để phản ứng chi tiết, tại sao React lại dành nhiều năm để xây dựng một trình biên dịch thay vì thế?*
+
+Câu trả lời nằm ở triết lý cốt lõi của React: **UI là một hàm của trạng thái**.
+
+Signals giới thiệu một mô hình tư duy hoàn toàn khác. Chúng yêu cầu bạn bọc các giá trị của mình trong các đối tượng có thể quan sát đặc biệt (ví dụ: `signal.value`). Khi một signal cập nhật, nó cập nhật DOM một cách chính xác mà không cần chạy lại hàm component.
+
+Đội ngũ React tin rằng mô hình "chạy lại hàm" dễ hiểu hơn. Nó giống như JavaScript tiêu chuẩn. Bằng cách xây dựng một trình biên dịch, React mang lại cho chúng ta các đặc tính hiệu suất của phản ứng chi tiết (như Signals) trong khi cho phép chúng ta viết các biến JavaScript thuần túy, bất biến. Bạn có được cả hai lợi ích tốt nhất.
+
+## Kết Luận
+
+React Compiler đại diện cho sự thay đổi đáng kể nhất trong trải nghiệm nhà phát triển React kể từ khi giới thiệu Hooks vào năm 2018. Bằng cách chuyển gánh nặng về tính bằng tham chiếu và các phép tính tốn kém từ nhà phát triển sang bước build, React đang trở lại lời hứa ban đầu của nó: chỉ cần mô tả giao diện người dùng của bạn trông như thế nào đối với một trạng thái nhất định, và framework sẽ xử lý phần còn lại một cách hiệu quả.
+
+Cuối cùng bạn có thể xóa `useMemo`.
+
+## Bạn Cũng Có Thể Thích
+
+- [Hướng dẫn tự động memoization của React Compiler](/en/blog/react-compiler-auto-memoization-guide)
+- [Hướng dẫn tối ưu React Router năm 2026](/en/blog/react-router-2026-guide)
+- [Hướng dẫn tái xác thực động Next.js App Router](/en/blog/nextjs-app-router-revalidate-tag-cache)
+- [Giải mã bộ nhớ đệm Next.js 14 App Router: Gỡ lỗi dữ liệu cũ](/en/blog/nextjs-14-app-router-caching-strategies)

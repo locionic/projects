@@ -1,0 +1,269 @@
+---
+draft: false
+title: "FastAPIとDockerマルチステージビルド：イメージサイズを70%削減"
+category: devops
+date: '2026-07-29'
+lastUpdated: '2026-09-22'
+tags: ["docker", "python", "fastapi", "devops", "uv"]
+summary: "コンパイラを本番環境にデプロイするのはやめましょう。uvとBuildKitのキャッシュを使ったFastAPIのDockerマルチステージビルドで、イメージサイズを1.2GBから100MB未満に削減し、CIの再ビルドを高速化する方法を紹介します。"
+images: ['/static/images/fastapi-docker-multistage-build.jpg']
+authors: ['default']
+---
+
+ほとんどのPython開発者は、シンプルな`Dockerfile`から始めます。`python:3.12`をプルし、要件をインストールし、FastAPIアプリをコピーして、出荷します。
+
+問題は何でしょうか？イメージが1.2GBになってしまいます。ビルドツール、Cコンパイラ、そして本番サーバーでは決して使わない開発ヘッダーが含まれています。デプロイ時にはプルに永遠の時間がかかり、攻撃対象領域を拡大します。
+
+Pythonアプリケーションをデプロイするなら、マルチステージDockerビルドは必須です。
+
+このガイドでは、同じDockerfileの3つのバージョンを、それぞれ前のバージョンを基にして説明します。
+1. **クラシックマルチステージ** — 基本的な修正
+2. **BuildKitキャッシュマウント** — CIでの高速リビルド
+3. **uvベース** — 最速の最新アプローチ
+
+![FastAPI Docker Multistage Builds](/static/images/fastapi-docker-multistage-build.jpg)
+
+<AudioPlayer src="/static/audio/fastapi-docker-multistage-build.mp3" title="Executive Audio Briefing" />
+
+## シングルステージPythonビルドが失敗する理由
+
+Pythonは、`psycopg2`、`cryptography`、`lxml`のような人気ライブラリのC拡張機能をビルドするためにコンパイラを必要とします。
+
+`pip install`を実行すると、多くの場合、ソースコードをダウンロードしてコンパイルします。これを機能させるには、ベースとなるDockerイメージに`build-essential`と`python3-dev`が必要です。その同じステージを本番環境に出荷すると、コンパイラも出荷することになります。
+
+ハッカーは、本番Webサーバー上でコンパイラを見つけるのが大好きです。エクスプロイトのコンパイルが非常に簡単になるからです。
+
+![Why single-stage Python builds fail](/static/images/why-single-stage-python-builds-fail.jpg)
+
+## バージョン1：クラシックマルチステージビルド
+
+マルチステージビルドは、`Dockerfile`を個別のステージに分割します。
+
+1. **ビルダー・ステージ**: 重いベースイメージ。コンパイラをインストールし、仮想環境を構築します。
+2. **ランタイム・ステージ**: 軽量なスリムイメージ。コンパイルされたvenvとアプリケーションコード*のみ*をコピーします。
+
+コンパイラが本番環境に到達することはありません。
+
+![The Multistage Solution](/static/images/the-multistage-solution.jpg)
+
+```dockerfile
+# Stage 1: Builder
+FROM python:3.12-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a self-contained virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Stage 2: Runtime
+FROM python:3.12-slim
+
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+WORKDIR /app
+
+# Runtime-only native lib (no compiler)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Transfer the fully-built venv — no build tools come with it
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY . .
+RUN chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+**結果**: 約1.2GBのイメージではなく、約150MBのイメージになります。
+
+### Alpine vs. Slim — PythonにはAlpineを使用しない
+
+Alpineは`glibc`の代わりに`musl libc`を使用します。多くのPythonパッケージ（`numpy`、`pandas`、`cryptography`）は、`glibc`専用のプリコンパイル済みホイールを出荷しています。Alpineでは、`pip`はすべてソースからコンパイルする必要があり、ビルドが劇的に遅くなり、頻繁に不明なCエラーが発生します。
+
+常に`python:X.Y-slim`を使用してください。これはDebianベースで、`glibc`を使用しており、本番環境に十分なほど小さいです。
+
+### 非ルートが重要な理由
+
+Dockerはデフォルトでコンテナを`root`として実行します。コンテナ内でルートアクセスを持つFastAPIプロセスが侵害されると、任意のファイルへの書き込み、ツールのインストール、共有ボリュームを介した他のコンテナへのピボットが可能になります。`USER appuser`の行は、プロセスが開始する前に低特権ユーザーに切り替えます。これは、PodSecurityAdmissionが強制されるKubernetes環境で必要です。
+
+## バージョン2：BuildKitキャッシュマウント（高速CIリビルド）
+
+クラシックなマルチステージビルドでは、`requirements.txt`が少しでも変更されると、ビルドのたびにすべてのpipパッケージを再ダウンロードします。BuildKitキャッシュマウントはこれを解決します。
+
+```dockerfile
+# syntax=docker/dockerfile:1.4
+FROM python:3.12-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY requirements.txt .
+
+# --mount=type=cache persists pip's HTTP cache across builds
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+
+FROM python:3.12-slim
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+COPY . .
+RUN chown -R appuser:appuser /app
+USER appuser
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+BuildKitはDocker 23以降でデフォルトで有効になっています。古いバージョンでは、ビルド前に`DOCKER_BUILDKIT=1`を設定してください。
+
+**CIへの影響**: ウォームキャッシュのあるGitHub Actionsでは、以前は4分30秒かかっていたフルリビルドが約45秒に短縮されます。これは、pipがコンパイル済みホイールをダウンロードしてコンパイルする代わりに、キャッシュマウントから直接読み取るためです。
+
+## バージョン3：uv — 最速の最新アプローチ
+
+[`uv`](https://github.com/astral-sh/uv)は、10〜100倍高速なRustベースのpip代替品です。Astralは、これを簡単に統合できるDockerイメージ（`ghcr.io/astral-sh/uv`）を提供しています。
+
+```dockerfile
+# syntax=docker/dockerfile:1.4
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
+
+WORKDIR /app
+
+# Install dependencies with uv — uses BuildKit cache automatically
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    uv sync --frozen --no-install-project --no-dev
+
+# Copy application code and install the project itself
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+# Runtime stage — no uv needed here
+FROM python:3.12-slim
+
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+WORKDIR /app
+
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app /app
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+ENV PATH="/app/.venv/bin:$PATH"
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+これは`requirements.txt`の代わりに`pyproject.toml` + `uv.lock`を使用しており、環境間で再現性のある固定されたビルドを提供します。
+
+**移行**: まだ`requirements.txt`を使用している場合は、`pyproject.toml`と`uv.lock`を生成するために`uv init`と`uv add $(cat requirements.txt)`を実行してください。
+
+## イメージサイズの比較
+
+| アプローチ | ベースイメージ | イメージサイズ | コールドビルド | ウォームリビルド |
+|---|---|---|---|---|
+| シングルステージ | python:3.12 | ~1.2 GB | 4分30秒 | 4分30秒 |
+| マルチステージ（クラシック） | python:3.12-slim | ~150 MB | 2分15秒 | 2分15秒 |
+| マルチステージ + BuildKitキャッシュ | python:3.12-slim | ~150 MB | 2分15秒 | ~45秒 |
+| uvマルチステージ + BuildKit | uv:python3.12 | ~95 MB | ~60秒 | ~12秒 |
+
+uvアプローチは、CI/CDのイテレーション速度とデプロイ時間にとって最も重要な2つの指標である、最小のイメージと最速のリビルドの両方を実現します。
+
+## 本番環境でのUvicornワーカー
+
+上記の例の`CMD`は、単一のUvicornワーカーを起動します。複数のCPUコアを持つ本番環境では、Gunicornをプロセスマネージャーとして使用します。
+
+```dockerfile
+CMD ["gunicorn", "main:app", \
+     "--workers", "4", \
+     "--worker-class", "uvicorn.workers.UvicornWorker", \
+     "--bind", "0.0.0.0:8000", \
+     "--timeout", "120", \
+     "--access-logfile", "-"]
+```
+
+または、Uvicornの組み込み`--workers`フラグを使用します（よりシンプルですが、Gunicornの方がグレースフルリスタートをうまく処理します）。
+
+```dockerfile
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+```
+
+一般的なルールとして、I/OバウンドなFastAPIアプリには`--workers = 2 × CPU cores + 1`を使用します。CPUバウンドなワークロードには、ワーカー数をCPU数と正確に一致させます。
+
+## GitHub Actions CI統合
+
+```yaml
+# .github/workflows/build.yml
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          # GitHub Actions cache backend — persists BuildKit layers between runs
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+`cache-from: type=gha` / `cache-to: type=gha,mode=max`のペアは、GitHub ActionsネイティブのBuildKitキャッシュです。uvのキャッシュマウントと組み合わせることで、アプリケーションコードのみが変更された場合（依存関係の変更がない場合）、CIリビルドはほぼ瞬時に行われます。
+
+## いつ何を使うべきか
+
+| シナリオ | 推奨事項 |
+|---|---|
+| pyproject.toml を使用する新規プロジェクト | uv マルチステージ + BuildKit |
+| requirements.txt を使用するレガシープロジェクト | クラシックマルチステージ、BuildKitキャッシュを追加 |
+| 厳格なセキュリティポリシーを持つ Kubernetes | どちらでも可、非ルートユーザーを確保 |
+| マルチアーキテクチャビルド (ARM + x86) | buildx に `--platform linux/amd64,linux/arm64` を追加 |
+
+`build-essential`を本番環境に出荷するのはやめましょう。クラシックなマルチステージアプローチでさえ、イメージを87%削減し、攻撃対象領域を排除します。uvに切り替えることで、さらに迅速に目標を達成できます。
+
+## こちらもおすすめ
+
+- [Docker BuildKit Cache Mount and Multi-Stage Optimization](/en/blog/docker-buildkit-cache-mount-optimization)
+- [Docker Compose for Local Development: A Complete Setup Guide](/en/blog/docker-compose-local-development)
+- [Astral uv in Docker: Multi-Stage Builds, BuildKit Caching & Fast CI](/en/blog/python-uv-package-manager-guide)
+- [FastAPI vs Litestar 2026: Performance Benchmark and Feature Comparison](/en/blog/fastapi-vs-litestar-comparison)

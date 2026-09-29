@@ -1,0 +1,333 @@
+---
+title: "2026年のWebAssembly: ブラウザを超えて — WASI、エッジ、プラグインシステム"
+date: "2026-09-30"
+lastUpdated: "2026-09-22"
+summary: "2026年のWebAssemblyはブラウザを超え、RustをWASIにコンパイルし、WasmtimeをPythonに組み込み、Extismでサンドボックス化されたプラグインシステムを構築し、Cloudflare WorkersやFermyon Spinにデプロイできます。"
+tags: ["webassembly", "wasm", "rust", "cloud", "wasi"]
+images: ["/static/images/wasm-deep-dive.png"]
+category: "backend"
+draft: false
+---
+
+WebAssembly（Wasm）が初めて発表されたとき、ブラウザにおけるJavaScriptの独占を最終的に打ち破る技術として歓迎されました。開発者はC++、Rust、Goをバイナリ形式にコンパイルし、ウェブ上でほぼネイティブの速度で実行できるようになりました。
+
+2026年現在、Wasmの最も大きな影響はブラウザではなく、クラウドにあります。WebAssemblyはウェブ技術から、レイテンシに敏感なマルチテナント環境でコンテナに取って代わる、ユニバーサルでセキュア、かつ高速なコンピューティングランタイムへと進化しました。
+
+この記事では実践的に、RustをWASIにコンパイルし、PythonにWasmランタイムを組み込み、Extismでサンドボックス化されたプラグインシステムを構築し、Wasmが実際にコンテナを凌駕する場面を理解します。
+
+<AudioPlayer src="/static/audio/wasm-deep-dive.mp3" title="役員向けオーディオブリーフィング" />
+
+## なぜバックエンドでWasmなのか？（真の比較）
+
+一般的な説明は「Wasmはコンテナよりも高速である」というものです。これは部分的にしか真実ではありません。正確な比較は以下の通りです。
+
+| | Dockerコンテナ | WebAssemblyモジュール |
+|---|---|---|
+| 起動時間 | 500ms～2秒（コールド） | < 1ms |
+| イメージサイズ | 50 MB – 1 GB | 1 MB – 10 MB |
+| メモリベースライン | 30–100 MB | < 1 MB |
+| セキュリティモデル | Linux名前空間/cgroups | 機能ベースのサンドボックス |
+| 言語サポート | 任意（OS経由） | Wasmにコンパイル可能な任意言語 |
+| ネットワーク | フルTCP/UDPスタック | WASIソケット（プレビュー2） |
+| ファイルシステムアクセス | バインドマウント | 明示的な機能付与 |
+
+起動時間の違いが決定的な要素です。Dockerコンテナの起動はLinuxカーネルが名前空間を設定することによって制限され、これを避けることはできません。Wasmモジュールのインスタンス化はメモリ割り当てとJITコンパイルであり、**マイクロ秒**単位で測定されます。これがCloudflare Workersがネットワーク上で5000万の同時Wasmインスタンスを実行できる理由です。
+
+## コアアーキテクチャ：WASI Preview 2
+
+Wasmは元々I/Oを持っていませんでした。それは純粋な計算エンジンであり、ホストが明示的に機能を提供しない限り、ファイルを読み込んだり、ネットワークソケットを開いたり、現在の時刻を取得することさえできませんでした。
+
+**WASI (WebAssembly System Interface)** は標準化されたシステムインターフェースを定義します。WASI Preview 2（2024年安定版）では、異なる言語のWasmモジュールが相互運用できるタイプセーフなABIである**コンポーネントモデル**が導入されました。
+
+Rustプログラムを`wasm32-wasip2`にコンパイルすると、`.wasm`バイナリが生成され、変更なしで任意のOSおよびアーキテクチャ上の任意のWASI準拠ランタイム（Wasmtime、WasmEdge、Wasmer）で実行できます。
+
+## ハンズオン：RustをWASIにコンパイルする
+
+```bash
+# Install the WASI target
+rustup target add wasm32-wasip2
+
+# Create a simple HTTP handler
+cargo new wasm-handler
+cd wasm-handler
+```
+
+```toml
+# Cargo.toml
+[dependencies]
+wasi = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+```
+
+```rust
+// src/main.rs
+use std::io::{self, Read, Write};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct Request {
+    name: String,
+    multiplier: u32,
+}
+
+#[derive(Serialize)]
+struct Response {
+    message: String,
+    result: u64,
+}
+
+fn main() {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).unwrap();
+
+    let req: Request = serde_json::from_str(&input).unwrap_or(Request {
+        name: "world".to_string(),
+        multiplier: 1,
+    });
+
+    let response = Response {
+        message: format!("Hello, {}!", req.name),
+        result: fibonacci(req.multiplier as u64),
+    };
+
+    io::stdout()
+        .write_all(serde_json::to_string(&response).unwrap().as_bytes())
+        .unwrap();
+}
+
+fn fibonacci(n: u64) -> u64 {
+    match n {
+        0 => 0,
+        1 => 1,
+        _ => {
+            let mut a = 0u64;
+            let mut b = 1u64;
+            for _ in 2..=n {
+                let c = a + b;
+                a = b;
+                b = c;
+            }
+            b
+        }
+    }
+}
+```
+
+```bash
+cargo build --target wasm32-wasip2 --release
+# Output: target/wasm32-wasip2/release/wasm-handler.wasm (< 500 KB)
+
+# Run with wasmtime
+echo '{"name":"developer","multiplier":30}' | wasmtime target/wasm32-wasip2/release/wasm-handler.wasm
+# Output: {"message":"Hello, developer!","result":832040}
+```
+
+結果として得られる`.wasm`ファイルは、Linux x86、macOS ARM、Windows x86、および任意のエッジPoPで実行されます。再コンパイルなしで同一のバイナリです。
+
+## PythonへのWasmtimeの組み込み
+
+Wasmは、任意のホスト言語内でプラグインランタイムとして使用できます。これは最も強力なパターンの一つです。コアアプリケーションはPythonですが、パフォーマンスが重要なロジックやユーザーが送信したロジックはサンドボックス化されたWasmで実行されます。
+
+```bash
+pip install wasmtime
+```
+
+```python
+# host.py
+from wasmtime import Store, Module, Instance, Linker, WasiConfig
+import json
+
+def run_wasm_handler(wasm_path: str, input_data: dict) -> dict:
+    store = Store()
+
+    # Configure WASI capabilities — deny-by-default
+    wasi_config = WasiConfig()
+    # We do NOT grant filesystem or network access — pure computation only
+    store.set_wasi(wasi_config)
+
+    linker = Linker(store.engine)
+    linker.define_wasi()
+
+    module = Module.from_file(store.engine, wasm_path)
+    instance = linker.instantiate(store, module)
+
+    # The WASM module reads from stdin and writes to stdout
+    # For real production use, consider wasmtime's memory API for direct buffer passing
+    import subprocess
+    result = subprocess.run(
+        ["wasmtime", wasm_path],
+        input=json.dumps(input_data).encode(),
+        capture_output=True,
+        timeout=5,  # hard timeout — Wasm can't escape it
+    )
+
+    return json.loads(result.stdout)
+
+result = run_wasm_handler(
+    "target/wasm32-wasip2/release/wasm-handler.wasm",
+    {"name": "Python host", "multiplier": 40}
+)
+print(result)  # {"message": "Hello, Python host!", "result": 102334155}
+```
+
+`timeout=5`はOSによって強制されます。悪意のあるWasmモジュールがこれを回避することはできません。また、`WasiConfig`がそれらの機能を付与しなかったため、モジュールはファイルシステムやネットワークにアクセスすることもできません。
+
+## Extismでサンドボックス化されたプラグインシステムを構築する
+
+[Extism](https://extism.org/)は、Wasmプラグインをホストアプリケーションに組み込む最もクリーンな方法です。ホストとWasm間で文字列/バイトを渡すABIの複雑さを処理します。
+
+### プラグイン（Rust）
+
+```bash
+cargo install extism-pdk
+cargo new --lib my-plugin
+cd my-plugin
+```
+
+```toml
+# Cargo.toml
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1"
+serde = { version = "1", features = ["derive"] }
+```
+
+```rust
+// src/lib.rs
+use extism_pdk::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct Input {
+    text: String,
+    max_words: usize,
+}
+
+#[derive(Serialize)]
+struct Output {
+    summary: String,
+    word_count: usize,
+}
+
+#[plugin_fn]
+pub fn summarize(input: Json<Input>) -> FnResult<Json<Output>> {
+    let words: Vec<&str> = input.text.split_whitespace().collect();
+    let truncated = words[..words.len().min(input.max_words)].join(" ");
+
+    Ok(Json(Output {
+        summary: if words.len() > input.max_words {
+            format!("{}...", truncated)
+        } else {
+            truncated
+        },
+        word_count: words.len(),
+    }))
+}
+```
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+```
+
+### ホスト（Python）
+
+```python
+# host.py
+import extism
+import json
+
+manifest = {"wasm": [{"path": "target/wasm32-unknown-unknown/release/my_plugin.wasm"}]}
+
+with extism.Plugin(manifest) as plugin:
+    result = plugin.call(
+        "summarize",
+        json.dumps({"text": "WebAssembly is a portable compilation target...", "max_words": 5})
+    )
+    print(json.loads(result))
+    # {"summary": "WebAssembly is a portable compilation...", "word_count": 8}
+```
+
+プラグインはWasmサンドボックス内で実行されます。以下のことはできません。
+- ホストファイルシステムへのアクセス
+- ネットワークリクエストの実行
+- 環境変数の読み取り
+- ホストプロセスのクラッシュ
+
+これは、ユーザーが送信したコードを大規模に安全に実行するためのパターンです。各テナントのプラグインは他のすべてのプラグインから隔離されて実行されます。
+
+## 2026年の実際のユースケース
+
+### 1. 次世代サーバーレス（サブミリ秒のコールドスタート）
+
+従来のサーバーレス（AWS Lambda、Google Cloud Functions）は、コンテナの初期化に500ms～2秒かかるため、コールドスタートに悩まされていました。Wasmネイティブプラットフォームはこれを解消します。
+
+- **Cloudflare Workers**: 各WorkerはWasmアイソレートです。コールドスタートは1ms未満です。グローバルネットワーク上で5000万以上のアイソレートが同時に実行されています。
+- **Fermyon Spin**: `spin deploy`はWasmバイナリをマネージドプラットフォームにデプロイします。Dockerfileもコンテナレジストリも不要です。
+- **Fastly Compute**: 同じモデルですが、異なるPoPネットワークを使用します。
+
+```bash
+# Deploy a Rust Axum app to Fermyon Spin
+spin new -t http-rust my-app
+cd my-app
+spin build
+spin deploy
+```
+
+### 2. 拡張可能なSaaSプラグインシステム
+
+Stripe、Shopify、Figmaはすべてプラグインを許可しています。従来のやり方では、ユーザーに特定のDSLで記述させるか、外部のWebhookエンドポイントをホストさせる必要がありました。
+
+Wasmを使用すると、ユーザーは任意の言語でプラグインを記述し、`.wasm`ファイルをアップロードするだけで、プラットフォームがサンドボックス内でそれを実行します。管理するインフラも、手動で強制する信頼境界もありません。
+
+### 3. エッジAI推論
+
+ONNX RuntimeはWasmバックエンドを搭載するようになりました。GPUサーバーを起動することなく、量子化されたMLモデルをエッジで実行できます。
+
+```bash
+# Run inference at the edge
+wasm-pack build --target web
+# Deploy to Cloudflare Workers — inference runs in each PoP
+```
+
+## コンポーネントモデル：ポリグロット相互運用
+
+WASI Preview 2のコンポーネントモデルは、歴史的な課題であった「Wasmモジュールは生バイトしか交換できなかった」という問題を解決します。RustモジュールからPythonモジュールに文字列を渡すには、手動でのポインタ演算が必要でした。
+
+コンポーネントモデルは、タイプセーフなインターフェース記述言語（WIT — WebAssembly Interface Types）を定義します。インターフェースを一度記述するだけで済みます。
+
+```wit
+// my-interface.wit
+package my:plugin;
+
+interface transform {
+    summarize: func(text: string, max-words: u32) -> string;
+}
+```
+
+その後、任意の言語でバインディングを生成します。`summarize`を実装するRustプラグインは、Goホスト、Pythonホスト、またはJavaScriptホストから、手動のシリアライズコードなしで呼び出すことができます。
+
+## WasmとDockerの使い分け
+
+**Wasmを使用する場合：**
+- サブミリ秒のコールドスタートが必要な場合（エッジ関数、サーバーレス）
+- マルチテナントプラグインシステムを構築している場合
+- 信頼できないコードパス間で厳密な分離が必要な場合
+- バイナリのポータビリティが重要な場合（IoT、異種フリート）
+
+**Dockerを使用し続ける場合：**
+- 完全なPOSIX環境が必要な場合（データベース、複雑なOS依存関係）
+- スタックが長時間実行されるデーモンプロセスに依存している場合
+- 成熟したオーケストレーションが必要な場合（Kubernetes、ECS）
+- コールドスタートのレイテンシが許容範囲内である場合（> 500ms）
+
+WasmとDockerは相互に排他的ではありません。多くの本番環境アーキテクチャでは、オーケストレーション層にコンテナを使用し、それらのコンテナ内のコンピューティング層にWasmを使用しています。
+
+## こちらもおすすめ
+
+- [WebAssembly in 2026: The Universal Runtime](/en/blog/wasm-2026)
+- [Axum vs Actix-web: Building a Production REST API in Rust](/en/blog/mastering-rust-web-dev)
+- [Docker BuildKit Cache Mount and Multi-Stage Optimization](/en/blog/docker-buildkit-cache-mount-optimization)
+- [Platform Engineering for AI: Architecting Infrastructure for Autonomous Agents](/en/blog/platform-engineering-for-ai-agents)

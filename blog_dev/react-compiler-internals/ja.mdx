@@ -1,0 +1,167 @@
+---
+title: "Reactコンパイラの仕組み：React Forgetを徹底解説"
+date: "2026-11-20"
+draft: false
+summary: "ReactForgetとReactコンパイラの内部動作をAST変換、データフロー解析、そしてuseMemoを削除できる理由を理解することで深く掘り下げます。"
+image: "/static/images/react_compiler_internals_1786471417067.jpg"
+tags: ["react", "javascript", "compiler", "performance"]
+images: ['/static/images/react-compiler-internals.png']
+---
+
+# 手動メモ化の終わり
+
+長年、React開発者は共通の悩みを抱えてきました。それは手動メモ化です。中規模から大規模のReactアプリケーションに携わった経験がある方なら、`useMemo`、`useCallback`、`React.memo`には嫌というほど馴染みがあるでしょう。これらはReactのレンダリングモデルにおける必要悪であり、フレームワークが高価な操作を再計算したり、あらゆる状態変更でDOMを過剰にレンダリングしたりするのを防ぐために、値、関数、コンポーネントをラップするために使うツールです。
+
+その結果、多くの人が「メモ化地獄」と呼ぶ状況に陥ります。
+
+```jsx
+// The old way: Manual dependency arrays and cognitive overhead
+function DataDashboard({ user, metrics }) {
+  const processedMetrics = useMemo(() => {
+    return heavyDataProcessing(metrics);
+  }, [metrics]);
+
+  const handleExport = useCallback(() => {
+    exportToCsv(processedMetrics, user.id);
+  }, [processedMetrics, user.id]);
+
+  return <DashboardChart data={processedMetrics} onExport={handleExport} />;
+}
+```
+
+React Compiler（当初のコードネームは*React Forget*）は、「**Reactをデフォルトで高速にする**」という単一の野心的な目標を掲げて開発されました。メモ化の負担を開発者からビルドツールに移すことで、React Compilerは参照等価性のパフォーマンス上の利点を失うことなく、プレーンなJavaScriptを書くことを可能にします。
+
+この魔法がどのように機能するのか、内部を見てみましょう。
+
+<AudioPlayer src="/static/audio/react-compiler-internals.mp3" title="Executive Audio Briefing" />
+
+## すべてはAST（抽象構文木）にかかっている
+
+React Compilerはランタイムライブラリではありません。ブラウザに到達する前にReactコンポーネントを分析する、ビルド時のBabelプラグイン（そして、ますますRustベースのツールチェーン）です。
+
+このプロセスの最初のステップは、JSXとJavaScriptを**抽象構文木（AST）**にパースすることです。ASTは、コードの階層的なツリー表現です。コンパイラは`const x = 5;`を見る代わりに、`Identifier`（「x」）と`NumericLiteral`（5）を含む`VariableDeclaration`を見ます。
+
+コンパイラがこのツリーを持つと、**静的データフロー解析**を実行できます。
+
+### データフロー解析と型推論
+
+標準的なミニファイアやバンドラーとは異なり、React Compilerはコードの*意図*を理解する必要があります。どの変数が状態に依存しているか、どの変数がミューテーションされるか、どの値が子コンポーネントにプロップとして渡されるかを知る必要があります。
+
+コンパイラはASTを走査し、データ依存関係をマッピングします。次のような質問をします。
+1. この変数はReactのプロップから派生していますか？
+2. このオブジェクトはレンダリング関数内で後でミューテーションされますか？
+3. この関数は外部APIまたはReact Hookを呼び出しますか？
+
+コンパイラが値が決定論的である（入力のみに依存し、グローバルな状態のミューテーションに依存しない）と判断した場合、それをメモ化の候補としてマークします。
+
+## 変換：コードは内部でどのように変化するか
+
+React Compilerが実際にコードをどのように変換するかを見てみましょう。
+
+この標準的な、メモ化されていないReactコンポーネントを見てください。
+
+```javascript
+function UserProfile({ user }) {
+    // 1. Object allocation
+    const userTheme = { color: user.preferences.themeColor };
+    
+    // 2. Heavy computation
+    const formattedData = processUserHistory(user.history);
+    
+    // 3. JSX allocation
+    return (
+        <div style={userTheme}>
+            <HistoryGraph data={formattedData} />
+        </div>
+    );
+}
+```
+
+コンパイラがない場合、`UserProfile`がレンダリングされるたびに（`user`が変更されていなくても）、Reactは新しい`userTheme`オブジェクトをメモリに割り当てます。これは新しいオブジェクト参照であるため、子コンポーネントに渡すと、その子は再レンダリングされます。
+
+React CompilerがASTを変換した後の出力の近似値は次のとおりです。
+
+```javascript
+import { c as _useMemoCache } from "react/compiler-runtime";
+
+function UserProfile({ user }) {
+    // Allocate a cache array for this component
+    const $ = _useMemoCache(4);
+    
+    // Cache the userTheme object
+    let userTheme;
+    if ($[0] !== user.preferences.themeColor) {
+        userTheme = { color: user.preferences.themeColor };
+        $[0] = user.preferences.themeColor;
+        $[1] = userTheme;
+    } else {
+        userTheme = $[1];
+    }
+    
+    // Cache the formatted data
+    let formattedData;
+    if ($[2] !== user.history) {
+        formattedData = processUserHistory(user.history);
+        $[2] = user.history;
+        $[3] = formattedData;
+    } else {
+        formattedData = $[3];
+    }
+    
+    // Return the JSX (which can also be cached!)
+    return (
+        <div style={userTheme}>
+            <HistoryGraph data={formattedData} />
+        </div>
+    );
+}
+```
+
+### 変換の内訳
+
+1. **`_useMemoCache(n)`**: コンパイラは、値をキャッシュするための`n`スロットの配列を割り当てる特別な内部フックを挿入します。これは、複数の`useMemo`フックを呼び出すよりも信じられないほど高速でメモリ効率が良いです。
+2. **きめ細かな依存関係追跡**: コンパイラが`$[0] !== user.preferences.themeColor`をどのようにチェックしているかに注目してください。`user`オブジェクト全体を監視するだけでなく、変数が依存する正確なネストされたプロパティを追跡します！
+3. **暗黙的なオブジェクトキャッシュ**: `userTheme`オブジェクトはキャッシュされるようになりました。`themeColor`が変更されない限り、その参照同一性はレンダリング間でまったく同じままです。
+
+## Reactのルールはさらに厳しくなった
+
+コンパイラは静的解析に依存しているため、慣用的でルールに準拠したReactを書いていることを前提としています。Reactのルールを破ると、コンパイラはコードを安全に最適化できません。
+
+具体的には、コンパイラは**レンダリング関数が純粋であること**を期待しています。
+
+レンダリング中にオブジェクトをミューテーションした場合：
+
+```javascript
+function BadComponent({ data }) {
+    // 🚨 Mutating variables during render!
+    data.lastViewed = Date.now(); 
+    return <div>{data.name}</div>;
+}
+```
+
+コンパイラはこのミューテーションを検出します。現在、React Compilerが安全に回避できないReactのルール違反を検出した場合、その特定のコンポーネントの最適化を**中止**し、メモ化されていない状態のままにします。アプリが壊れることはありませんが、パフォーマンス上の利点は失われます。
+
+コードベースがコンパイラに対応していることを確認するには、`eslint-plugin-react-hooks`と新しい`eslint-plugin-react-compiler`を厳密に適用する必要があります。
+
+## なぜSignalsを使わないのか？
+
+現代のフロントエンドエコシステムでよくある質問は、「Vue、Solid、PreactがSignalsを使ってきめ細かなリアクティビティを実現しているのに、なぜReactは何年もかけてコンパイラを構築したのか？」というものです。
+
+その答えは、Reactの核となる哲学にあります。それは「**UIは状態の関数である**」というものです。
+
+Signalsはまったく異なるメンタルモデルを導入します。値は特別なオブザーバブルオブジェクト（例：`signal.value`）でラップする必要があります。シグナルが更新されると、コンポーネント関数を再実行することなく、DOMを外科的に更新します。
+
+Reactチームは、「関数を再実行する」モデルの方が推論しやすいと考えています。それは標準的なJavaScriptのように感じられます。コンパイラを構築することで、Reactはきめ細かなリアクティビティ（Signalsのような）のパフォーマンス特性を提供しながら、プレーンでイミュータブルなJavaScript変数を書くことを可能にします。両方の良いとこ取りができるのです。
+
+## 結論
+
+React Compilerは、2018年のHooks導入以来、React開発者体験における最も重要な変化を表しています。参照等価性と高価な計算の負担を開発者からビルドステップに移すことで、Reactは元の約束に戻ります。つまり、特定の状態に対してUIがどのように見えるべきかを記述するだけで、フレームワークが残りの部分を効率的に処理するというものです。
+
+ついに`useMemo`を削除できます。
+
+## こちらもおすすめです
+
+- [React Compiler Automatic Memoization Guide](/en/blog/react-compiler-auto-memoization-guide)
+- [The Ultimate Guide to React Router in 2026](/en/blog/react-router-2026-guide)
+- [Next.js App Router Dynamic Revalidation Guide](/en/blog/nextjs-app-router-revalidate-tag-cache)
+- [Demystifying Next.js 14 App Router Caching: Debugging Stale Data](/en/blog/nextjs-14-app-router-caching-strategies)

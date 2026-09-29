@@ -1,0 +1,229 @@
+---
+title: "KubernetesにおけるeBPFによる高性能な可観測性：サイドカー税を回避する"
+date: "2026-08-04"
+lastUpdated: "2026-09-18"
+summary: "KubernetesでのeBPF可観測性を深く掘り下げ、Envoyサイドカーの排除、カーネルプローブ、BPFリングバッファ、ゼロコードテレメトリーインストルメンテーションについて解説します。"
+tags: ["ebpf", "kubernetes", "observability", "microservices", "devops"]
+images: ["/static/images/ebpf-networking-observability.png"]
+category: Tech
+draft: false
+---
+
+過去10年間、Kubernetesにおけるクラウドネイティブな可観測性（observability）は、ほぼユーザー空間の抽象化にのみ依存してきました。分散トレーシング（distributed tracing）、相互TLS（mTLS）、マイクロサービス間のレイヤー7ネットワークメトリクスが必要な場合、業界標準のプレイブックは、すべてのアプリケーションPodに**Envoyサイドカープロキシ**を注入することでした（IstioやLinkerdによって普及しました）。
+
+サイドカーは、ネットワークロジックをアプリケーション開発者から抽象化することには成功しましたが、プラットフォームエンジニアリングチームの間で**「サイドカー税（Sidecar Tax）」**として知られる、大規模な隠れた運用上のペナルティを導入しました。
+
+サイドカープロキシを実行するということは、次のことを意味します。
+- すべてのインバウンドおよびアウトバウンドのネットワークパケットが、Linuxネットワークスタックを2回通過する。
+- 数百のプロキシコンテナが、ギガバイト単位のクラスタメモリと専用のCPUコアを消費する。
+- サービスホップごとにレイテンシが2〜4ミリ秒増加する。
+
+**eBPF（Extended Berkeley Packet Filter）**は、このパラダイムを根本的に変革しました。eBPFは、検証済みのサンドボックス化されたバイトコードをLinuxカーネル内で直接実行することで、カーネル境界でディープなネットワークテレメトリ、ソケットイベント、分散トレースを、ほぼゼロのオーバーヘッドでキャプチャします。**サイドカーを注入したり、アプリケーションのソースコードを1行も変更したりすることなく**です。
+
+このガイドでは、eBPF可観測性の仕組みを分解し、BPF CO-RE（Compile Once – Run Everywhere）を探求し、Goでカーネルプローブを構築し、従来のサービスメッシュに対するパフォーマンスベンチマークを評価します。
+
+---
+
+<AudioPlayer src="/static/audio/ebpf-kubernetes-observability.mp3" title="エグゼクティブオーディオブリーフィング" />
+
+## サイドカー税：ボトルネックの理解
+
+eBPFがなぜアーキテクチャ上のブレークスルーであるかを理解するために、標準的なサービスメッシュ内のパケットライフサイクルを見てみましょう。
+
+```
+[Traditional Service Mesh: 4 Context Switches per Hop]
+  Pod A (App) ──► Loopback ──► Envoy Proxy (Pod A) ──► Host Network
+                                                           │
+                                                      Wire Transit
+                                                           │
+  Pod B (App) ◄── Loopback ◄── Envoy Proxy (Pod B) ◄── Host Network
+```
+
+Pod AがPod BにHTTPリクエストを送信する場合：
+1. Pod Aはユーザー空間で`send()`システムコールを実行します。
+2. カーネルはパケットを処理し、ローカルループバックインターフェースを介してPod AのEnvoyプロキシコンテナにルーティングします。
+3. Envoyはパケットを傍受し、ユーザー空間でヘッダーを解析し、物理ネットワークインターフェースに送信します。
+4. 受信側のノードでは、Pod BのEnvoyプロキシが着信パケットを傍受し、セキュリティポリシーを再評価し、Pod Bのアプリケーションコンテナに転送します。
+
+このユーザー空間からカーネル空間へのコンテキストスイッチは、深刻なCPUキャッシュスラッシングとメモリレイテンシを引き起こします。1,000個のPodが稼働する大規模なクラスタでは、サイドカープロキシはI/Oを待つだけで、クラスタ全体のメモリの20%から35%を消費することがよくあります！
+
+---
+
+## eBPFの代替案：透過的なカーネルレベルフッキング
+
+すべてのネットワークパケット、プロセス実行、メモリ割り当てはオペレーティングシステムカーネルを通過する必要があるため、カーネルはシステム動作を監視する上で最も信頼できる唯一の場所です。
+
+eBPFを使用すると、各Kubernetesワーカーノードで実行される単一のデーモンセットが、軽量なイベントフックをカーネル関数にアタッチします。
+
+```
+[eBPF Observability: Direct Kernel Interception]
+  Pod A (Application) ─────────────────────────────► Pod B (Application)
+         │                                                    │
+  ───────┼────────────────────────────────────────────────────┼───────
+         ▼                                                    ▼
+  [Kernel Socket Layer] ◄─── (eBPF Tracepoint Hook) ───► [Kernel Socket Layer]
+                                     │
+                             eBPF Ring Buffer
+                                     │
+                                     ▼
+                    eBPF Collector (Node DaemonSet)
+```
+
+1. **ゼロコードインストゥルメンテーション**: eBPFプログラムは、ソケット作成（`sys_enter_connect`）とTCP状態遷移にフックします。開発者がNode、Go、またはPythonでOpenTelemetry SDKをインストールすることなく、HTTPヘッダー、メソッドタイプ、gRPCステータスコードを透過的に自動的に検査します。
+2. **ショートサーキットされた高速パス**: `sockops`プログラムを使用することで、eBPFは同じノードで通信するPodの場合、TCP/IPスタックを完全にバイパスし、メモリをソケットバッファからソケットバッファに直接パイプできます（ローカルIPCレイテンシを最大80%削減します）。
+
+---
+
+## カーネルの安全性：カーネル内ベリファイア
+
+Linuxカーネル内でカスタムコードを実行するには、これまでカスタムカーネルモジュール（`.ko`）のコンパイルが必要でした。そこでは、単一のヌルポインタ逆参照や無限ループが即座にカーネルパニックを引き起こし、物理サーバー全体をクラッシュさせていました。
+
+eBPFは、**カーネルベリファイア**によってこれを防ぎます。
+- **終了保証**: ベリファイアは、すべてのループが境界を持ち、終了することが保証されていることを静的に検証します。
+- **メモリ安全性**: プログラムは未初期化メモリを読み取ったり、範囲外のポインタアドレスにアクセスしたりすることはできません。
+- **複雑さの制限**: バイトコード命令は厳密に制限されており、プログラムがナノ秒単位で実行されることを保証し、CPUサービス拒否攻撃を防ぎます。
+
+---
+
+## GoとCilium/ebpfで最小限のeBPFネットワークプローブを構築する
+
+現代のeBPF開発では、BTF（BPF Type Format）を使用した**BPF CO-RE（Compile Once – Run Everywhere）**が利用されており、コンパイルされたeBPFバイナリを再コンパイルすることなく、異なるLinuxカーネルバージョンで実行できます。
+
+### 1. カーネルプログラム（C）
+
+このeBPFプログラムは、アウトバウンドTCP接続が開始されたときにキャプチャするために、`sys_enter_connect`トレースポイントにアタッチします。
+
+```c
+// probe.bpf.c
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+
+struct event {
+    __u32 pid;
+    char comm[16];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024); // 256 KB ring buffer
+} events SEC(".maps");
+
+SEC("tracepoint/syscalls/sys_enter_connect")
+int trace_connect(struct trace_event_raw_sys_enter *ctx) {
+    struct event *e;
+    
+    // Reserve slot in shared ring buffer
+    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) return 0;
+
+    e->pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+char LICENSE[] SEC("license") = "Dual BSD/GPL";
+```
+
+### 2. ユーザー空間ローダー（Go）
+
+ユーザー空間のGoデーモンは、高スループットのロックレスリングバッファからイベントを読み取り、メトリクスをPrometheusコレクターにプッシュします。
+
+```go
+// main.go
+package main
+
+import (
+	"bytes"
+	"encoding/binary"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
+)
+
+type Event struct {
+	PID  uint32
+	Comm [16]byte
+}
+
+func main() {
+	// Load compiled eBPF ELF into the Linux kernel
+	objs := probeObjects{}
+	if err := loadProbeObjects(&objs, nil); err != nil {
+		log.Fatalf("Failed loading eBPF objects: %v", err)
+	}
+	defer objs.Close()
+
+	// Attach to sys_enter_connect tracepoint
+	tp, err := link.Tracepoint("syscalls", "sys_enter_connect", objs.TraceConnect, nil)
+	if err != nil {
+		log.Fatalf("Failed attaching tracepoint: %v", err)
+	}
+	defer tp.Close()
+
+	// Open lockless ring buffer reader
+	rd, err := ringbuf.NewReader(objs.Events)
+	if err != nil {
+		log.Fatalf("Failed creating ringbuf reader: %v", err)
+	}
+	defer rd.Close()
+
+	log.Println("eBPF network probe active. Capturing outbound TCP connections...")
+
+	for {
+		record, err := rd.Read()
+		if err != nil {
+			break
+		}
+
+		var event Event
+		binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event)
+		commStr := string(bytes.Trim(event.Comm[:], "\x00"))
+		log.Printf("[Kernel Event] Process %s (PID %d) initiated TCP connection\n", commStr, event.PID)
+	}
+}
+```
+
+---
+
+## 実証ベンチマーク：従来のサイドカー vs eBPF可観測性
+
+以下の表は、100ノードのKubernetesクラスターで実行されている5,000リクエスト/秒の同一HTTPベンチマークで測定されたレイテンシとリソース使用率の概要です。
+
+| メトリクス | Istio Envoy サイドカー | Cilium eBPF (サイドカーレス) | 純影響 |
+| :--- | :--- | :--- | :--- |
+| **p99 ネットワークレイテンシ** | 4.8 ms | 1.1 ms | **p99 レイテンシが77%低下** |
+| **クラスタメモリフットプリント** | 48 GB RAM (50MB/pod) | 1.8 GB RAM (1 daemon/node) | **メモリを96%節約** |
+| **クラスタCPU使用率** | 18.2 コア | 2.1 コア | **CPUを88%削減** |
+| **App Pod 再起動オーバーヘッド** | 高 (Inject webhook) | ゼロ (カーネル透過) | **Podの即時起動** |
+
+---
+
+## よくある質問
+
+### eBPFはKubernetesで昇格された権限やrootアクセスを必要としますか？
+カーネルにプログラムをロードするeBPFデーモンセットは、`CAP_BPF`または`CAP_SYS_ADMIN`ケーパビリティを必要とします。しかし、アプリケーションワークロードとPodは、特権のないユーザーアカウントと読み取り専用のルートファイルシステムで実行され、特別な権限は必要ありません。
+
+### eBPFはHTTPS/TLSトラフィックを復号して検査できますか？
+はい、可能です。eBPFは、`uprobes`を使用してユーザー空間の暗号ライブラリ（OpenSSLやGoの`crypto/tls`など）にフックし、暗号化される直前の平文データをキャプチャできます。これにより、MITMプロキシ証明書を必要とせずに、完全なL7 HTTPヘッダーとペイロードのトレースが可能になります。
+
+### 現在、eBPF上に構築されている主要な本番ツールは何ですか？
+主要な本番eBPF可観測性ツールには以下が含まれます。
+1. **Cilium & Hubble**: サービスメッシュ、透過的なmTLS、ネットワークフローの可視化。
+2. **Pixie**: 自動化されたKubernetesアプリケーションのデバッグと分散トレーシング。
+3. **Parca / Pyroscope**: カーネルスタックトレースまで掘り下げた、システム全体の継続的なCPUおよびメモリプロファイリング。
+
+---
+
+## こちらもおすすめです
+
+- [Kubernetes HPA with Custom Prometheus Metrics: Beyond CPU Scaling (2026)](/en/blog/kubernetes-hpa-custom-prometheus-metrics)
+- [Prometheus Grafana Alerting and Burn Rate Design](/en/blog/prometheus-grafana-alerting-burn-rate-design)
+- [k6 Grafana Distributed Load Testing & performance Profiling](/en/blog/k6-grafana-distributed-load-testing)
+- [Microservices Contract Testing with Pact & Node.js](/en/blog/contract-testing-pact-nodejs-microservices)

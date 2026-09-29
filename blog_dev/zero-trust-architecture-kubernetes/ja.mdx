@@ -1,0 +1,250 @@
+---
+title: "Kubernetesにおけるゼロトラストセキュリティの実装: 完全なプロダクションガイド"
+date: "2026-08-04"
+lastUpdated: "2026-09-18"
+summary: "Kubernetesにおけるフラットネットワークの境界セキュリティを排除するための実用的なガイドで、default-deny NetworkPolicies、SPIFFE/SPIREワークロードアイデンティティ、厳格なmTLSについて解説します。"
+tags: ["kubernetes", "security", "zero-trust", "devops", "cloud-native"]
+images: ["/static/images/zero-trust-arch.png"]
+category: Tech
+draft: false
+---
+
+従来のエンタープライズITでは、セキュリティは完全に「城と堀」の境界モデルに依存していました。ネットワークの周囲に強固なファイアウォールを構築し、プライベートIPサブネット内で動作するものはすべて信頼され、無害であると仮定していました。
+
+現代のクラウドネイティブ環境、特にKubernetes内では、境界モデルは危険なほど欠陥があります。デフォルトでは、**Kubernetesはフラットでセグメント化されていないネットワーク**で動作します。優先度の低い分析ポッド内の侵害されたサードパーティパッケージは、クラスタメタデータAPIをプローブしてクエリしたり、内部Redisキャッシュに接続したり、本番環境の支払いマイクロサービスに直接不正なHTTPリクエストを送信したりする可能性があります。
+
+真の**ゼロトラストアーキテクチャ**は、単一の支配的な原則の下で動作します。それは、**決して信頼せず、常に検証し、継続的に認証する**というものです。パブリックインターネットから発信されたものであろうと、同じ名前空間内の隣接するポッドから発信されたものであろうと、すべてのリクエストは暗号的に認証され、認可され、暗号化されなければなりません。
+
+このガイドでは、レイヤー4ネットワークセグメンテーション、レイヤー7暗号ID、およびアドミッションコントローラー検証を横断するKubernetesでのゼロトラストの段階的な実装について説明します。
+
+---
+
+<AudioPlayer src="/static/audio/zero-trust-architecture-kubernetes.mp3" title="役員向け音声ブリーフィング" />
+
+## フラットネットワークの現実：Kubernetesのデフォルトの脆弱性
+
+標準的なKubernetesクラスター（EKS、GKE、またはバニラのkubeadm経由）をデプロイすると、デフォルトのCNIプラグインはすべてのポッドにプライベートIPアドレスを割り当て、すべての名前空間でポッド間の無制限の通信を許可します。
+
+```
+[Default Kubernetes: Unrestricted Lateral Movement]
+  Attacker ──► Compromised Frontend Pod 
+                     │
+                     ├────────► Database Pod (Direct TCP access!)
+                     ├────────► Internal Redis Pod (No password required!)
+                     └────────► Cloud Metadata API (169.254.169.254 - IAM Stealing!)
+```
+
+この脆弱性を排除するには、3つの異なる強制プレーンにわたってセキュリティ制御を確立する必要があります。
+
+1.  **レイヤー4ネットワークプレーン**: Kubernetes NetworkPoliciesまたはeBPFを使用して、デフォルト拒否のファイアウォールポリシーを適用します。
+2.  **レイヤー7アプリケーションプレーン**: SPIFFE IDを使用して、相互TLS（mTLS）とIDベースの認可を適用します。
+3.  **アドミッション＆ランタイムプレーン**: Kyvernoを介して、署名済みイメージと非ルート実行を適用します。
+
+---
+
+## 1. レイヤー4セグメンテーション：デフォルト拒否の基盤
+
+ゼロトラストの最初のルールは、侵害を前提とすることです。ポッドが侵害された場合、それは隔離されたネットワークサイロにロックされなければなりません。
+
+### ステップ1：すべてのイングレスおよびエグレストラフィックをデフォルトで拒否する
+
+このポリシーを本番環境の名前空間に適用します。これにより、すべてのポッドを横断するすべての着信および発信接続がドロップされます。
+
+```yaml
+# default-deny-all.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: production
+spec:
+  podSelector: {} # Selects all pods in the namespace
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+### ステップ2：DNSエグレスを明示的にホワイトリスト化する
+
+デフォルト拒否がアクティブな状態では、ポッドはDNS名を解決することさえできません。ポート53でCoreDNSトラフィックを明示的に許可する必要があります。
+
+```yaml
+# allow-dns-egress.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+```
+
+### ステップ3：特定のイングレスパスを整備する
+
+次に、どのサービスが通信できるかを明示的に定義します。たとえば、`app: frontend`というラベルの付いたポッドのみがポート8080で`app: order-service`に接続することを許可します。
+
+```yaml
+# allow-frontend-to-order.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-order
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: order-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+```
+
+---
+
+## 2. レイヤー7ワークロードIDと相互TLS（mTLS）
+
+レイヤー4のNetworkPoliciesはIPとポートの通信を制限しますが、ペイロードを送信しているのが「誰」であるかを確認したり、ワイヤートラフィックを暗号化したりすることはできません。IPスプーフィングを回避した攻撃者は、暗号化されていないプレーンテキストトラフィックを盗聴することができます。
+
+これを解決するために、サービスメッシュ（Istio、Linkerd、Cilium Service Meshなど）を使用して、すべてのポッドに暗号化された**SPIFFE (Secure Production Identity Framework for Everyone)** X.509証明書を発行します。
+
+### 厳格な相互TLS（mTLS）の適用
+
+クラスター内のすべてのプレーンテキストトラフィックを拒否するようにIstioを設定します。
+
+```yaml
+# strict-peer-authentication.yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: production
+spec:
+  mtls:
+    mode: STRICT # Completely rejects unencrypted TCP connections
+```
+
+`mode: STRICT`を使用すると、サイドカープロキシは、アプリケーションコードの変更を必要とせずに、証明書のローテーション、TLSハンドシェイク、およびワイヤー暗号化を自動的に処理します。
+
+### 暗号IDによるリクエストの認可
+
+IPアドレスを信頼する代わりに、呼び出し元サービスの暗号化されたServiceAccount IDを使用してアクセス制御を適用します。
+
+```yaml
+# authz-order-service.yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: secure-order-api
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: order-service
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              # Only the pod running with this specific ServiceAccount is authorized
+              - "cluster.local/ns/production/sa/frontend-service-account"
+      to:
+        - operation:
+            methods: ["POST"]
+            paths: ["/api/v1/orders"]
+```
+
+攻撃者が同じ物理ワーカーノード上の隣接するポッドを制御したとしても、彼らの証明書には認可されたSPIFFEプリンシパルがないため、`POST /api/v1/orders`リクエストを送信しようとする試みはプロキシレベルで即座にブロックされます。
+
+---
+
+## 3. ランタイム防御：Kyvernoによる特権昇格の防止
+
+ゼロトラストでは、ポッドがノードにスケジュールされる前にワークロードの整合性を検証する必要があります。`root`として実行されているコンテナやホストファイルパスをマウントしているコンテナは拒否する必要があります。
+
+この**Kyvernoポリシー**をデプロイして、不変のコンテナセキュリティコンテキストを適用します。
+
+```yaml
+# require-non-root.yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: enforce-zero-trust-pod-security
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: check-security-context
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      validate:
+        message: "Containers must run as non-root with read-only root filesystems."
+        pattern:
+          spec:
+            securityContext:
+              runAsNonRoot: true
+            containers:
+              - securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop:
+                      - ALL
+```
+
+---
+
+## ゼロトラスト検証マトリックス
+
+| 強制ベクトル | 従来のKubernetesセットアップ | ゼロトラスト強化クラスター |
+| :--- | :--- | :--- |
+| **ポッド間ワイヤートラフィック** | プレーンテキストHTTP（盗聴可能） | 100% mTLS暗号化（X.509） |
+| **ネットワーク境界** | 名前空間を横断するオープンなフラットネットワーク | イングレスおよびエグレスのデフォルト拒否 |
+| **ワークロード認証** | 未検証のIPアドレス | 暗号化されたSPIFFE ID |
+| **特権昇格** | ルートコンテナが許可される | `runAsNonRoot`、読み取り専用ルートFS |
+| **メタデータAPIアクセス** | オープンな`169.254.169.254`アクセス | エグレスNetworkPolicyによりブロック |
+
+---
+
+## よくある質問
+
+### mTLSを実装すると、内部マイクロサービスにかなりの遅延が追加されますか？
+最新のサービスメッシュとeBPFベースのmTLS実装（CiliumやAmbient Meshを備えたIstioなど）は、ホップあたり0.5ミリ秒未満のオーバーヘッドしか追加しません。最新のCPUハードウェアアクセラレーション（AES-NI）は、無視できるCPU使用率でTLS暗号化を処理します。
+
+### ポッドがStripeやAWSのような外部SaaS APIを呼び出す必要がある場合はどうなりますか？
+エグレスゲートウェイを介して、外部CIDRブロックまたは特定のDNS名へのトラフィックのみを許可する明示的なエグレスNetworkPolicyを作成します。他のすべての外部インターネット接続はデフォルトでブロックされます。
+
+### すべてのポッドでIstioサイドカーを実行せずにゼロトラストを実装できますか？
+はい、可能です。Ciliumのような最新のeBPFベースのCNIは、サイドカーコンテナを必要とせずに、Linuxカーネルで透過的なmTLSとレイヤー7ネットワークポリシーをネイティブに提供し、メモリオーバーヘッドと運用上の複雑さを大幅に削減します。
+
+---
+
+## こちらもおすすめです
+
+- [2026年のゼロトラストアーキテクチャの実装](/en/blog/zero-trust-arch)
+- [ゼロトラストネットワークアーキテクチャ](/en/blog/zero-trust-network)
+- [2026年のクラウドネイティブセキュリティの進化](/en/blog/cloud-native-security)
+- [AI生成コードの保護：2026年のシフトレフトDevSecOps戦略](/en/blog/securing-ai-generated-code-shift-left)

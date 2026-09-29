@@ -1,0 +1,220 @@
+---
+title: "なぜ私のDockerイメージは1GBだったのか（そして50MBに縮小した方法）"
+images: ['https://imgbed.locionic.com/file/1784436137480_docker-image-optimization.jpg']
+date: '2026-07-13'
+lastUpdated: '2026-07-13'
+tags: ["docker", "devops", "optimization"]
+category: Tech
+draft: false
+summary: "マルチステージビルド、Alpineベース、distroless runtime、レイヤーキャッシュのベストプラクティスを活用して、Dockerコンテナイメージを1GBから50MBに削減する方法をご紹介します。"
+---
+
+
+
+Dockerイメージを本番環境にプッシュし、デプロイスピナーが3分間回り続けるのを見ていました。そしてクラッシュしました。バグのせいではなく、1.2GBのイメージをプルするのに永遠に時間がかかり、CIランナーがタイムアウトしたためです。
+
+自分のイメージが大きいことは知っていました。しかし、`docker images`を実行してその数字が目に飛び込んでくるまで、それがどれほど大きいか気づいていませんでした。単純なNode.js APIなのに1ギガバイト以上。恥ずかしい話です。
+
+そこで私はダイエットを始めました。私自身のダイエットではなく、Dockerイメージのダイエットです。肥大化したモンスターから、引き締まった効率的なコンテナへと縮小させるために学んだことをご紹介します。
+
+<AudioPlayer src="/static/audio/docker-image-optimization.mp3" title="Executive Audio Briefing" />
+
+## 問題：何がそんなに容量を食っていたのか？
+
+私の推測ですが、あなたのDockerfileも私と同じようなものだったのではないでしょうか。
+
+<DiffView
+  oldCode={`FROM node:18
+WORKDIR /app
+COPY . .
+RUN npm install
+RUN npm run build
+EXPOSE 3000
+CMD ["npm", "start"]`}
+  newCode={`FROM node:18-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+COPY . .
+RUN npm run build
+
+FROM node:18-alpine
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+EXPOSE 3000
+CMD ["node", "dist/index.js"]`}
+  language="dockerfile"
+  mode="unified"
+/>
+
+たった7行。無害に見えます。しかし、そのイメージはNode.js SDK全体、ビルドツール、開発依存関係、そして私のソースコードのあらゆるレイヤーを、おまけまで含めてすべて持ち運んでいました。
+
+その巨大なイメージに対して`docker image history`を実行しました。すると、各レイヤーとそのサイズが表示されました。npm installのステップだけで450MB。Nodeのフルベースイメージはさらに350MB。そして私の`COPY . .`の行は？それは、ローカルにインストールしたnode_modulesや、テストに使っていた4Kビデオアセットが詰まったフォルダまで、すべてをコピーしていました。
+
+## 肥大化をどう診断したか
+
+何かを修正する前に、問題の全体像を明確に把握する必要があります。
+
+私はすべてを変えた3つのツールを使いました。
+
+<Callout type="info" title="私の肥大化検出ツールキット">
+  レイヤーごとのサイズを見るには`docker image history <image>`を実行します。次に、ディスク使用量の合計を見るには`docker system df`を実行します。そして、本当の状況を知りたい場合は、`dive`をインストールして`dive <image>`を実行し、各レイヤーの内容をインタラクティブに分析します。
+</Callout>
+
+Diveは目から鱗でした。ファイルが追加または変更された各レイヤーを色分けして表示してくれました。本番イメージの中に、200MBのテストフィクスチャと`.git`フォルダ全体が文字通り存在しているのが見えました。
+
+私は週末を丸々使って実験しました。月曜日までに、イメージサイズを95%削減できました。その方法を正確にご紹介します。
+
+## ステップ1：マルチステージビルド（最大の効果）
+
+マルチステージビルドは、私が行った中で最も大きな影響を与えた変更でした。
+
+コンセプトはシンプルです。1つのDockerfileで複数の`FROM`ステートメントを使用します。最初のステージでコンパイルと依存関係のインストールを処理します。最終ステージでは、必要な成果物のみをコピーします。
+
+<Callout type="idea" title="核心となる洞察">
+  各FROMステートメントは新しいステージを作成します。最後のステージのみが最終イメージになります。それ以前のステージのものはすべて破棄されます。ビルドツール、中間ファイル、キャッシュされた依存関係、すべてなくなります。
+</Callout>
+
+私の元のDockerfileは1つのステージを使用していました。TypeScript、すべての開発依存関係、そして人類が知るあらゆるnpmパッケージをインストールしていました。そしてアプリを実行していました。つまり、sharp、eslint、prettier、その他多数の開発ツールが本番コンテナの中に存在していたのです。
+
+私の新しいアプローチでは2つのステージを使用しました。ビルダー（builder）ステージですべてをインストールし、コードをコンパイルしました。プロダクション（production）ステージでは、コンパイルされた出力と本番環境の依存関係のみをコピーしました。
+
+結果は？イメージは1.2GBから280MBになりました。まずまずのスタートですが、まだ終わりではありませんでした。
+
+## ステップ2：Alpineが200MBを節約してくれた
+
+Nodeの公式`node:18`イメージはUbuntuベースです。快適ですが、コードを1行も追加する前に350MBの容量があります。
+
+`node:18-alpine`バリアントは？30MBです。
+
+Alpine Linuxはglibcの代わりにmusl libcを使用しています。bashをashに置き換えています。快適さよりもコンパクトさを重視しています。そしてほとんどの場合、あなたのアプリはその違いに気づかないでしょう。
+
+<Alert type="warning" title="ネイティブモジュールに注意">
+  アプリがネイティブNodeモジュール（node-gyp、bcrypt、sharpなど）を使用している場合、Alpineは頭痛の種になる可能性があります。ビルダー（builder）ステージでpython3やg++のようなビルド依存関係をインストールする必要があるかもしれません。私はbcryptのバインディングが実行時に失敗したときに、このことを痛いほど学びました。
+</Alert>
+
+Alpineに切り替えることで、ベースイメージは350MBから30MBに削減されました。マルチステージビルドと組み合わせることで、合計で約120MBまで削減できました。
+
+## ステップ3：書くべきだった.dockerignore
+
+告白します。私の最初のDockerfileでは`COPY . .`を使っていましたが、それについて深く考えることはありませんでした。
+
+そのたった1行が、私のプロジェクトディレクトリ全体を、node_modules、.git、.envファイル、テストフィクスチャ、そして数ヶ月前にダウンロードしたデザインモックアップまで含めて、すべてのビルドにコピーしていました。
+
+修正は恥ずかしいほど簡単でした。
+
+<DiffView
+  oldCode={``}
+  newCode={`node_modules
+.git
+.env
+.env.local
+*.md
+test/
+tests/
+coverage/
+.vscode/
+design-assets/
+*.log`}
+  language="dockerfile"
+  mode="unified"
+/>
+
+.dockerignoreファイルです。たった1つのファイル、おそらく10行程度。これは、Dockerにビルドコンテキストに何を送信しないかを指示します。
+
+これだけで約150MBを節約できました。しかし、それ以上に重要なのは、ビルドが速くなったことです。Dockerは、毎回何百メガバイトもの無関係なファイルをパッケージ化してデーモンに送信することがなくなりました。
+
+## ステップ4：依存関係のトリアージ
+
+<Accordion type="single" defaultValue="npm">
+  <AccordionItem title="npm ci vs npm install" value="npm">
+    <Badge variant="primary">60MB削減</Badge>
+
+    `npm install`はデフォルトでdevDependenciesをインストールします。`npm ci --only=production`はロックファイルにあるものを正確にインストールし、開発パッケージをスキップします。これにより、node_modulesは300MBから60MBに削減されました。
+  </AccordionItem>
+  <AccordionItem title="未使用のパッケージ" value="unused">
+    <Badge variant="primary">40MB削減</Badge>
+
+    `depcheck`を実行したところ、使っていないパッケージが14個も見つかりました。Moment.js、lodash、その他多数のユーティリティライブラリ。無駄な重荷でした。それらをすべて削除しました。
+  </AccordionItem>
+  <AccordionItem title="レイヤーキャッシュ" value="layers">
+    <Badge variant="primary">ビルドの高速化</Badge>
+
+    Dockerfileの順序を、ソースコードの前にpackage.jsonをコピーするように変更しました。Dockerは各レイヤーをキャッシュします。ソースの変更がnpm installレイヤーを無効にしない場合、ビルドは数分ではなく数秒で完了します。
+  </AccordionItem>
+</Accordion>
+
+正直に言います。npmエコシステムは肥大化を助長します。`npm install`は、おまけまで含めてすべてをプルします。しかし、`npm ci --only=production`はあなたの味方です。ロックファイルを使用し、指定されたものを正確にインストールし、開発依存関係を完全にスキップします。
+
+私が苦労して学んだことの1つ。COPYコマンドの順序を戦略的に配置することです。まず`package.json`と`package-lock.json`をコピーし、npm installを実行してから、残りのソースをコピーします。こうすることで、Dockerはnpmレイヤーをキャッシュし、依存関係が変更された場合にのみ再実行します。
+
+## ステップ5：Docker Slimで分解する
+
+時には、大槌ではなくメスが必要な場合があります。そこでDockerSlimの出番です。
+
+<Callout type="info" title="DockerSlimの結果">
+  DockerSlimは実行中のコンテナを分析し、アプリが実際に触れないものをすべて削除します。未使用のバイナリ、ファイル、ライブラリ、権限を削除します。私のAPIイメージでは、手動でのクリーンアップでは見落としていた40MBの不要なものをさらに削除してくれました。
+</Callout>
+
+`docker-slim build --http-probe my-image`を実行したところ、120MBから78MBに縮小しました。バイナリの静的解析、実行中のプロセスの動的解析を行い、Nodeランタイムが決して開かなかったファイルを排除しました。
+
+## 最終結果
+
+数字を見てみましょう。
+
+<ConceptCompare
+  columns={["Metric", "Before", "After"]}
+  rows={[
+    { feature: "Image Size", cells: [{ text: "1.2 GB", type: "negative" }, { text: "48 MB", type: "positive" }] },
+    { feature: "Build Time", cells: [{ text: "4 min 30 s", type: "negative" }, { text: "45 s", type: "positive" }] },
+    { feature: "Pull Time (10 Mbps)", cells: [{ text: "~16 min", type: "negative" }, { text: "~40 s", type: "positive" }] },
+    { feature: "Layers", cells: [{ text: "14", type: "warning" }, { text: "5", type: "positive" }] },
+    { feature: "Vulnerabilities", cells: [{ text: "127", type: "negative" }, { text: "23", type: "positive" }] }
+  ]}
+/>
+
+1.2GBのイメージが48MBになりました。ビルド時間は4分半から1分未満に短縮されました。プル時間はコーヒーブレイクからちょっとしたストレッチの時間になりました。
+
+脆弱性の削減には驚きました。パッケージが少ないということは、CVEのターゲットも少ないということです。セキュリティスキャンでは、127件の検出から23件に減少しました。これは偶然ではありません。
+
+<Callout type="warning" title="結果は異なる場合があります">
+  これらの数値はあなたのスタックに依存します。GoバイナリはPythonアプリとは異なる縮小の仕方をします。Spring Bootを使用したJavaアプリは全く別のものです。しかし、原則は普遍的です。
+</Callout>
+
+## 過去の自分に伝えたいこと
+
+もし6ヶ月前に戻って自分にメモを残せるとしたら、こう書くでしょう。
+
+**ベースイメージから始めること。** デフォルトのイメージは快適だが肥大している。Alpineやdistrolessを使えば、コードを1行も書く前に何百メガバイトも節約できる。
+
+**最初からマルチステージビルドを使うこと。** 設定に5分かかり、後で山のような頭痛の種を避けることができる。ビルダー（builder）ステージですべてをインストールし、プロダクション（production）ステージでは必要なものだけを取り出す。
+
+**.dockerignoreを無視すると痛い目を見る。** そのファイルは、あなたがこれまでに行った中で最も安価な最適化だ。最初の`docker build`の前に書くこと。
+
+**すべてを測定すること。** 変更の前後で`dive`を実行すること。測定できなければ、それは推測に過ぎない。
+
+## 本当の教訓
+
+イメージが小さいほどデプロイは速くなります。セキュリティも向上します。レジストリでの保存コストも安くなります。帯域幅の使用量も減ります。CIパイプラインも快適になります。
+
+しかし、本当の勝利は？デプロイを恐れることがなくなりました。私のイメージはコミットから本番環境まで2分以内にデプロイされます。何か問題が発生しても、数分ではなく数秒で修正をデプロイできます。
+
+あの1GBのイメージは、単にディスク容量を無駄にしていただけではありません。私の時間を無駄にしていたのです。
+
+CIがタイムアウトするまで待たないでください。今すぐ無駄をなくしましょう。未来のあなたが感謝するでしょう。
+
+<Quiz
+  question="Dockerイメージサイズを削減する上で最も効果的なテクニックは何ですか？"
+  options={["より小さいベースイメージに切り替える", ".dockerignoreを使用する", "マルチステージビルド", "DockerSlimを実行する"]
+  }
+  correctIndex={2}
+  explanation="マルチステージビルドは、ビルド環境とランタイム環境を分離することで、ビルドツール、開発依存関係、中間ファイルを完全に破棄できます。通常、これが最大の削減効果をもたらします。"
+/>
+
+## こちらもどうぞ
+
+- [Docker Compose for Local Development: A Complete Setup Guide](/en/blog/docker-compose-local-development)
+- [Dev Containers Guide: Docker Environments in VS Code](/en/blog/devcontainers-for-consistent-environments)
+- [IaaS, PaaS, SaaS: A Mental Model That Actually Sticks](/en/blog/iaas_paas_saas)
+- [Edge Computing for Web Developers: What It Actually Is and When to Use It](/en/blog/edge-computing-for-web-developers)

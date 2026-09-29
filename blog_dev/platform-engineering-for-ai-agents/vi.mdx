@@ -1,0 +1,187 @@
+---
+title: "Kỹ thuật nền tảng cho AI: Kiến trúc hạ tầng cho các tác nhân tự trị"
+date: "2026-08-04"
+lastUpdated: "2026-09-18"
+summary: "Hướng dẫn DevOps về kiến trúc hạ tầng tác nhân AI quy mô lớn: theo dõi OpenTelemetry, hộp cát thực thi Firecracker, máy trạng thái và bộ ngắt mạch chi phí."
+tags: ["ai", "platform-engineering", "devops", "autonomous-agents", "kubernetes"]
+images: ["/static/images/platform-engineering-golden-paths.png"]
+category: Tech
+draft: false
+---
+
+Xây dựng một tác nhân AI nguyên mẫu với LangChain hoặc AutoGen trên máy tính xách tay của nhà phát triển tương đối đơn giản: bạn đưa một lời nhắc cho LLM, kết nối một hàm Python làm công cụ và xem nó thực thi.
+
+Tuy nhiên, vận hành một đội gồm hàng trăm tác nhân AI tự trị trong môi trường sản xuất là một thách thức kỹ thuật hoàn toàn khác. Không giống như các microservice truyền thống thực thi mã xác định với dấu chân bộ nhớ và CPU có thể dự đoán được, các tác nhân tự trị là **các quy trình làm việc không xác định, chạy dài, tự định hướng**. Chúng khởi tạo các vòng lặp lồng nhau, tạo ra các tác nhân phụ động, gọi các API bên ngoài và thực thi mã tùy ý trong thời gian thực.
+
+Nếu nhóm kỹ thuật nền tảng của bạn triển khai các tác nhân AI lên các pod Kubernetes tiêu chuẩn với các chính sách hết thời gian chờ HTTP tiêu chuẩn, bạn sẽ nhanh chóng gặp phải các lỗi xếp tầng: các vòng lặp tác nhân vô hạn, cạn kiệt giới hạn tốc độ API, tăng đột biến chi phí không kiểm soát và mạng nội bộ bị xâm phạm.
+
+Trong hướng dẫn này, chúng tôi sẽ phân tích bản thiết kế kiến trúc cần thiết để xây dựng Nền tảng Phát triển Nội bộ (IDP) có khả năng vận hành các đội tác nhân AI cấp doanh nghiệp một cách an toàn và đáng tin cậy.
+
+---
+
+<AudioPlayer src="/static/audio/platform-engineering-for-ai-agents.mp3" title="Tóm tắt âm thanh dành cho điều hành" />
+
+## Khối lượng công việc không xác định: Tại sao các tác nhân phá vỡ các nền tảng truyền thống
+
+Cơ sở hạ tầng đám mây truyền thống được tối ưu hóa cho các chu kỳ yêu cầu-phản hồi:
+- Một yêu cầu HTTP đến bộ điều khiển Ingress.
+- Một pod không trạng thái xử lý logic nghiệp vụ trong vòng 100ms – 500ms.
+- Một bản ghi cơ sở dữ liệu được cập nhật, một phản hồi được trả về và các tài nguyên được giải phóng ngay lập tức.
+
+Các tác nhân tự trị phá vỡ mọi giả định này:
+
+1. **Thời gian thực thi không giới hạn**: Một tác nhân thực hiện nghiên cứu thị trường hoặc gỡ lỗi một yêu cầu kéo có thể chạy trong 45 phút, thực hiện 80 lệnh gọi LLM tuần tự và hàng trăm lệnh gọi công cụ.
+2. **Thực thi công cụ động & Rủi ro bảo mật**: Khi một tác nhân viết và thực thi mã để phân tích CSV hoặc kiểm tra truy vấn SQL, nó không thể chạy bên trong container sản xuất. Nó yêu cầu một sandbox thực thi được cách ly cứng.
+3. **Tiêu thụ token xếp tầng**: Một lỗi logic duy nhất trong vòng lặp suy luận của tác nhân có thể kích hoạt các lệnh gọi API đệ quy, tiêu thụ hàng triệu token và gây ra hàng nghìn đô la hóa đơn API LLM trong vòng vài phút.
+
+```
+[Agent Platform Engineering Architecture]
+
+  User / Event Trigger
+         │
+         ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │ Agent Gateway & Rate Limiter (Token Budget Enforcement)  │
+  └────────────────────────────┬─────────────────────────────┘
+                               │
+         ▼                     ▼                      ▼
+  ┌──────────────┐      ┌──────────────┐       ┌──────────────┐
+  │ Agent Worker │      │ Agent Worker │       │ Agent Worker │
+  │ (Reasoning)  │      │ (Reasoning)  │       │ (Reasoning)  │
+  └──────┬───────┘      └──────┬───────┘       └──────┬───────┘
+         │                     │                      │
+         ├─────────────────────┼──────────────────────┤
+         ▼                     ▼                      ▼
+  ┌────────────────┐    ┌─────────────────┐    ┌──────────────────┐
+  │ Isolated E2B / │    │ OpenTelemetry   │    │ Postgres / Redis │
+  │ Firecracker VM │    │ Tracing & Evals │    │ Checkpoint Store │
+  │ (Code Sandbox) │    │ (Audit Logging) │    │ (State Recovery) │
+  └────────────────┘    └─────────────────┘    └──────────────────┘
+```
+
+---
+
+## 1. Sandbox thực thi được tăng cường: Firecracker & E2B
+
+Khi một tác nhân tự trị tạo mã Python hoặc Bash để thực hiện một tác vụ, việc chạy mã đó bên trong pod worker Kubernetes của bạn sẽ tạo ra các rủi ro nghiêm trọng về thoát khỏi container và di chuyển ngang.
+
+Các nhóm nền tảng phải cung cấp một **dịch vụ sandbox tạm thời theo yêu cầu**:
+
+- **MicroVM Firecracker**: Thay vì các container Docker (chia sẻ kernel Linux của máy chủ), MicroVM cung cấp khả năng cách ly KVM cấp phần cứng thực sự với thời gian khởi động dưới 125 mili giây.
+- **Lọc lưu lượng mạng đi**: Mọi sandbox phải hoạt động với các quy tắc mạng từ chối mặc định nghiêm ngặt. Lưu lượng truy cập ra ngoài bị hạn chế thông qua các chính sách mạng eBPF hoặc Cilium để ngăn tác nhân tiếp cận các điểm cuối siêu dữ liệu đám mây nội bộ (`169.254.169.254`) hoặc cơ sở dữ liệu sản xuất.
+- **Hạn ngạch tài nguyên cứng**: Các sandbox phải thực thi các giới hạn bộ nhớ (ví dụ: 512MB RAM) và CPU nghiêm ngặt với việc tự động chấm dứt giám sát sau 60 giây không hoạt động.
+
+```python
+# Production Agent Sandbox Invocation using Ephemeral MicroVMs
+from e2b_code_interpreter import Sandbox
+
+def execute_agent_code(python_code: str) -> dict:
+    """Executes arbitrary agent-generated code in an isolated microVM sandbox."""
+    # Instantiates a fresh Firecracker microVM in <200ms
+    with Sandbox(template="python-data-science") as sandbox:
+        try:
+            execution = sandbox.run_code(
+                python_code,
+                timeout=30, # Hard ceiling prevents infinite CPU loops
+            )
+            return {
+                "stdout": execution.logs.stdout,
+                "stderr": execution.logs.stderr,
+                "error": execution.error,
+                "exit_code": 0 if not execution.error else 1,
+            }
+        except Exception as e:
+            return {"error": f"Sandbox execution timeout: {str(e)}", "exit_code": -1}
+```
+
+---
+
+## 2. Khả năng quan sát chuyên biệt: Theo dõi chuỗi suy luận
+
+Việc giám sát mức sử dụng CPU và tỷ lệ HTTP 500 không cho bạn biết liệu một tác nhân đang ảo giác hay bị kẹt trong một bẫy suy luận.
+
+Các nhóm nền tảng phải trang bị cho các tác nhân **Quy ước ngữ nghĩa GenAI của OpenTelemetry**, theo dõi mọi bước: đầu vào lời nhắc, các đoạn ngữ cảnh đã truy xuất, đối số gọi công cụ, mức sử dụng token và độ trễ:
+
+```python
+from opentelemetry import trace
+
+tracer = trace.get_tracer("ai.platform.agent", "1.0.0")
+
+def execute_agent_step(agent_id: str, step_index: int, prompt: str, model: str):
+    with tracer.start_as_current_span(f"agent.step.{step_index}") as span:
+        span.set_attribute("gen_ai.system", "anthropic")
+        span.set_attribute("gen_ai.request.model", model)
+        span.set_attribute("agent.id", agent_id)
+        span.set_attribute("agent.step_index", step_index)
+        
+        # Scrub PII before attaching to trace span
+        sanitized_prompt = scrub_pii(prompt)
+        span.set_attribute("gen_ai.prompt", sanitized_prompt)
+
+        response = call_llm_with_tools(prompt)
+        
+        # Capture usage metrics for real-time cost attribution
+        span.set_attribute("gen_ai.usage.prompt_tokens", response.usage.prompt_tokens)
+        span.set_attribute("gen_ai.usage.completion_tokens", response.usage.completion_tokens)
+        span.set_attribute("agent.tools_called", [t.name for t in response.tool_calls])
+        
+        return response
+```
+
+Bằng cách xuất các dấu vết này đến các bộ thu OpenTelemetry (được hỗ trợ bởi Jaeger hoặc SigNoz), các nhà điều hành nền tảng có thể truy vấn ngay lập tức:
+- *Công cụ nào có tỷ lệ lỗi cao nhất?*
+- *Chi phí token trung bình cho mỗi vé Jira đã giải quyết là bao nhiêu?*
+- *Một vòng lặp tác nhân lặp lại các đối số giống hệt nhau ở đâu?*
+
+---
+
+## 3. Ngân sách Token & Bộ ngắt mạch
+
+Một tác nhân giả mạo bị mắc kẹt trong một vòng lặp vô hạn có thể làm cạn kiệt hạn ngạch API OpenAI hoặc Anthropic hàng tháng của một tổ chức trong vòng chưa đầy một giờ.
+
+Kỹ thuật nền tảng phải triển khai **Bộ ngắt mạch đa cấp** ở cấp cổng:
+
+```python
+# Redis-Backed Sliding Window Token Circuit Breaker
+import redis
+
+r = redis.Redis.from_url(os.getenv("REDIS_URL"))
+
+def check_token_quota(tenant_id: str, requested_tokens: int, max_hourly_budget: int = 250_000):
+    key = f"quota:tokens:{tenant_id}"
+    current_spent = r.incrby(key, requested_tokens)
+    
+    # Set 1-hour expiration on initial spend
+    if current_spent == requested_tokens:
+        r.expire(key, 3600)
+        
+    if current_spent > max_hourly_budget:
+        # Trip the circuit breaker
+        raise Exception(f"Hourly token quota exceeded for tenant {tenant_id}. Execution halted.")
+```
+
+Ngoài ra, các tác nhân nên thực thi:
+1. **Giới hạn lặp tối đa**: Giới hạn cứng 15–20 bước suy luận cho mỗi tác vụ.
+2. **Phát hiện lặp lại**: Nếu một tác nhân thực thi cùng một công cụ với cùng các đối số hai lần liên tiếp, hãy dừng thực thi ngay lập tức và kích hoạt sự can thiệp của con người.
+
+---
+
+## Các câu hỏi thường gặp
+
+### Tại sao các tác nhân không nên chạy trực tiếp trong các container Kubernetes?
+Các container Kubernetes tiêu chuẩn chia sẻ kernel Linux của máy chủ. Nếu một tác nhân thực thi mã được tạo bởi một LLM bao gồm các khai thác độc hại hoặc cố gắng thăm dò mạng container nội bộ, nó có thể thoát khỏi container hoặc xâm phạm các dịch vụ cụm nội bộ. Các sandbox như Firecracker MicroVM cung cấp ảo hóa cấp phần cứng, cách ly hoàn toàn việc thực thi của mỗi tác nhân.
+
+### Bạn xử lý trạng thái tác nhân chạy dài qua các lần khởi động lại worker như thế nào?
+Sử dụng điểm kiểm tra theo hướng sự kiện với nhật ký chỉ thêm vào trong PostgreSQL. Sau mỗi bước suy luận hoặc thực thi công cụ, tác nhân cam kết vector trạng thái và lịch sử bộ nhớ của nó vào cơ sở dữ liệu. Nếu một pod worker Kubernetes bị chiếm quyền, một pod mới sẽ tiếp tục quy trình làm việc của tác nhân trực tiếp từ điểm kiểm tra đã xác minh cuối cùng mà không mất tiến độ.
+
+### Cách tốt nhất để xử lý giới hạn tốc độ LLM trên nhiều tác nhân đồng thời là gì?
+Triển khai Cổng AI nội bộ (chẳng hạn như LiteLLM hoặc Portkey) trước các nhà cung cấp mô hình. Cổng quản lý các nhóm token phân tán, cân bằng tải các yêu cầu trên nhiều khóa API của nhà cung cấp và tự động chuyển sang các mô hình hoặc khu vực đám mây thứ cấp khi gặp phản hồi giới hạn tốc độ HTTP 429.
+
+---
+
+## Bạn cũng có thể thích
+
+- [Kỹ thuật nền tảng: Xây dựng các con đường vàng cho nhà phát triển](/en/blog/platform-engineering-golden-paths)
+- [Kubernetes Operators: Xây dựng bộ điều khiển tùy chỉnh với Operator SDK](/en/blog/kubernetes-2026-08-06)
+- [Kubernetes Operators và tài nguyên tùy chỉnh](/en/blog/kubernetes-operators)
+- [Xây dựng Kubernetes Operators trong Go: Quản lý ứng dụng có trạng thái](/en/blog/kubernetes-operators-golang)

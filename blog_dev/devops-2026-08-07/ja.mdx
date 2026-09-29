@@ -1,0 +1,313 @@
+---
+title: "FluxによるGitOps:Kubernetesのための宣言的インフラストラクチャとCD"
+date: "2026-08-07"
+summary: "Flux v2による本番環境のGitOps:GitRepositoryソース、Kustomize/Helmリコンシリエーションループ、SOPSによるシークレット復号、コンテナイメージの自動更新。"
+tags: ["kubernetes", "devops", "gitops", "flux", "cloud-native"]
+draft: false
+images: ['/static/images/devops-2026-08-07.png']
+---
+
+GitOpsは、インフラストラクチャとアプリケーションの望ましい状態について**Gitを唯一の信頼できる情報源**とし、Kubernetesクラスター内の自動化されたコントローラーが実際の状態をGitに一致させるように継続的に調整する運用モデルです。
+
+ArgoCDが普及している集中型Web UIを提供する一方で、**Flux (v2)** は**GitOps Toolkit (GOTK)** を基盤として構築されています。これは、Kubernetesカスタムリソース定義（CRD）と、クラスター内でネイティブに実行される特殊なコントローラーからなるモジュール式のセットです。Fluxは、マルチテナント環境、自動化されたイメージ更新、および最小限のリソースフットプリントにおいて優れています。
+
+このガイドでは、Kustomizeの調整、Helmリリース、SOPSシークレット暗号化、自動化されたコンテナイメージPRなど、Flux v2を使用した本番環境レベルのGitOpsのセットアップについて説明します。
+
+---
+
+<AudioPlayer src="/static/audio/devops-2026-08-07.mp3" title="Executive Audio Briefing" />
+
+## 1. Fluxアーキテクチャ: GitOps Toolkit
+
+Fluxは、GitOpsを専用の単一責任コントローラーに分解します。
+
+```
+                  Git Repository (GitHub / GitLab)
+                                │
+                                ▼ (Pulls Git commit / tag / branch)
+                     [ source-controller ]
+                                │
+         ┌──────────────────────┴──────────────────────┐
+         ▼ (Raw manifests & Kustomize)                 ▼ (Helm Charts)
+[ kustomize-controller ]                      [ helm-controller ]
+         │                                             │
+         ▼ (Applies with Prune & Health Checks)        ▼ (Executes Helm engine)
+   Kubernetes API                                Kubernetes API
+         ▲                                             ▲
+         └──────────────────────┬──────────────────────┘
+                                │ (Watches OCI Registry & commits new tags to Git)
+                 [ image-automation-controller ]
+```
+
+* **`source-controller`:** Gitリポジトリ、Helmチャート、OCIアーティファクト、S3バケットをクラスターストレージにフェッチします。
+* **`kustomize-controller`:** Kustomizeオーバーレイを実行し、SOPSシークレットを復号化し、マニフェストをAPIサーバーに適用し、削除されたリソースを自動的にプルーニングします。
+* **`helm-controller`:** Helmチャートリリースのライフサイクルを宣言的に管理します。
+* **`notification-controller`:** Slack、Discord、またはWebhookにイベントを送信し、Git/OCIレジストリから受信Webhookを受け取って即時調整をトリガーします。
+* **`image-automation-controller`:** Dockerレジストリ内の新しいコンテナタグを検出し、更新されたイメージタグを自動的にGitリポジトリにコミットします。
+
+---
+
+## 2. 本番環境向けモノレポリポジトリ構造
+
+堅牢なマルチ環境リポジトリレイアウトは、基盤となるインフラストラクチャとテナントアプリケーションを明確に分離します。
+
+```
+fleet-infra/
+├── clusters/
+│   ├── staging/
+│   │   ├── flux-system/        # Bootstrap manifests
+│   │   ├── infrastructure.yaml # Reconciles /infrastructure/staging
+│   │   └── apps.yaml           # Reconciles /apps/staging
+│   └── production/
+│       ├── flux-system/
+│       ├── infrastructure.yaml
+│       └── apps.yaml
+├── infrastructure/
+│   ├── base/
+│   │   ├── ingress-nginx/
+│   │   └── cert-manager/
+│   └── staging/
+│       └── kustomization.yaml
+└── apps/
+    ├── base/
+    │   └── payments-api/
+    └── staging/
+        ├── kustomization.yaml
+        └── patch-replicas.yaml
+```
+
+---
+
+## 3. コアマニフェスト: GitRepository & Kustomization
+
+### ソースの定義: `GitRepository`
+
+```yaml
+# clusters/staging/fleet-source.yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: fleet-infra
+  namespace: flux-system
+spec:
+  interval: 1m
+  url: https://github.com/my-org/fleet-infra.git
+  ref:
+    branch: main
+  secretRef:
+    name: github-deploy-token
+  ignore: |
+    # Exclude non-manifest directories from checksums
+    /*
+    !/apps
+    !/infrastructure
+```
+
+### ヘルスチェックとプルーニングによる調整: `Kustomization`
+
+```yaml
+# clusters/staging/apps.yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: staging-apps
+  namespace: flux-system
+spec:
+  interval: 5m
+  path: ./apps/staging
+  prune: true               # Automatically deletes removed k8s resources
+  wait: true                # Blocks until all Pods pass readiness probes
+  timeout: 3m
+  sourceRef:
+    kind: GitRepository
+    name: fleet-infra
+  dependsOn:
+    - name: staging-infrastructure  # Ensures ingress/CRDs exist before apps deploy
+  postBuild:
+    substitute:
+      ENVIRONMENT: "staging"
+      CLUSTER_DOMAIN: "stage.internal.net"
+```
+
+---
+
+## 4. ドリフト検出によるHelmリリースの管理
+
+Fluxは、ローカルにHelm CLIをインストールすることなく、Helmチャートをネイティブに管理します。
+
+```yaml
+# infrastructure/base/ingress-nginx/helm-release.yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: ingress-nginx
+  namespace: flux-system
+spec:
+  interval: 2h
+  url: https://kubernetes.github.io/ingress-nginx
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: ingress-nginx
+  namespace: ingress-nginx
+spec:
+  interval: 15m
+  chart:
+    spec:
+      chart: ingress-nginx
+      version: "4.11.x"
+      sourceRef:
+        kind: HelmRepository
+        name: ingress-nginx
+        namespace: flux-system
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+  driftDetection:
+    mode: enabled          # Automatically reverts manual edits back to chart values
+  values:
+    controller:
+      replicaCount: 3
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+```
+
+---
+
+## 5. シークレット管理: SOPSとAgeによるGit内暗号化
+
+プレーンテキストのシークレットをGitに保存してはいけません。Fluxは、クラスターに適用する前に、[SOPS](https://github.com/getsops/sops)で暗号化されたYAMLをネイティブに復号化します。
+
+### ステップ1: `age`でシークレットを暗号化する
+```bash
+# Generate age private key for the cluster
+age-keygen -o age.agekey
+
+# Create in-cluster secret with the private key
+kubectl create secret generic sops-age \
+  --namespace=flux-system \
+  --from-file=age.agekey
+
+# Encrypt local Kubernetes secret
+sops --encrypt --age $(cat age.agekey | grep public | cut -d: -f2 | xargs) \
+  --encrypted-regex '^(data|stringData)$' \
+  secret.yaml > apps/staging/secret.enc.yaml
+```
+
+### ステップ2: 実行時に復号化するようにFluxを設定する
+
+```yaml
+# In apps/staging/kustomization.yaml or root Kustomization CRD
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: staging-secrets
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./apps/staging
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: fleet-infra
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age        # Matches private key stored in flux-system
+```
+
+---
+
+## 6. 自動イメージ更新 (継続的デプロイ)
+
+Fluxはコンテナレジストリを監視し、新しいイメージタグを直接Gitに自動コミットできます。
+
+```yaml
+# apps/base/payments-api/image-policy.yaml
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImageRepository
+metadata:
+  name: payments-api
+  namespace: flux-system
+spec:
+  image: ghcr.io/my-org/payments-api
+  interval: 1m
+---
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImagePolicy
+metadata:
+  name: payments-api
+  namespace: flux-system
+spec:
+  imageRepositoryRef:
+    name: payments-api
+  policy:
+    semver:
+      range: '^1.x'        # Auto-promotes minor and patch versions
+---
+apiVersion: image.toolkit.fluxcd.io/v1beta1
+kind: ImageUpdateAutomation
+metadata:
+  name: flux-system
+  namespace: flux-system
+spec:
+  interval: 1m
+  sourceRef:
+    kind: GitRepository
+    name: fleet-infra
+  git:
+    checkout:
+      ref:
+        branch: main
+    commit:
+      author:
+        email: fluxcdbot@users.noreply.github.com
+        name: fluxcdbot
+      messageTemplate: 'chore(cd): update payments-api to {{range .Updated.Images}}{{println .}}{{end}}'
+    push:
+      branch: main
+  update:
+    path: ./apps/staging
+    strategy: Setters
+```
+
+デプロイYAMLにコメントセッターを追加します。
+
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/my-org/payments-api:1.4.2 # {"$imagepolicy": "flux-system:payments-api"}
+```
+
+CIが`ghcr.io/my-org/payments-api:1.4.3`をプッシュすると、Fluxはタグを検出し、Git内のこの行を正確に更新し、`chore(cd)...`でコミットし、`main`にプッシュし、ステージング環境で新しいPodを調整します。
+
+---
+
+## Flux v2 vs ArgoCD: 本番環境でのトレードオフ
+
+| 機能 | Flux v2 | ArgoCD |
+|---|---|---|
+| **アーキテクチャ** | ネイティブKubernetesコントローラー (GOTK) | アプリケーションCRD + 集中型Webサーバー |
+| **Web UI** | 最小限 / Weave GitOps (オプション) | 豊富なインタラクティブダッシュボードを内蔵 |
+| **シークレット復号化** | コントローラー内でネイティブSOPS & Age / KMS | ArgoCDプラグイン / 外部オペレーターが必要 |
+| **マルチクラスター** | クラスターごとに軽量エージェントプル | 中央プルまたはリモートクラスターへのプッシュ |
+| **ドリフト修正** | 継続的なバックグラウンド自己修復 | 継続的な同期または手動同期ボタン |
+| **イメージ自動化** | リポジトリ内自動コミットコントローラーをネイティブで提供 | ArgoCD Image Updater (別個) が必要 |
+
+---
+
+## こちらもおすすめ
+
+- [ArgoCD GitOpsマルチクラスターデプロイメントパターン](/en/blog/argocd-gitops-multi-cluster-deployments)
+- [高度なCI/CD: ブルーグリーンデプロイメントとカナリアリリース](/en/blog/devops-2026-08-11)
+- [Kubernetesオペレーターとカスタムリソース: すべてを自動化する](/en/blog/kubernetes-operators)
+- [KubernetesにおけるeBPFによる高性能オブザーバビリティ](/en/blog/ebpf-kubernetes-observability)

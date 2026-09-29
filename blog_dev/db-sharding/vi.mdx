@@ -1,0 +1,222 @@
+---
+title: "Các chiến lược Sharding cơ sở dữ liệu hiện đại cho tăng trưởng siêu tốc"
+date: "2026-09-28"
+summary: "Nắm vững các kiến trúc sharding cơ sở dữ liệu hiện đại: phân vùng ngang, khóa băm theo dải so với khóa băm nhất quán, kết nối liên shard, giao dịch phân tán (2PC so với Saga), Vitess và Citus."
+tags: ["database", "architecture", "scaling", "backend", "postgresql", "mysql"]
+draft: false
+images: ["/static/images/db-sharding.png"]
+---
+
+Sharding là lựa chọn cuối cùng để mở rộng quy mô cơ sở dữ liệu. Bạn không sharding vì bạn muốn; bạn sharding vì bộ ghi chính của bạn đã bão hòa, việc mở rộng theo chiều dọc đã đạt đến giới hạn vật lý (hoặc giới hạn hóa đơn AWS), và các bản sao chỉ đọc không thể giải quyết các nút thắt cổ chai về thông lượng ghi.
+
+Khi bạn vượt qua ngưỡng đó, bạn đánh đổi các đảm bảo quan hệ của một nút đơn (giao dịch ACID, khóa ngoại liên bảng, ràng buộc duy nhất toàn cục) để lấy khả năng mở rộng theo chiều ngang. Hướng dẫn này sẽ trình bày cách các hệ thống hiện đại thực sự sharding các cơ sở dữ liệu quan hệ, cách chọn khóa sharding, và cách xử lý các chế độ lỗi của hệ thống phân tán sau đó.
+
+---
+
+<AudioPlayer src="/static/audio/db-sharding.mp3" title="Tóm tắt âm thanh dành cho lãnh đạo" />
+
+## Khi nào nên Shard (Và những gì nên thử trước)
+
+Trước khi chia cơ sở dữ liệu của bạn thành các shard, hãy đảm bảo bạn đã thực hiện hết các bước trung gian sau:
+
+```
+Scaling Stages:
+1. Index Optimization & Slow Query Tuning (EXPLAIN ANALYZE)
+      │ (hit CPU/IOPS limits)
+      ▼
+2. Read/Write Splitting (Primary for writes, Replicas for reads)
+      │ (write throughput saturates primary node)
+      ▼
+3. Table Partitioning (PostgreSQL declarative partitioning / MySQL partition)
+      │ (single machine disk/memory/lock contention saturated)
+      ▼
+4. Functional Partitioning (Extract Auth, Billing, Analytics to isolated DBs)
+      │ (a single domain table like `orders` or `events` exceeds 1 node capacity)
+      ▼
+5. Horizontal Sharding (Split identical table schema across N database nodes)
+```
+
+Nếu một bảng đơn vượt quá **500 triệu hàng**, các thao tác ghi tạo ra tranh chấp khóa liên tục, và độ trễ sao chép WAL/redo tăng nhanh hơn khả năng tiếp nhận của các bản sao, bạn cần sharding theo chiều ngang.
+
+---
+
+## 1. Các chiến lược khóa Sharding
+
+**Khóa Sharding** xác định shard cơ sở dữ liệu nào chứa một hàng nhất định. Chọn sai khóa sẽ dẫn đến các điểm nóng, các truy vấn scatter-gather liên shard, và những cuộc di chuyển ác mộng.
+
+### Chiến lược A: Sharding dựa trên phạm vi
+
+Các hàng được định tuyến dựa trên các phạm vi giá trị liên tục (ví dụ: `created_at` phạm vi ngày hoặc phạm vi ID `1–1,000,000` -> Shard 1, `1,000,001–2,000,000` -> Shard 2).
+
+*   **Ưu điểm:** Dễ dàng truy vấn các phạm vi ngày/ID trong một shard duy nhất; dễ dàng lưu trữ dữ liệu cũ bằng cách xóa toàn bộ một shard.
+*   **Nhược điểm (Chính):** **Điểm nóng ghi** nghiêm trọng. Tất cả các ghi mới đều truy cập shard có phạm vi cao nhất (ví dụ: ngày hôm nay), khiến các shard cũ không hoạt động trong khi nút mới nhất bị tắc nghẽn.
+
+### Chiến lược B: Sharding dựa trên hàm băm (Consistent Hashing)
+
+Chuyển khóa sharding qua một hàm băm mật mã hoặc hàm băm phi mật mã nhanh (như MurmurHash3 hoặc xxHash) modulo số lượng shard, hoặc ánh xạ lên một vòng băm nhất quán với các nút ảo:
+
+$$\text{Shard ID} = \text{hash}(\text{sharding\_key}) \pmod N$$
+
+```python
+import mmh3
+
+class ShardRouter:
+    def __init__(self, shard_count: int):
+        self.shard_count = shard_count
+
+    def get_shard_id(self, entity_id: str) -> int:
+        # MurmurHash3 ensures uniform distribution across shards
+        hash_val = mmh3.hash(str(entity_id))
+        return abs(hash_val) % self.shard_count
+
+router = ShardRouter(shard_count=8)
+print(router.get_shard_id("user_98314"))  # -> Shard 3
+print(router.get_shard_id("user_98315"))  # -> Shard 7
+```
+
+*   **Ưu điểm:** Phân phối đồng đều các thao tác đọc và ghi trên tất cả các nút. Không có điểm nóng ghi.
+*   **Nhược điểm:** Các truy vấn phạm vi trên các khóa (ví dụ: `WHERE created_at BETWEEN x AND y`) phải phát sóng tới **tất cả** các shard (scatter-gather).
+
+### Chiến lược C: Sharding dựa trên thư mục / tra cứu
+
+Một dịch vụ tra cứu trung tâm, được lưu vào bộ nhớ đệm cao (ví dụ: Redis + cơ sở dữ liệu siêu dữ liệu) ánh xạ `entity_id` tới `shard_id`.
+
+*   **Ưu điểm:** Tính linh hoạt tối đa. Bạn có thể di chuyển một khách hàng có khối lượng lớn riêng lẻ (một khách hàng "cá voi") đến shard phần cứng chuyên dụng của họ bằng cách đơn giản cập nhật bảng tra cứu.
+*   **Nhược điểm:** Mỗi thao tác cơ sở dữ liệu thêm một chuyến đi khứ hồi mạng bổ sung đến dịch vụ tra cứu; dịch vụ tra cứu trở thành một điểm lỗi duy nhất (SPOF) nếu không được lưu vào bộ nhớ đệm nhiều.
+
+---
+
+## 2. Triển khai thực tế: Định tuyến cấp ứng dụng trong Python
+
+Trong sharding cấp ứng dụng, lớp dịch vụ của bạn quản lý các nhóm kết nối cho mỗi shard và định tuyến các truy vấn dựa trên ngữ cảnh:
+
+```python
+import asyncpg
+from typing import Dict, Any
+
+class ShardedDatabaseManager:
+    def __init__(self, shard_configs: Dict[int, str]):
+        self.configs = shard_configs
+        self.pools: Dict[int, asyncpg.Pool] = {}
+
+    async def initialize(self):
+        for shard_id, dsn in self.configs.items():
+            self.pools[shard_id] = await asyncpg.create_pool(
+                dsn, min_size=5, max_size=20, timeout=10.0
+            )
+
+    def get_shard_for_tenant(self, tenant_id: str) -> int:
+        import hashlib
+        h = int(hashlib.md5(tenant_id.encode()).hexdigest(), 16)
+        return h % len(self.pools)
+
+    async def execute_query(
+        self, tenant_id: str, query: str, *args
+    ) -> list[Dict[str, Any]]:
+        shard_id = self.get_shard_for_tenant(tenant_id)
+        pool = self.pools[shard_id]
+        async with pool.acquire() as conn:
+            records = await conn.fetch(query, *args)
+            return [dict(r) for r in records]
+
+    async def scatter_gather(self, query: str, *args) -> list[Dict[str, Any]]:
+        """Broadcast read query to all shards concurrently and aggregate results."""
+        import asyncio
+        async def query_shard(shard_id: int, pool: asyncpg.Pool):
+            async with pool.acquire() as conn:
+                return await conn.fetch(query, *args)
+
+        tasks = [query_shard(sid, pool) for sid, pool in self.pools.items()]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        flat = []
+        for r in results:
+            flat.extend([dict(row) for row in r])
+        return flat
+```
+
+---
+
+## 3. 4 Khó khăn lớn của cơ sở dữ liệu quan hệ được Shard
+
+### 1. Vấn đề định danh duy nhất toàn cầu
+
+Bạn không còn có thể dựa vào `AUTO_INCREMENT` hoặc các chuỗi `BIGSERIAL` của PostgreSQL vì mỗi shard sẽ tạo ra các khóa chính trùng lặp.
+
+**Giải pháp:**
+*   **UUIDv7:** UUID 128-bit được sắp xếp theo thời gian (khả năng định vị chỉ mục cơ sở dữ liệu tốt, không cần phối hợp trung tâm).
+*   **Snowflake IDs:** Số nguyên 64-bit bao gồm `[Timestamp (41 bits) | Worker ID (10 bits) | Sequence (12 bits)]`. Tạo ra hàng triệu ID duy nhất có thể sắp xếp mỗi giây mà không cần khóa cơ sở dữ liệu.
+
+```
+Snowflake 64-Bit Structure:
+[ 1 bit sign ] [ 41 bits timestamp (ms) ] [ 10 bits machine/shard ID ] [ 12 bits sequence ]
+```
+
+### 2. Kết nối liên shard
+
+Nếu `orders` được sharding bởi `tenant_id` và `products` là toàn cục, việc kết nối chúng trực tiếp trong SQL trên các máy chủ vật lý khác nhau là không thể.
+
+*   **Mẫu A: Gom nhóm thực thể (Co-location).** Shard tất cả dữ liệu liên quan bằng cùng một khóa gốc. Nếu `users`, `orders`, và `order_items` đều chứa `tenant_id` làm khóa sharding của chúng, các truy vấn giới hạn trong một `tenant_id` duy nhất sẽ thực hiện dưới dạng các kết nối cục bộ 100% trên shard đó.
+*   **Mẫu B: Sao chép bảng tham chiếu.** Các bảng tra cứu nhỏ, ít thay đổi (ví dụ: `currencies`, `countries`, `plan_tiers`) được sao chép vào **mọi** shard. Các cập nhật được phát sóng đến tất cả các nút thông qua Change Data Capture (Debezium/Kafka).
+*   **Mẫu C: Kết nối trong bộ nhớ cấp ứng dụng.** Truy vấn `orders` từ Shard A, tìm nạp `product_ids` duy nhất, thực hiện truy vấn hàng loạt `SELECT * FROM products WHERE id = ANY(...)` trên cơ sở dữ liệu danh mục, và ghép các DTO lại với nhau trong dịch vụ backend.
+
+### 3. Giao dịch phân tán: 2PC so với Saga
+
+Khi một hoạt động kinh doanh chạm đến hai shard khác nhau (ví dụ: chuyển tiền từ Tài khoản trên Shard 1 sang Tài khoản trên Shard 2), `BEGIN ... COMMIT` tiêu chuẩn không thể đảm bảo tính nguyên tử.
+
+#### Two-Phase Commit (2PC)
+Một điều phối viên giao dịch hỏi tất cả các shard tham gia: "Bạn có thể commit không?" (Giai đoạn Chuẩn bị). Nếu tất cả trả lời CÓ, điều phối viên ghi lại commit và đưa ra "Commit!" (Giai đoạn Commit).
+*   **Vấn đề:** Độ trễ cao, giữ khóa trên các bước nhảy mạng, và các chế độ lỗi điều phối viên bị chặn. Hiếm khi được sử dụng trong các hệ thống internet có thông lượng cao.
+
+#### Mẫu Saga với Hộp thư giao dịch (Transactional Outbox)
+Thay thế các khóa phân tán đồng bộ bằng các giao dịch bù trừ không đồng bộ:
+
+```
+1. [Shard 1] Deduct $100 from Account A -> Write "MoneyDebited" event to local `outbox` table (Atomic local commit)
+2. CDC worker reads `outbox` -> Publishes to Kafka
+3. Worker reads Kafka -> [Shard 2] Credit $100 to Account B
+4. If Shard 2 fails permanently -> Emit "CreditFailed" event -> Compensating transaction on Shard 1 to refund $100 to Account A
+```
+
+---
+
+## 4. Middleware cơ sở dữ liệu hiện đại so với SQL phân tán gốc
+
+Thay vì duy trì các lớp định tuyến tùy chỉnh trong mã ứng dụng của bạn, các kiến trúc hiện đại thường dựa vào các lớp proxy hoặc lưu trữ phân tán:
+
+| Phương pháp | Ví dụ | Cách hoạt động | Tốt nhất cho |
+|---|---|---|---|
+| **Proxy trong suốt** | [Vitess](https://vitess.io/) (MySQL), [Citus](https://www.citusdata.com/) (Postgres) | Nằm giữa ứng dụng và MySQL/Postgres tiêu chuẩn. Ứng dụng nói SQL tiêu chuẩn; proxy phân tích AST và định tuyến các shard. | Mở rộng các cơ sở dữ liệu quan hệ nguyên khối hiện có mà không cần viết lại SQL ứng dụng. |
+| **SQL phân tán (Gốc)** | [CockroachDB](https://www.cockroachlabs.com/), [TiDB](https://docs.pingcap.com/tidb/stable), Google Spanner | Công cụ lưu trữ được phân tán gốc (đồng thuận Raft + cây LSM/Pebble). Các shard (phạm vi) tự động chia tách và cân bằng lại. | Các hệ thống cloud-native mới cần ghi theo chiều ngang với các giao dịch ACID tiêu chuẩn. |
+| **Sharding cấp ứng dụng** | Custom Router / Hibernate Shards / SQLAlchemy Routing | Ứng dụng chọn chuỗi kết nối một cách rõ ràng dựa trên ID thực thể. | Thông lượng cực cao mà chi phí độ trễ của proxy (1–2ms) là không thể chấp nhận được. |
+
+---
+
+## 5. Cân bằng lại trực tiếp: Công thức di chuyển trực tuyến
+
+Đến một lúc nào đó, 8 shard của bạn sẽ hết dung lượng và bạn phải mở rộng lên 16 shard mà không làm gián đoạn nền tảng:
+
+1.  **Khởi tạo các nút shard mới** (Shard 9–16).
+2.  **Ghi kép:** Cập nhật ứng dụng của bạn để ghi vào cả vị trí shard cũ và vị trí shard mới.
+3.  **Điền lại dữ liệu:** Chạy một worker nền để sao chép dữ liệu lịch sử từ các shard cũ sang các shard mới (được lọc theo định tuyến băm nhất quán mới).
+4.  **Xác minh tính nhất quán:** So sánh tổng kiểm tra giữa các shard cũ và mới.
+5.  **Chuyển đổi đọc:** Chuyển hướng lưu lượng đọc đến ánh xạ 16 shard mới.
+6.  **Dừng ghi kép:** Xóa các bản ghi đã di chuyển cũ từ Shard 1–8.
+
+---
+
+## Danh sách kiểm tra tóm tắt cho kiến trúc Sharding
+
+1.  **Chọn khóa Sharding cẩn thận:** Đặt dữ liệu cùng vị trí theo người thuê/người dùng để giữ 95%+ truy vấn trong một shard duy nhất.
+2.  **Sử dụng Snowflake 64-bit hoặc UUIDv7** để tránh xung đột ID khóa chính giữa các nút.
+3.  **Loại bỏ các giao dịch liên shard** bằng cách sử dụng mẫu Saga và hộp thư giao dịch.
+4.  **Sao chép các bảng tham chiếu nhỏ** đến tất cả các shard để cho phép các kết nối cục bộ.
+5.  **Đánh giá Vitess / Citus** trước khi viết hàng trăm dòng logic định tuyến cấp ứng dụng tùy chỉnh.
+
+---
+
+## Bạn cũng có thể thích
+
+- [Bắt đầu với MySQL: Truy vấn và Tối ưu hóa trong Sản xuất](/en/blog/getting-started-with-mysql-queries)
+- [Các chiến lược Seeding cơ sở dữ liệu với Prisma và TypeScript](/en/blog/prisma-seed-typescript-strategies)
+- [Các mẫu lưu trữ Redis nâng cao cho API có lưu lượng truy cập cao](/en/blog/redis-caching-patterns)
+- [Truyền dữ liệu thời gian thực với Apache Kafka](/en/blog/real-time-kafka)

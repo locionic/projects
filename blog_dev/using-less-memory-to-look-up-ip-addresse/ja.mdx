@@ -1,0 +1,291 @@
+---
+draft: false
+title: "MessWithDNSでのIPアドレス検索におけるメモリ使用量の削減"
+images: ['https://imgbed.locionic.com/file/1784441605215_using-less-memory-to-look-up-ip-addresse.jpg']
+date: '2024-10-27'
+lastUpdated: '2026-09-22'
+tags: ["networking", "go", "memory-optimization", "database"]
+category: Tech
+summary: "Go製DNSプレイグラウンドでIP検索データベースのフットプリントを117MBから46MBに削減し、リソース制約のあるクラウドサーバーでのOOMクラッシュを解消した方法を、pprof、netip.Addr、ASN重複排除を用いて解説します。"
+---
+
+私はMess With DNSというDNSプレイグラウンドを運営しています。楽しいプロジェクトなのですが、しょっちゅうクラッシュしていました。サーバーのRAMは465MBしかなく、IPアドレス検索データベースがそのうち117MBを占めていたのです。これは全メモリの4分の1が消えている計算です。
+
+PowerDNSがさらに100MBを消費し、Mess With DNS自体も200MBを必要としていました。合計すると、サーバーは常に限界ギリギリで稼働している状態でした。一度でも不正なリクエストが来れば、すぐにOOMキルが発生していました。
+
+私がどのように診断し、修正したかを正確に説明します。
+
+<AudioPlayer src="/static/audio/using-less-memory-to-look-up-ip-addresse.mp3" title="Executive Audio Briefing" />
+
+<Callout type="danger" title="メモリ危機">
+  合計465MBのRAMのうち、IPアドレス検索データベースが**117MB**を消費していました。PowerDNS（100MB）とMess With DNS（200MB）を合わせると、サーバーは常に限界まで追い込まれており、残りのヘッドルームはわずか約48MBでした。
+</Callout>
+
+## 最初の一歩：実際に測定する
+
+何も手を付ける前に、何がメモリを消費しているのか、なぜ消費しているのかを理解する必要がありました。Goの`pprof`パッケージを使えば、これは簡単です。
+
+```go
+import (
+    "runtime"
+    "runtime/pprof"
+    "os"
+)
+
+func dumpHeapProfile(path string) error {
+    runtime.GC() // force GC so the profile reflects live allocations
+    f, err := os.Create(path)
+    if err != nil {
+        return err
+    }
+    defer f.Close()
+    return pprof.WriteHeapProfile(f)
+}
+```
+
+次に、それを分析します。
+
+```bash
+# capture a heap profile from a running process
+go tool pprof -alloc_space http://localhost:6060/debug/pprof/heap
+
+# or from a saved file
+go tool pprof -inuse_space heap.prof
+```
+
+プロファイルはすぐに2つのアロケーションを指摘しました。IPレンジごとに冗長に保存されているASNデータと、古い`net.IP`バイトスライス型です。最初にプロファイリングをしていなければ、間違った推測をしていたでしょう。
+
+## 元のデータ構造
+
+IPルックアップデータベースは、CIDRレンジをその発信元ASN（それらのアドレスを所有するISPまたはネットワークオペレーター）にマッピングします。元の構造は次のようでした。
+
+```go
+type IPRange struct {
+    Start   net.IP // byte slice: 24 bytes header + 16 bytes data
+    End     net.IP
+    Country string
+    ASN     uint32
+    OrgName string // "Cloudflare, Inc." — duplicated for every range
+    OrgDesc string // duplicated again
+}
+
+var ranges []IPRange // 500,000+ entries
+```
+
+`net.IP`型は`type IP []byte`として定義されています。Goのスライスはポインタ、長さ、容量の3つのフィールドを持ち、これは24バイトのヘッダーに加えて、別途ヒープに割り当てられたバッキング配列です。各`IPRange`はこれらを2つ持っています。
+
+そして、すべての`IPRange`は`OrgName`と`OrgDesc`の文字列をインラインで保存しています。もし10,000のレンジがCloudflareに属している場合、「Cloudflare, Inc.」を10,000回保存することになります。
+
+## まずは当たり前のことを試す
+
+最初に考えたのはSQLiteでした。データベースをディスクに移動し、本当に速度が必要なものにはRAMを確保する。簡単ですよね？
+
+違いました。
+
+SQLiteは大きな整数を適切にサポートしていません。IPv6アドレスはテキスト文字列として保存する必要がありました。これは間違っていると感じましたが、うまくいくかどうか試すためにそのまま進めました。
+
+本当の問題はパフォーマンスでした。ディスクルックアップは、私がすでに持っていた配列ベースの二分探索よりも**500倍遅かった**のです。ここで言っているのはマイクロ秒の話ではありません。「目に見えてハングする」レベルです。ハングするDNSプレイグラウンドはプレイグラウンドではありません。それはイライラ製造機です。
+
+というわけで、これは行き止まりでした。
+
+## トライでさらに悪化させる
+
+次にトライを試しました。理論的には、トライはプレフィックスマッチングに優れており、これはIPルックアップにまさに必要なものです。これはうまくいくと確信していました。
+
+しかし、うまくいきませんでした。
+
+トライはメモリを**800MB**にまで膨らませました。これはサーバーが持つRAMよりも多い量です。そして、なぜか元の二分探索よりも遅かったのです。問題を改善するどころか、悪化させてしまいました。
+
+<Callout type="idea" title="早期に学んだこと">
+  時には、エレガントなデータ構造が正しいとは限りません。シンプルな配列と二分探索は、速度とメモリの両方で、より洗練されたアプローチをすでに上回っていました。うまく機能しているものを置き換えるのではなく、無駄を修正しましょう。
+</Callout>
+
+この時点で私は立ち止まりました。すでにうまく機能しているものがありました。配列ベースの二分探索です。それは高速で正確でした。唯一の問題はメモリでした。だから、全体を置き換えるのではなく、既存のものを修正してみてはどうだろうか？
+
+## 実際にうまくいったこと
+
+元の方法に戻り、無駄を探しました。pprofの出力からすぐに2つの大きな点が目立ちました。
+
+### 修正1：ASN情報の重複排除
+
+ASNデータを独自の配列に引き出し、文字列データをインラインで保存する代わりに数値インデックスを保存します。
+
+```go
+type ASNRecord struct {
+    OrgName string
+    OrgDesc string
+    Country string
+    ASN     uint32
+}
+
+type IPRange struct {
+    Start   netip.Addr // value type — no heap allocation
+    End     netip.Addr
+    ASNIdx  uint32 // index into a shared ASNRecord slice
+}
+
+var asnRecords []ASNRecord // one entry per unique ASN
+var ranges []IPRange       // many entries, tiny per-entry cost
+```
+
+データベースロード中に重複排除されたテーブルを構築します。
+
+```go
+func buildIndex(rows []rawRow) ([]IPRange, []ASNRecord) {
+    asnMap := make(map[uint32]uint32) // ASN number -> index
+    var asnRecords []ASNRecord
+    var ranges []IPRange
+
+    for _, row := range rows {
+        idx, ok := asnMap[row.ASN]
+        if !ok {
+            idx = uint32(len(asnRecords))
+            asnRecords = append(asnRecords, ASNRecord{
+                OrgName: row.OrgName,
+                OrgDesc: row.OrgDesc,
+                Country: row.Country,
+                ASN:     row.ASN,
+            })
+            asnMap[row.ASN] = idx
+        }
+        ranges = append(ranges, IPRange{
+            Start:  row.Start,
+            End:    row.End,
+            ASNIdx: idx,
+        })
+    }
+    return ranges, asnRecords
+}
+```
+
+これにより**50MB**節約できました。ASNデータは1か所に集約され、レンジは4バイトのインデックスを持つだけになりました。
+
+### 修正2：`netip.Addr`への切り替え
+
+元のコードではGoの古い`net.IP`型を使用していました。これは`[]byte`です。スライスヘッダー（64ビットシステムで24バイト）とヒープに割り当てられたバッキング配列（IPv6で16バイト）で構成されます。すべての`IPRange`内のすべてのIPアドレスがヒープに触れていました。
+
+Go 1.18で`net/netip`に`netip.Addr`が導入されました。これは**値型**です。128ビットの値と16ビットのゾーンインデックスで構成され、スタックまたは構造体内にインラインで保存されます。ヒープアロケーションは発生しません。
+
+```go
+// Before: heap allocation per address
+start := net.ParseIP("2a06:98c0::")  // []byte on heap
+
+// After: pure stack value
+start, _ := netip.ParseAddr("2a06:98c0::")  // no heap
+```
+
+二分探索は依然として同じように機能します。`netip.Addr`は比較演算子をサポートしています。
+
+```go
+func lookup(ranges []IPRange, ip netip.Addr) *ASNRecord {
+    lo, hi := 0, len(ranges)-1
+    for lo <= hi {
+        mid := (lo + hi) / 2
+        r := ranges[mid]
+        if ip.Compare(r.Start) >= 0 && ip.Compare(r.End) <= 0 {
+            return &asnRecords[r.ASNIdx]
+        }
+        if ip.Compare(r.Start) < 0 {
+            hi = mid - 1
+        } else {
+            lo = mid + 1
+        }
+    }
+    return nil
+}
+```
+
+型の切り替えにより、さらに**20MB**節約できました。ルックアップアルゴリズムを変更することなく、二分探索は依然としてO(log n)であり、同じ速度で実行されます。
+
+## メモリレイアウト：変更前と変更後
+
+`IPRange`エントリあたりのメモリフットプリントの変化は次のとおりです。
+
+```
+BEFORE (per IPRange, with net.IP):
+┌──────────────────────────────────────────┐
+│ Start  net.IP  [ptr|len|cap] = 24 bytes  │
+│         heap → [16 bytes]                │
+│ End    net.IP  [ptr|len|cap] = 24 bytes  │
+│         heap → [16 bytes]                │
+│ Country string  16 bytes                 │
+│ ASN     uint32   4 bytes                 │
+│ OrgName string  16 bytes + heap string   │
+│ OrgDesc string  16 bytes + heap string   │
+└──────────────────────────────────────────┘
+~120+ bytes per entry (plus heap strings)
+
+AFTER (per IPRange, with netip.Addr):
+┌──────────────────────────────────────────┐
+│ Start  netip.Addr  17 bytes (no heap)    │
+│ End    netip.Addr  17 bytes (no heap)    │
+│ ASNIdx uint32       4 bytes              │
+└──────────────────────────────────────────┘
+~38 bytes per entry (all inline, no heap)
+```
+
+50万のレンジがある場合、この違いは劇的に増幅されます。
+
+## 結果
+
+IPルックアップデータベースは**117MBから46MB**に削減され、61%の削減となりました。二分探索の速度はまったく同じままでした。サーバーはクラッシュしなくなりました。
+
+| メトリック | 変更前 | 変更後 | 変化 |
+|---|---|---|---|
+| IPルックアップメモリ | 117MB | 46MB | −61% |
+| 空きヘッドルーム | 約48MB | 約119MB | +71MB |
+| ルックアップアルゴリズム | 二分探索 | 二分探索 | 変更なし |
+| クエリレイテンシ | 高速 | 高速 | 変更なし |
+
+<Callout type="info" title="本番環境でのプロファイリング">
+  Goの本番サービスでライブアロケーションを追跡している場合は、`net/http/pprof`ハンドラを使用してください。
+
+  ```go
+  import _ "net/http/pprof"
+  go http.ListenAndServe(":6060", nil)
+  ```
+
+  すると、`go tool pprof -inuse_space http://localhost:6060/debug/pprof/heap`は現在ライブで存在するものを表示します。`-alloc_space`を使用して、時間の経過に伴う累積アロケーションを確認します。
+</Callout>
+
+## 別のやり方をするとしたら
+
+もしやり直せるなら、トライは完全にスキップするでしょう。私が扱っていたデータサイズには間違ったツールでした。インターネット規模なら機能するかもしれませんが、これはGoogleのBGPテーブルではありません。既知の、境界のあるデータセットを持つ趣味のプロジェクトです。
+
+また、推測するのではなく、**まずプロファイリングを行う**でしょう。簡単なpprofヒーププロファイルがあれば、SQLiteやトライを試すのに費やした数日ではなく、数分でASNの重複問題が明らかになったはずです。測定は常に仮定に勝ります。
+
+本当の教訓は？常に賢い解決策が必要なわけではありません。時には、すでに持っているものを見て、「どこに無駄があるのか？」と問う必要があるのです。
+
+### ここで適用された一般的なGoのメモリ原則
+
+- **可能な限り値型を使用する。** `netip.Addr`、`[16]byte`、固定サイズのフィールドを持つ構造体など、ヒープポインタを避けるものはすべてGCの負荷を軽減し、メモリを節約します。
+- **繰り返されるデータを正規化する。** 複数のレコードが同じ文字列やサブレコードを共有している場合、それを一度だけ保存し、インデックスで参照します。これはデータベース正規化の背後にあるのと同じ原則です。
+- **最適化する前にプロファイリングを行う。** 10分間のpprofセッションは、何時間もの投機的なリファクタリングに勝ります。構造体では小さく見えるアロケーションも、大規模になるとギガバイト単位になることがあります。
+- **置き換えをベンチマークする。** `netip.Addr`への移行をデプロイする前に、ルックアップのホットパスで`go test -bench=. -benchmem`を実行して、回帰を導入していないことを確認します。
+
+```bash
+# Quick benchmark template
+func BenchmarkLookup(b *testing.B) {
+    ip, _ := netip.ParseAddr("1.1.1.1")
+    b.ResetTimer()
+    for i := 0; i < b.N; i++ {
+        lookup(ranges, ip)
+    }
+}
+```
+
+それ以来、サーバーは安定しています。71MBの追加ヘッドルームはそれほど多くないように聞こえるかもしれませんが、合計465MBの場合、それは信頼できるサービスと、通常の負荷でダウンするサービスとの違いを意味します。
+
+<Callout type="info" title="関連投稿">
+  <ul>
+    <li><a href="/en/blog/unwritten-rules-of-terminal-programs">ターミナルプログラムの暗黙のルール</a> — ターミナルの慣習とパターン</li>
+    <li><a href="/en/blog/why-pipes-sometimes-get-stuck-buffering">パイプが詰まる理由：バッファリングの解説</a> — パイプラインにおけるバッファリングの問題</li>
+  </ul>
+</Callout>
+
+## こちらもおすすめ
+
+- [MySQLチートシート：実際に使うクエリ](/en/blog/getting-started-with-mysql-queries)
+- [Web開発のためのRustマスター](/en/blog/mastering-rust-web-dev)
+- [ハイパーグロースのための最新データベースシャーディング戦略](/en/blog/db-sharding)
+- [PrismaとTypeScriptによるデータベースシーディング戦略](/en/blog/prisma-seed-typescript-strategies)

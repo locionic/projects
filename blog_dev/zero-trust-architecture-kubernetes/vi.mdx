@@ -1,0 +1,250 @@
+---
+title: "Triển khai bảo mật Zero-Trust trong Kubernetes: Hướng dẫn sản xuất hoàn chỉnh"
+date: "2026-08-04"
+lastUpdated: "2026-09-18"
+summary: "Hướng dẫn thực tế để loại bỏ bảo mật chu vi mạng phẳng trong Kubernetes: NetworkPolicies mặc định từ chối, định danh workload SPIFFE/SPIRE và mTLS nghiêm ngặt."
+tags: ["kubernetes", "security", "zero-trust", "devops", "cloud-native"]
+images: ["/static/images/zero-trust-arch.png"]
+category: Tech
+draft: false
+---
+
+Trong lĩnh vực IT doanh nghiệp truyền thống, bảo mật hoàn toàn dựa vào mô hình "lâu đài và hào nước": xây dựng một tường lửa vững chắc xung quanh mạng của bạn và giả định rằng mọi thứ hoạt động bên trong mạng con IP riêng đều đáng tin cậy và vô hại.
+
+Trong các môi trường cloud-native hiện đại—đặc biệt là trong Kubernetes—mô hình chu vi này có những lỗ hổng nguy hiểm. Theo mặc định, **Kubernetes vận hành một mạng phẳng, không phân đoạn**. Một gói phần mềm bên thứ ba bị xâm nhập trong một pod phân tích có mức độ ưu tiên thấp có thể thăm dò và truy vấn API siêu dữ liệu của cụm, kết nối với bộ nhớ đệm Redis nội bộ hoặc gửi các yêu cầu HTTP trái phép trực tiếp đến các microservice thanh toán sản xuất.
+
+Một **Kiến trúc Zero-Trust** thực sự hoạt động theo một nguyên tắc quản lý duy nhất: **không bao giờ tin tưởng, luôn xác minh, liên tục xác thực**. Mọi yêu cầu—cho dù bắt nguồn từ internet công cộng hay từ một pod lân cận trong cùng một namespace—đều phải được xác thực bằng mật mã, ủy quyền và mã hóa.
+
+Trong hướng dẫn này, chúng ta sẽ đi sâu vào việc triển khai từng bước Zero-Trust trong Kubernetes thông qua phân đoạn mạng Lớp 4, nhận dạng mật mã Lớp 7 và xác thực bộ điều khiển nhập.
+
+---
+
+<AudioPlayer src="/static/audio/zero-trust-architecture-kubernetes.mp3" title="Tóm tắt âm thanh điều hành" />
+
+## Thực tế mạng phẳng: Các lỗ hổng mặc định của Kubernetes
+
+Khi bạn triển khai một cụm Kubernetes tiêu chuẩn (thông qua EKS, GKE hoặc kubeadm thuần túy), plugin CNI mặc định sẽ gán cho mỗi pod một địa chỉ IP riêng và cho phép giao tiếp pod-to-pod không hạn chế trên tất cả các namespace.
+
+```
+[Default Kubernetes: Unrestricted Lateral Movement]
+  Attacker ──► Compromised Frontend Pod 
+                     │
+                     ├────────► Database Pod (Direct TCP access!)
+                     ├────────► Internal Redis Pod (No password required!)
+                     └────────► Cloud Metadata API (169.254.169.254 - IAM Stealing!)
+```
+
+Để loại bỏ lỗ hổng này, chúng ta phải thiết lập các biện pháp kiểm soát bảo mật trên ba mặt phẳng thực thi riêng biệt:
+
+1.  **Mặt phẳng mạng Lớp 4**: Thực thi các chính sách tường lửa từ chối mặc định bằng cách sử dụng Kubernetes NetworkPolicies hoặc eBPF.
+2.  **Mặt phẳng ứng dụng Lớp 7**: Thực thi TLS lẫn nhau (mTLS) và ủy quyền dựa trên danh tính bằng cách sử dụng SPIFFE ID.
+3.  **Mặt phẳng nhập & thời gian chạy**: Thực thi các hình ảnh đã ký và thực thi không phải root thông qua Kyverno.
+
+---
+
+## 1. Phân đoạn Lớp 4: Nền tảng từ chối mặc định
+
+Quy tắc đầu tiên của Zero-Trust là giả định vi phạm. Nếu một pod bị xâm phạm, nó phải bị khóa vào một silo mạng bị cô lập.
+
+### Bước 1: Từ chối mặc định tất cả lưu lượng Ingress và Egress
+
+Áp dụng chính sách này cho các namespace sản xuất của bạn. Nó loại bỏ tất cả các kết nối đến và đi trên tất cả các pod:
+
+```yaml
+# default-deny-all.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: production
+spec:
+  podSelector: {} # Selects all pods in the namespace
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+### Bước 2: Cho phép rõ ràng Egress DNS
+
+Với việc từ chối mặc định đang hoạt động, các pod thậm chí không thể phân giải tên DNS. Bạn phải cho phép rõ ràng lưu lượng CoreDNS trên cổng 53:
+
+```yaml
+# allow-dns-egress.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+```
+
+### Bước 3: Mở đường dẫn Ingress cụ thể
+
+Bây giờ, hãy xác định rõ ràng những dịch vụ nào có thể giao tiếp. Ví dụ, chỉ cho phép các pod được gắn nhãn `app: frontend` kết nối với `app: order-service` trên cổng 8080:
+
+```yaml
+# allow-frontend-to-order.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-order
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: order-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+```
+
+---
+
+## 2. Nhận dạng khối lượng công việc Lớp 7 & TLS lẫn nhau (mTLS)
+
+NetworkPolicies Lớp 4 hạn chế giao tiếp IP và cổng, nhưng chúng không thể xác minh *ai* đang gửi tải trọng hoặc mã hóa lưu lượng dây. Một kẻ tấn công vượt qua việc giả mạo IP vẫn có thể nghe trộm lưu lượng văn bản thuần không được mã hóa.
+
+Chúng tôi giải quyết vấn đề này bằng cách sử dụng một service mesh (chẳng hạn như Istio, Linkerd hoặc Cilium Service Mesh) để cấp chứng chỉ X.509 **SPIFFE (Secure Production Identity Framework for Everyone)** mật mã cho mỗi pod.
+
+### Thực thi TLS lẫn nhau (mTLS) nghiêm ngặt
+
+Cấu hình Istio để từ chối tất cả lưu lượng văn bản thuần trong cụm:
+
+```yaml
+# strict-peer-authentication.yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: production
+spec:
+  mtls:
+    mode: STRICT # Completely rejects unencrypted TCP connections
+```
+
+Với `mode: STRICT`, proxy sidecar tự động xử lý việc xoay vòng chứng chỉ, bắt tay TLS và mã hóa dây mà không yêu cầu bất kỳ thay đổi mã ứng dụng nào.
+
+### Ủy quyền yêu cầu thông qua nhận dạng mật mã
+
+Thay vì tin tưởng địa chỉ IP, hãy thực thi kiểm soát truy cập bằng cách sử dụng danh tính ServiceAccount mật mã của dịch vụ gọi:
+
+```yaml
+# authz-order-service.yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: secure-order-api
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: order-service
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              # Only the pod running with this specific ServiceAccount is authorized
+              - "cluster.local/ns/production/sa/frontend-service-account"
+      to:
+        - operation:
+            methods: ["POST"]
+            paths: ["/api/v1/orders"]
+```
+
+Ngay cả khi kẻ tấn công giành quyền kiểm soát một pod lân cận trên cùng một nút worker vật lý, mọi nỗ lực gửi yêu cầu `POST /api/v1/orders` sẽ bị chặn ngay lập tức ở cấp độ proxy vì chứng chỉ của chúng thiếu nguyên tắc SPIFFE được ủy quyền.
+
+---
+
+## 3. Phòng thủ thời gian chạy: Ngăn chặn leo thang đặc quyền với Kyverno
+
+Zero-Trust yêu cầu xác minh tính toàn vẹn của khối lượng công việc trước khi các pod được lên lịch vào các nút. Bạn phải từ chối các container chạy dưới dạng `root` hoặc gắn các đường dẫn tệp máy chủ.
+
+Triển khai **Chính sách Kyverno** này để thực thi các ngữ cảnh bảo mật container bất biến:
+
+```yaml
+# require-non-root.yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: enforce-zero-trust-pod-security
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: check-security-context
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      validate:
+        message: "Containers must run as non-root with read-only root filesystems."
+        pattern:
+          spec:
+            securityContext:
+              runAsNonRoot: true
+            containers:
+              - securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop:
+                      - ALL
+```
+
+---
+
+## Ma trận xác minh Zero-Trust
+
+| Vector thực thi | Thiết lập Kubernetes cũ | Cụm được tăng cường Zero-Trust |
+| :--- | :--- | :--- |
+| **Lưu lượng dây Pod-to-Pod** | HTTP văn bản thuần (Có thể đánh hơi) | 100% mTLS được mã hóa (X.509) |
+| **Ranh giới mạng** | Mạng phẳng mở trên các namespace | Từ chối mặc định Ingress và Egress |
+| **Xác thực khối lượng công việc** | Địa chỉ IP không được xác thực | Nhận dạng SPIFFE mật mã |
+| **Leo thang đặc quyền** | Các container root được phép | `runAsNonRoot`, Hệ thống tệp root chỉ đọc |
+| **Truy cập API siêu dữ liệu** | Truy cập `169.254.169.254` mở | Bị chặn qua Egress NetworkPolicy |
+
+---
+
+## Các câu hỏi thường gặp
+
+### Việc triển khai mTLS có làm tăng đáng kể độ trễ cho các microservice nội bộ không?
+Các service mesh hiện đại và các triển khai mTLS dựa trên eBPF (như Cilium hoặc Istio với Ambient Mesh) chỉ thêm chưa đến 0,5 mili giây chi phí trên mỗi hop. Tăng tốc phần cứng CPU hiện đại (AES-NI) xử lý mã hóa TLS với mức sử dụng CPU không đáng kể.
+
+### Điều gì xảy ra nếu một pod cần gọi các API SaaS bên ngoài như Stripe hoặc AWS?
+Bạn tạo một Egress NetworkPolicy rõ ràng cho phép lưu lượng truy cập chỉ đến các khối CIDR bên ngoài hoặc các tên DNS cụ thể thông qua Egress Gateway. Tất cả các kết nối internet đi khác đều bị chặn theo mặc định.
+
+### Tôi có thể triển khai Zero-Trust mà không cần chạy một sidecar Istio trong mỗi pod không?
+Có. Các CNI dựa trên eBPF hiện đại như Cilium cung cấp các chính sách mạng mTLS và Lớp 7 minh bạch nguyên bản trong nhân Linux mà không yêu cầu các container sidecar, giảm đáng kể chi phí bộ nhớ và độ phức tạp hoạt động.
+
+---
+
+## Bạn cũng có thể thích
+
+- [Triển khai Kiến trúc Zero Trust vào năm 2026](/en/blog/zero-trust-arch)
+- [Kiến trúc mạng Zero Trust](/en/blog/zero-trust-network)
+- [Sự phát triển của bảo mật Cloud Native vào năm 2026](/en/blog/cloud-native-security)
+- [Bảo mật mã được tạo bởi AI: Các chiến lược DevSecOps Shift-Left cho năm 2026](/en/blog/securing-ai-generated-code-shift-left)

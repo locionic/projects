@@ -1,0 +1,356 @@
+---
+draft: false
+title: "Next.jsダッシュボード向けカスタムPlaywright Reporterの構築方法"
+category: Tech
+date: "2026-07-28"
+lastUpdated: '2026-09-22'
+tags: ["playwright", "testing", "automation", "nextjs"]
+summary: "カスタムJSON Playwright reporterの記述、リアルタイムなend-to-endテスト実行結果のNext.jsダッシュボードへのストリーミング、flakiness分析、CI shardingサポート、PostgreSQL永続化に関するステップバイステップのチュートリアル。"
+images: ['https://imgbed.locionic.com/file/1785258991842_custom_reporter_playwright_1785258937235.jpg']
+---
+
+Playwright 用のカスタムレポーターを構築することは、ライブテスト自動化の結果を独自の Next.js ダッシュボードにストリーミングする最も効果的な方法です。静的な HTML レポートに依存したり、サードパーティのサービスに料金を支払ったりする代わりに、正確なテストメトリクスをキャプチャしてバックエンドに直接投稿する専用のレポーターを作成できます。これにより、チームはベンダーロックインなしでプライベートなセルフホスト型分析プラットフォームを利用できます。
+
+このガイドでは、Playwright でカスタム JSON レポーターを実装し、Next.js で受信 API ルートを構築し、不安定性追跡を追加し、複数のランナーにわたる CI シャーディングをサポートし、Prisma 経由で PostgreSQL に結果を永続化する方法を正確に学びます。
+
+<AudioPlayer src="/static/audio/custom-reporter-playwright-dashboard.mp3" title="Executive Audio Briefing" />
+
+## 標準 HTML レポートが不十分な理由
+
+標準の Playwright HTML レポートは、単一の目的を果たします。それは、単一のテスト実行の合否を示すことです。履歴追跡、複数実行にわたる不安定性検出、チーム全体のダッシュボード、アラートシステムとの統合は提供されません。
+
+チームが複数の CI パイプラインで毎日何千ものテストを実行している場合、次のものが必要です。
+
+- **履歴トレンドデータ** — リファクタリング後、テストの安定性は向上していますか？
+- **不安定性リーダーボード** — 再試行でのみ合格するテストはどれですか？
+- **ブランチごとの可視性** — この PR は新しい失敗を導入しましたか？
+- **リアルタイムストリーミング** — 開発者は実行中、実行後ではなく、結果を見ることができますか？
+
+カスタム Playwright レポーターは、Playwright の組み込み `Reporter` インターフェースを実装し、構造化データを独自の API に投稿することで、これらすべてを解決します。
+
+## Playwright レポーターインターフェースの実装
+
+Playwright は、テスト実行中の正確なタイミングで起動するライフサイクルフックを備えた `Reporter` インターフェースを公開しています。主なフックは次のとおりです。
+
+- `onBegin(config, suite)` — テスト実行開始時に一度呼び出されます
+- `onTestBegin(test, result)` — 個々のテストの前に呼び出されます
+- `onTestEnd(test, result)` — 各テストが完了した後（合格、失敗、スキップ）に呼び出されます
+- `onEnd(result)` — 実行全体が終了したときに一度呼び出されます
+
+Playwright プロジェクトのルートに `dashboard-reporter.ts` を作成します。
+
+```typescript
+import type {
+  Reporter,
+  TestCase,
+  TestResult,
+  FullResult,
+  Suite,
+  FullConfig,
+} from '@playwright/test/reporter';
+
+interface TestPayload {
+  testId: string;
+  title: string;
+  fullTitle: string;
+  filePath: string;
+  status: 'passed' | 'failed' | 'flaky' | 'skipped' | 'timedOut';
+  retryCount: number;
+  durationMs: number;
+  workerIndex: number;
+  errorMessage: string | null;
+  errorStack: string | null;
+  attachmentUrls: string[];
+}
+
+interface RunPayload {
+  runId: string;
+  branch: string;
+  commitSha: string;
+  status: FullResult['status'];
+  startedAt: string;
+  finishedAt: string;
+  totalTests: number;
+  passedTests: number;
+  failedTests: number;
+  flakyTests: number;
+  skippedTests: number;
+  tests: TestPayload[];
+}
+
+class NextjsDashboardReporter implements Reporter {
+  private results: TestPayload[] = [];
+  private startedAt: string = '';
+  private runId: string;
+  private dashboardUrl: string;
+
+  constructor(options: { dashboardUrl?: string } = {}) {
+    this.runId = process.env.CI_RUN_ID ?? crypto.randomUUID();
+    this.dashboardUrl =
+      options.dashboardUrl ??
+      process.env.DASHBOARD_URL ??
+      'http://localhost:3000';
+  }
+
+  onBegin(_config: FullConfig, _suite: Suite) {
+    this.startedAt = new Date().toISOString();
+    console.log(`[Reporter] Run ${this.runId} started at ${this.startedAt}`);
+  }
+
+  onTestEnd(test: TestCase, result: TestResult) {
+    // A test that passed but only after retries is flaky
+    const isFlaky = result.status === 'passed' && result.retry > 0;
+
+    this.results.push({
+      testId: test.id,
+      title: test.title,
+      fullTitle: test.titlePath().join(' > '),
+      filePath: test.location.file,
+      status: isFlaky ? 'flaky' : result.status,
+      retryCount: result.retry,
+      durationMs: result.duration,
+      workerIndex: result.workerIndex ?? -1,
+      errorMessage: result.errors[0]?.message?.slice(0, 2000) ?? null,
+      errorStack: result.errors[0]?.stack?.slice(0, 4000) ?? null,
+      // Attachments are uploaded to S3/R2 separately; we store only URLs
+      attachmentUrls: result.attachments
+        .filter((a) => a.path)
+        .map((a) => `${this.dashboardUrl}/artifacts/${this.runId}/${a.name}`),
+    });
+  }
+
+  async onEnd(result: FullResult) {
+    const payload: RunPayload = {
+      runId: this.runId,
+      branch: process.env.GITHUB_REF_NAME ?? 'local',
+      commitSha: process.env.GITHUB_SHA ?? 'unknown',
+      status: result.status,
+      startedAt: this.startedAt,
+      finishedAt: new Date().toISOString(),
+      totalTests: this.results.length,
+      passedTests: this.results.filter((t) => t.status === 'passed').length,
+      failedTests: this.results.filter((t) => t.status === 'failed').length,
+      flakyTests: this.results.filter((t) => t.status === 'flaky').length,
+      skippedTests: this.results.filter((t) => t.status === 'skipped').length,
+      tests: this.results,
+    };
+
+    try {
+      const response = await fetch(`${this.dashboardUrl}/api/reports`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-reporter-secret': process.env.REPORTER_SECRET ?? '',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        console.error(`[Reporter] Upload failed: ${response.status} ${await response.text()}`);
+      } else {
+        console.log(`[Reporter] Run ${this.runId} uploaded successfully.`);
+      }
+    } catch (err) {
+      // Never let reporter errors crash the CI process
+      console.error('[Reporter] Network error during upload:', err);
+    }
+  }
+}
+
+export default NextjsDashboardReporter;
+```
+
+`playwright.config.ts` にレポーターを登録します。
+
+```typescript
+import { defineConfig } from '@playwright/test';
+
+export default defineConfig({
+  reporter: [
+    ['list'],                                    // Console output during run
+    ['./dashboard-reporter.ts', {               // Custom dashboard reporter
+      dashboardUrl: process.env.DASHBOARD_URL,
+    }],
+  ],
+});
+```
+
+## Next.js API レシーバーの構築
+
+API ルートは、受信ペイロードを検証し、PostgreSQL に書き込み、すぐに返します。`app/api/reports/route.ts` の App Router を使用します。
+
+```typescript
+import { NextResponse } from 'next/server';
+import { prisma } from '@/lib/prisma';
+
+const REPORTER_SECRET = process.env.REPORTER_SECRET;
+
+export async function POST(request: Request) {
+  // Validate the shared secret
+  if (REPORTER_SECRET) {
+    const secret = request.headers.get('x-reporter-secret');
+    if (secret !== REPORTER_SECRET) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+  }
+
+  const data = await request.json();
+
+  // Upsert the run record (idempotent for CI sharding where multiple workers post)
+  const run = await prisma.testRun.upsert({
+    where: { runId: data.runId },
+    create: {
+      runId: data.runId,
+      branch: data.branch,
+      commitSha: data.commitSha,
+      status: data.status,
+      startedAt: new Date(data.startedAt),
+      finishedAt: new Date(data.finishedAt),
+      totalTests: data.totalTests,
+      passedTests: data.passedTests,
+      failedTests: data.failedTests,
+      flakyTests: data.flakyTests,
+      skippedTests: data.skippedTests,
+    },
+    update: {
+      // Merge shard results: aggregate counts
+      totalTests: { increment: data.totalTests },
+      passedTests: { increment: data.passedTests },
+      failedTests: { increment: data.failedTests },
+      flakyTests: { increment: data.flakyTests },
+      skippedTests: { increment: data.skippedTests },
+      status: data.status === 'failed' ? 'failed' : undefined,
+      finishedAt: new Date(data.finishedAt),
+    },
+  });
+
+  // Batch-insert all individual test results
+  await prisma.testResult.createMany({
+    data: data.tests.map((t: any) => ({
+      runId: run.id,
+      testId: t.testId,
+      title: t.title,
+      fullTitle: t.fullTitle,
+      filePath: t.filePath,
+      status: t.status,
+      retryCount: t.retryCount,
+      durationMs: t.durationMs,
+      workerIndex: t.workerIndex,
+      errorMessage: t.errorMessage,
+    })),
+    skipDuplicates: true,
+  });
+
+  return NextResponse.json({ success: true, runId: run.runId });
+}
+```
+
+## テスト永続化のための Prisma スキーマ
+
+```prisma
+model TestRun {
+  id          Int          @id @default(autoincrement())
+  runId       String       @unique
+  branch      String
+  commitSha   String
+  status      String
+  startedAt   DateTime
+  finishedAt  DateTime
+  totalTests  Int          @default(0)
+  passedTests Int          @default(0)
+  failedTests Int          @default(0)
+  flakyTests  Int          @default(0)
+  skippedTests Int         @default(0)
+  results     TestResult[]
+  createdAt   DateTime     @default(now())
+
+  @@index([branch])
+  @@index([commitSha])
+}
+
+model TestResult {
+  id           Int     @id @default(autoincrement())
+  run          TestRun @relation(fields: [runId], references: [id])
+  runId        Int
+  testId       String
+  title        String
+  fullTitle    String
+  filePath     String
+  status       String
+  retryCount   Int     @default(0)
+  durationMs   Int
+  workerIndex  Int
+  errorMessage String?
+
+  @@index([testId])
+  @@index([status])
+  @@index([filePath])
+}
+```
+
+## 不安定性ダッシュボードクエリ
+
+結果が永続化されると、単一のクエリでブランチ全体のテストごとの不安定性率を計算できます。
+
+```typescript
+// Top 10 flaky tests in the last 30 days
+const flakyLeaderboard = await prisma.testResult.groupBy({
+  by: ['testId', 'fullTitle', 'filePath'],
+  where: {
+    run: { startedAt: { gte: new Date(Date.now() - 30 * 86400_000) } },
+  },
+  _count: { testId: true },
+  _sum: { retryCount: true },
+  having: { retryCount: { _sum: { gt: 0 } } },
+  orderBy: { _sum: { retryCount: 'desc' } },
+  take: 10,
+});
+```
+
+## CI シャーディングのサポート
+
+Playwright CI シャーディングは、テストスイートを複数のランナーに分割して高速化します。各シャードは独立して実行され、その結果を同じエンドポイントに投稿します。API ルートは `CI_RUN_ID` を介して設定された `runId` をキーとする `upsert` を使用するため、すべてのシャードは単一の統合された実行レコードにマージされます。
+
+```yaml
+# .github/workflows/e2e.yml
+strategy:
+  matrix:
+    shardIndex: [1, 2, 3, 4]
+    shardTotal: [4]
+env:
+  CI_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+  DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
+  REPORTER_SECRET: ${{ secrets.REPORTER_SECRET }}
+```
+
+4 つのシャードのそれぞれが `CI_RUN_ID` を投稿し、`upsert` のインクリメントロジックを介して集計カウントがデータベースに正しく蓄積されます。
+
+---
+
+## よくある質問
+
+<FAQ>
+  <Question>カスタム Playwright ダッシュボードの実行にはどのくらいの費用がかかりますか？</Question>
+  <Answer>カスタムダッシュボードの実行費用はごくわずかです。レシーバーを Vercel にデプロイし、テレメトリを Supabase またはサーバーレス Neon PostgreSQL に保存する場合、中小規模のエンジニアリングチームにとって運用コストは実質的にゼロです。</Answer>
+
+  <Question>スクリーンショットやトレース zip ファイルなどの添付ファイルを Next.js に送信できますか？</Question>
+  <Answer>はい。大きなバイナリファイルを JSON ペイロード内に送信する代わりに、テスト実行中に署名付き URL を使用して Cloudflare R2 または Amazon S3 にアーティファクトを直接アップロードし、署名付きアーティファクト URL のみをレポーターペイロードに含めます。これにより、JSON ペイロードが小さく保たれ、タイムアウトの問題が回避されます。</Answer>
+
+  <Question>カスタムレポーターは Playwright テスト実行を遅くしますか？</Question>
+  <Answer>いいえ。Playwright はテストライフサイクルフックを非同期で実行します。インメモリデータ集計はバックグラウンドで行われ、すべてのテストが完了した後、onEnd フックでネットワークペイロードがディスパッチされます。唯一のオーバーヘッドは最終的な HTTP POST であり、通常は 500ms 未満です。</Answer>
+
+  <Question>このカスタムレポーターは Playwright CI シャーディングと互換性がありますか？</Question>
+  <Answer>はい。すべてのランナーシャードに共有の CI_RUN_ID 環境変数を渡します。各ワーカーシャードは、同じ実行 ID でバッチを Next.js API に投稿し、データベースの upsert ロジックはそれらを正しい集計カウントを持つ統合されたテスト実行ビューに集約します。</Answer>
+
+  <Question>Slack または PagerDuty で新しいテストの失敗をアラートするにはどうすればよいですか？</Question>
+  <Answer>API ルートの onEnd ハンドラーで、結果を永続化した後、`data.failedTests > 0` と `data.branch === 'main'` を確認します。もしそうであれば、Slack ウェブフックまたは PagerDuty Events API v2 に追加のフェッチ呼び出しを行います。これにより、別の CI ステップなしでリアルタイムアラートが提供されます。</Answer>
+</FAQ>
+
+---
+
+## こちらもおすすめです
+
+- [Deep Playwright vs Cypress Performance Benchmark in 2026](/en/blog/playwright-vs-cypress-performance-benchmark)
+- [Playwright Visual Regression Testing: The Complete Enterprise Guide](/en/blog/playwright-visual-regression-testing-guide)
+- [Next.js Middleware: Building Robust Authentication and Authorization](/en/blog/nextjs-middleware-authentication)
+- [Vitest in Large Monorepos: Performance Optimization Guide](/en/blog/vitest-monorepo-unit-testing-performance)

@@ -1,0 +1,297 @@
+---
+summary: "Next.js14以降のAppRouterにおけるServerComponentとClientComponentの境界を診断・デバッグするための実践ガイド。具体的なエラーメッセージ、RSCペイロード検査、server-onlyガード、React19のServerActionsエラー処理を解説します。"
+title: "Next.js14:サーバー・クライアント境界のデバッグ"
+date: "2026-08-12"
+lastUpdated: "2026-09-22"
+tags: ["nextjs", "react", "debugging"]
+draft: false
+images: ["/static/images/nextjs-14-debug.jpg"]
+---
+
+Next.js App Router (Next.js 13.4+) は、React Server Components と Client Components を単一のツリーに統合します。ほとんどの場合、これは目に見えない形で機能しますが、問題が発生すると、エラーは不可解で、スタックトレースは触ったことのない内部を指します。このガイドでは、あらゆる種類の境界障害を迅速に診断するための具体的なテクニックを提供します。
+
+<AudioPlayer src="/static/audio/nextjs-debugging-server-client-boundary.mp3" title="Executive Audio Briefing" />
+
+## 両サイド分割の理解
+
+Server Components は**サーバー上でのみ**実行されます。データベース呼び出しの`await`、環境変数の読み取り、Node.js 専用モジュールのインポートが可能です。その出力は RSC ペイロードとしてシリアル化されます。これは、**HTML ではない**、JSON ではない、JavaScript バンドルではない、コンパクトなストリーミング形式です。Client Components (`'use client'` とマークされているもの) はブラウザ JS にコンパイルされ、ハイドレーションと再レンダリング中に実行されます。
+
+境界とは、Server Component が Client Component を*レンダリングする*エッジのことです。そのエッジを越えるものはすべてシリアル化可能でなければなりません。
+
+## エラークラス 1 — 非シリアル化可能なプロパティ
+
+**表示される内容:**
+
+```
+Error: Functions cannot be passed directly to Client Components unless you explicitly expose it by marking it with "use server".
+  at stringify (...next/dist/server/app-render/app-render.js:...)
+```
+
+またはクラスインスタンスの場合:
+
+```
+Error: Only plain objects, and a few built-ins, can be passed to Client Components from Server Components.
+Classes or null prototypes are not supported.
+```
+
+**原因:** Server Component から Client Component へ、`Date`、`Map`、`Set`、クラスインスタンス、または関数をプロパティとして渡すこと。
+
+```tsx
+// ❌ Date object is not serializable
+async function Page() {
+  const post = await db.post.findFirst()
+  return <PostCard publishedAt={post.createdAt} /> // Date → crash
+}
+
+// ✅ Serialize to ISO string before passing
+async function Page() {
+  const post = await db.post.findFirst()
+  return <PostCard publishedAt={post.createdAt.toISOString()} />
+}
+```
+
+**デバッグのヒント:** Server Component で渡す前に `JSON.stringify(yourProp)` をログに出力します。それがスローされるか `{}` を生成する場合、そのプロパティはシリアル化できません。
+
+## エラークラス 2 — ハイドレーションの不一致
+
+**ブラウザコンソールに表示される内容:**
+
+```
+Error: Hydration failed because the initial UI does not match what was rendered on the server.
+
+Warning: Expected server HTML to contain a matching <div> in <div>.
+
+See more info here: https://nextjs.org/docs/messages/react-hydration-error
+```
+
+**根本原因:** サーバーから送信された HTML が、クライアントがハイドレーション中にレンダリングする React ツリーと一致しない。一般的なトリガー:
+
+- Client Component の初期レンダリングで `window`、`localStorage`、`navigator`、または `Date.now()` を使用している場合
+- サーバーとクライアントで異なるタイムゾーンが異なる日付文字列を生成している場合
+- ブラウザ拡張機能がハイドレーション前に DOM ノードを挿入している場合
+
+**修正パターン — ブラウザ専用コードの遅延:**
+
+```tsx
+'use client'
+import { useEffect, useState } from 'react'
+
+// ❌ Crashes: window is undefined on the server
+export function ViewCount() {
+  const stored = localStorage.getItem('views') ?? '0'
+  return <span>{stored} views</span>
+}
+
+// ✅ Mount-safe: reads localStorage only after hydration
+export function ViewCount() {
+  const [views, setViews] = useState<string | null>(null)
+
+  useEffect(() => {
+    setViews(localStorage.getItem('views') ?? '0')
+  }, [])
+
+  if (views === null) return <span>— views</span>
+  return <span>{views} views</span>
+}
+```
+
+**日付の不一致の修正:** 常に日付をサーバーから ISO 文字列として渡し、クライアント側で `new Date(isoString)` を使用して解析します。Client Component の初期レンダリング内で `new Date()` を呼び出さないでください。
+
+## エラークラス 3 — RSC ペイロードの検査
+
+Next.js がハイドレーションする前に、サーバーから RSC ペイロードをストリーミングします。生のまま検査して、サーバーが何を送信したかを理解できます。
+
+DevTools → **Network** タブを開き → **Fetch/XHR** でフィルタリング → ページをリロードします。`Accept: text/x-component` を含むページ URL へのリクエストを探します。レスポンスは次のようになります。
+
+```
+0:["$","div",null,{"className":"prose"},["$","h1",null,{},"Hello"]]
+1:{"id":"cjld2cyuq0000t3rmniod1fga","title":"Hello World","createdAt":"2026-01-01T00:00:00.000Z"}
+```
+
+これは、サーバーが何をシリアル化し、どのようなツリー形状を生成したかを正確に示します。ここにフィールドがない場合、それはフェッチされなかったか、非シリアル化可能として削除されたかのどちらかです。
+
+**プロのヒント:** Next.js 開発モードでは、URL に `?_rsc=1` を追加して、純粋な RSC の更新を強制し、ペイロードを単独で検査します。
+
+## エラークラス 4 — サーバーモジュールのクライアントへの漏洩
+
+**表示される内容:**
+
+```
+Module build failed: You're importing a component that needs "server-only"
+but none of its parents are marked with "use server", nor are they a Server Component.
+```
+
+またはさらに悪いことに、エラーは発生せず、Node.js API 呼び出しがブラウザバンドルでサイレントに `undefined` を返すだけです。
+
+**`server-only` パッケージ**は標準的なガードです。
+
+```bash
+npm install server-only
+```
+
+```ts
+// lib/db.ts
+import 'server-only'     // ← throws at build time if imported in a Client Component
+import { PrismaClient } from '@prisma/client'
+
+const db = new PrismaClient()
+export { db }
+```
+
+これで、Client Component またはそれがインポートするファイルが `lib/db.ts` をインポートしようとすると、データベースの認証情報がブラウザにサイレントに送信される代わりに、明確なエラーでビルドが失敗します。
+
+これを以下のファイルに適用します。
+- データベースの認証情報または API シークレットを含むファイル
+- Node.js の組み込み機能 (`fs`、`crypto`、`net` など) を使用するファイル
+- 公開されていない内部サービスを呼び出すファイル
+
+## エラークラス 5 — `use server` 関数境界
+
+関数 (ファイルではない) の `'use server'` は、**Server Action** を作成します。これはサーバーで実行されますが、Client Component から呼び出すことができる関数です。ルールは厳格です。
+
+```tsx
+// app/actions.ts
+'use server'
+
+export async function createPost(formData: FormData) {
+  const title = formData.get('title') as string
+  if (!title) throw new Error('Title is required')
+  await db.post.create({ data: { title } })
+}
+```
+
+**`use server` 境界でのよくある間違い:**
+
+1. **非シリアル化可能な値を返す** — RSC プロパティと同じルールです。プレーンなオブジェクトを返します。
+2. **クライアント入力を信頼する** — Server Actions は HTTP エンドポイントです。常に Zod で検証します。
+
+```ts
+'use server'
+import { z } from 'zod'
+
+const schema = z.object({ title: z.string().min(1).max(200) })
+
+export async function createPost(formData: FormData) {
+  const parsed = schema.safeParse({ title: formData.get('title') })
+  if (!parsed.success) throw new Error('Invalid input')
+  await db.post.create({ data: parsed.data })
+}
+```
+
+3. **捕捉されないエラーがアクションをサイレントにクラッシュさせる** — React 19 では、エラー状態を捕捉するために `useActionState` を使用します。
+
+```tsx
+'use client'
+import { useActionState } from 'react'
+import { createPost } from './actions'
+
+export function PostForm() {
+  const [error, action, isPending] = useActionState(
+    async (_prev: string | null, formData: FormData) => {
+      try {
+        await createPost(formData)
+        return null
+      } catch (e) {
+        return (e as Error).message
+      }
+    },
+    null
+  )
+
+  return (
+    <form action={action}>
+      <input name="title" />
+      {error && <p className="text-red-500">{error}</p>}
+      <button disabled={isPending}>
+        {isPending ? 'Saving…' : 'Create Post'}
+      </button>
+    </form>
+  )
+}
+```
+
+## エラークラス 6 — 機密データのための Taint API
+
+React 19 では、機密性の高いサーバーデータが誤って Client Components に渡されるのを防ぐために、`experimental_taintObjectReference` と `experimental_taintUniqueValue` が導入されました。
+
+```ts
+// app/api/user/route.ts
+import { experimental_taintObjectReference } from 'react'
+
+async function getUser(id: string) {
+  const user = await db.user.findUnique({ where: { id } })
+  // Mark the whole object as tainted — passing it as a prop will throw
+  experimental_taintObjectReference(
+    'Do not pass user objects to Client Components. Serialize only the fields you need.',
+    user
+  )
+  return user
+}
+```
+
+`next.config.js` で有効にします。
+
+```js
+/** @type {import('next').NextConfig} */
+module.exports = {
+  experimental: {
+    taint: true,
+  },
+}
+```
+
+これは多層防御の手段です。エラーは開発中の**レンダリング時**に発生し、偶発的なデータがクライアントバンドルに漏洩する前に検出されます。
+
+## `'use client'` 配置戦略
+
+App Router で最も影響の大きいパフォーマンス決定は、クライアント境界をどこに引くかです。よくある間違いは、レイアウトや高レベルのページコンポーネントに `'use client'` を配置することです。これにより、すべての子がクライアントバンドルに強制的に含まれてしまいます。
+
+**ルール:** `'use client'` をインタラクティブ性が必要な限り深くプッシュします。
+
+```tsx
+// ❌ Forces everything into client bundle
+'use client'
+export default function BlogPage({ posts }) {
+  const [filter, setFilter] = useState('')
+  return (
+    <div>
+      <input onChange={(e) => setFilter(e.target.value)} />
+      {posts.map(p => <PostCard key={p.id} post={p} />)}
+    </div>
+  )
+}
+
+// ✅ Only the filter widget is a Client Component
+// BlogPage and PostCard remain Server Components
+'use client'
+export function FilterInput({ onFilter }: { onFilter: (q: string) => void }) {
+  return <input onChange={(e) => onFilter(e.target.value)} />
+}
+```
+
+Server Components は、Client Components を介して**他の Server Components** を `children` として渡すことができます。これにより、それらをクライアントサイドにする必要はありません。
+
+```tsx
+// This pattern works — children are still Server Components
+export default function Layout({ children }: { children: React.ReactNode }) {
+  return <ClientShell>{children}</ClientShell>
+}
+```
+
+## デバッグワークフローチートシート
+
+| 症状 | 最初に確認すること | ツール |
+|---|---|---|
+| 「関数は渡せません」 | 境界を越えるプロパティの型 | Server Component の `JSON.stringify(prop)` |
+| ハイドレーションの不一致 | 初期レンダリングでのブラウザ専用 API | DevTools → React タブ → ハイドレーションエラー |
+| RSC ペイロードが間違っている | サーバーが実際にシリアル化したもの | ネットワークタブ → `text/x-component` リクエスト |
+| ブラウザ内のサーバーモジュール | `server-only` インポートの欠落 | ビルド出力 → バンドルアナライザー |
+| アクションがサイレントに失敗する | Server Action での捕捉されないスロー | `useActionState` エラーキャプチャ |
+| 機密データの漏洩 | Client Component に渡されたオブジェクト | `experimental_taintObjectReference` |
+
+## こちらもおすすめ
+
+- [Next.js App Router with Prisma: Setup & Connection Pooling](/en/blog/nextjs-prisma-app-router)
+- [Next.js App Router Folder Structure: Best Practices & Enterprise Architecture (2026)](/en/blog/nextjs-app-router-folder-structure)
+- [React Testing Library user-event v14: Best Practices & fireEvent Migration (2026)](/en/blog/react-testing-library-user-event-best-practices)
+- [Supercharging React with Rust and WebAssembly: A Comprehensive Guide](/en/blog/rust-wasm-react)

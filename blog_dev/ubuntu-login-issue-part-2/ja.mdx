@@ -1,0 +1,245 @@
+---
+draft: false
+title: "Ubuntuでの2分間のログイン遅延を修正（実際のデバッグの旅）"
+images: ['https://imgbed.locionic.com/file/1784441601756_ubuntu-login-issue-part-2.jpg']
+date: "2026-05-27"
+lastUpdated: '2026-09-22'
+tags: ["linux", "ubuntu", "performance", "troubleshooting"]
+category: Tech
+summary: "Ubuntuで2分間のログインフリーズを3日間追いかけ、NetworkManagerのネットワーク待機、gnome-keyringの二重起動、snapdによる18個のsnapへの2分追加という3つの問題が積み重なっていたことが判明。そのデバッグの全過程を紹介します。"
+---
+
+パスワードを入力してから2分間、フリーズしたデスクトップをじっと見つめていました。毎朝、3日間連続で。
+
+<AudioPlayer src="/static/audio/ubuntu-login-issue-part-2.mp3" title="Executive Audio Briefing" />
+
+<Callout type="idea" title="重要な洞察">
+起動時間とログイン時間は全く異なる問題です。`systemd-analyze`は起動速度を測定するもので、パスワード入力後に何が起こるかは測定しません。
+</Callout>
+
+これは、NVIDIA/Xorgの問題が同様の症状を引き起こした私の[最初のUbuntuログイン遅延に関する投稿](/en/blog/ubuntu-login-issue)の続編です。今回はマシンにNVIDIA GPUはありませんでしたが、同じ2分間のフリーズが再発しました。根本原因も修正方法も異なります。
+
+---
+
+## 診断ツールキット
+
+何も触る前に、証拠を集めましょう。推測は時間の無駄です。
+
+**起動時分析**（ログイン画面の前に何がロードされるか）：
+```bash
+systemd-analyze blame | head -20
+systemd-analyze critical-chain
+systemd-analyze plot > boot.svg
+```
+
+**ユーザーセッション分析**（パスワード入力後に何がロードされるか）：
+```bash
+systemd-analyze --user blame | head -20
+systemd-analyze --user critical-chain
+```
+
+**ジャーナルスキャン**（タイムアウトと失敗イベントの検索）：
+```bash
+# All errors since last boot
+journalctl -b -p err
+
+# Everything, with timestamps
+journalctl -b --output=short-precise | less
+
+# Filter for common culprits
+journalctl -b | grep -iE "timeout|timed out|failed|refused|killed"
+```
+
+重要な洞察：`systemd-analyze blame`は起動時（ログイン前）のみを表示します。ログイン後のフリーズには、`--user`と`journalctl -b`が必要です。
+
+---
+
+## 最初のヒント：NetworkManager
+
+`systemd-analyze blame`は、5.7秒で`NetworkManager-wait-online.service`を示していました。ログインフリーズの原因ではありませんが、修正する価値はあります。
+
+<Callout type="info" title="NetworkManager-wait-onlineの機能">
+このサービスは、完全なネットワーク接続が確立されるまで起動シーケンスをブロックします。サーバーでは重要です。データベースのようなsystemdサービスは、起動前にネットワークが必要です。デスクトップでは、通常は無意味です。
+</Callout>
+
+```bash
+sudo systemctl disable NetworkManager-wait-online.service
+```
+
+実際に無効になっているか確認します。
+```bash
+systemctl is-enabled NetworkManager-wait-online.service
+# Should output: disabled
+```
+
+起動が5秒速くなりました。ログインフリーズは変わりませんでした。
+
+**デスクトップでこれが安全な理由：** デスクトップアプリは、起動時にネットワークが準備されていることに依存しません。それらは自身で処理します。`NetworkManager-wait-online`が成功する必要がある唯一のサービスは、明示的に`After=network-online.target`されているもので、デスクトップでは稀です。
+
+---
+
+## 2番目のヒント：重複するキーリング
+
+`journalctl -b | grep -iE "failed|error"`は、ログインからちょうど2分後にエラーのクラスターを示していました。
+
+```
+Failed to start app-gnome-gnome-keyring-secrets.scope
+systemd[1423]: Failed to start gnome-keyring-secrets.scope
+cgroup: Failed to create /user.slice/user-1000.slice/session-2.scope/app.slice/app-gnome-keyring
+```
+
+タイムスタンプは正確でした。これらのエラーはログインから120秒後に現れました。これはフリーズの正確な長さです。
+
+<Stepper>
+<Step title="問題の理解">
+GNOMEはキーリングデーモンを2回起動していました。1回はsystemdユーザーサービス経由で、もう1回は`/etc/xdg/autostart/`にある`.desktop`自動起動ファイル経由です。2回目の試行ではソケットがすでに使用中であることが判明し、クラッシュしました。そして、systemdはセッションの準備ができたと宣言する前に、失敗したサービスを待機していました。
+</Step>
+
+<Step title="重複の確認">
+自動起動ファイルが存在するか確認します。
+```bash
+ls /etc/xdg/autostart/ | grep keyring
+# gnome-keyring-pkcs11.desktop
+# gnome-keyring-secrets.desktop
+# gnome-keyring-ssh.desktop
+```
+
+systemdユーザーサービスもアクティブであるか確認します。
+```bash
+systemctl --user status gnome-keyring-daemon.service
+```
+
+両方が存在し、サービスがアクティブな場合、重複しています。
+</Step>
+
+<Step title="修正">
+ユーザーのみの自動起動エントリを無効にします（システム全体のファイルを変更しないでください）。
+```bash
+mkdir -p ~/.config/autostart
+for f in gnome-keyring-pkcs11.desktop gnome-keyring-secrets.desktop gnome-keyring-ssh.desktop; do
+    cp /etc/xdg/autostart/$f ~/.config/autostart/$f
+    echo "X-GNOME-Autostart-enabled=false" >> ~/.config/autostart/$f
+done
+```
+ログアウトして再度ログインします。cgroupエラーは消えるはずです。
+</Step>
+</Stepper>
+
+cgroupエラーは消えました。フリーズは？まだ正確に2分間です。
+
+---
+
+## 真犯人：snapdの計算
+
+明らかな候補を排除した後、ジャーナル内でタイミングに関連するものを対象に検索を実行しました。
+
+```bash
+journalctl -b | grep -i "snap\|adjust\|timeout" | head -30
+```
+
+そこにありました。
+
+```
+snapd[2242]: adjusting startup timeout by 2m0s (pessimistic estimate of 30s plus 5s per snap)
+snapd[2242]: OsRelease{...} snap name "snapd-desktop-integration" error: service not found
+```
+
+<Callout type="warning" title="Snapdのタイムアウト計算式">
+snapdは、起動タイムアウトを**30秒 + インストールされているsnapごとに5秒**と計算します。私は18個のsnapをインストールしていました。30 + (5 × 18) = **正確に120秒**。
+
+これはsnapdのソースコードにハードコードされています。これを短く設定することはできません。
+</Callout>
+
+`snapd-desktop-integration` snapは、ログインするたびに失敗していました。snapdは、セッションの進行を許可する前に、計算されたタイムアウト（120秒）いっぱい待機していました。
+
+### どのSnapが失敗しているか診断する
+
+```bash
+# Check snap status
+snap list
+
+# Check for failing snap services
+snap services | grep -v enabled
+
+# Watch snap logs
+journalctl -b -u snapd | grep -iE "fail|error|timeout"
+```
+
+出力は、`snapd-desktop-integration`が接続に一貫して失敗していることを示していました。このsnapの役割は、ホストとコンテナ化されたsnapアプリの間でGTKテーマとフォントを同期することです。純粋に見た目の問題であり、ログイン待機を除けば、失敗しても何も壊れません。
+
+### 修正
+
+```bash
+sudo snap remove snapd-desktop-integration
+```
+
+ログアウトして、再度ログインします。デスクトップは瞬時にロードされました。
+
+### 代替案：Snapを保持し、サービスを削除する
+
+たまに使うためにsnapを保持したいが、ログイン時に実行されないようにしたい場合：
+
+```bash
+sudo snap stop snapd-desktop-integration
+sudo snap set snapd-desktop-integration daemon=false
+```
+
+これにより、snapはインストールされたまま、サービスが自動的に起動するのを防ぎます。
+
+---
+
+## 全体像：3つのバグ、1つの症状
+
+| バグ | 検出ツール | ログインへの影響 | 修正 |
+|-----|--------------------|-----------------|----|
+| `NetworkManager-wait-online` | `systemd-analyze blame` | 起動時に+5秒（ログインではない） | `systemctl disable` |
+| 重複するgnome-keyring | `journalctl -b -p err` | Cgroupエラー、わずかな遅延 | 自動起動の重複を無効にする |
+| snapdタイムアウト | `journalctl -b \| grep snap` | ログインフリーズ+120秒 | `snap remove snapd-desktop-integration` |
+
+それぞれのバグは実在しました。snapdの問題が見つかるまで、どれも単独で2分間のフリーズを引き起こすことはありませんでした。
+
+---
+
+## 予防的チェック
+
+何か問題が発生するのを待たずに、ユーザーセッションで何がゆっくりと起動しているかを監査したい場合：
+
+```bash
+# Slowest user services at startup
+systemd-analyze --user blame | head -20
+
+# All snap services and their status
+snap services
+
+# Snaps that have autostart behavior
+snap list | awk 'NR>1 {print $1}' | xargs -I{} snap info {} 2>/dev/null | grep -A2 "services:"
+```
+
+多くのsnapがインストールされているシステムの場合、上記の計算が適用されます。snapが6つ追加されるごとに、最悪の場合のタイムアウトに30秒が追加されます。snapリストはスリムに保ちましょう。
+
+---
+
+<Callout type="idea" title="診断チートシート">
+**起動の内訳:** `systemd-analyze blame | head -20`  
+**ユーザーセッションの内訳:** `systemd-analyze --user blame | head -20`  
+**ログイン失敗:** `journalctl -b | grep -iE "timeout|timed out|failed"`  
+**Snap固有:** `journalctl -b -u snapd | grep -iE "fail|adjust|timeout"`  
+**Snapサービス:** `snap services | grep -v enabled`
+</Callout>
+
+---
+
+## TL;DR
+
+3つの異なるバグ。2分間の待機。1つの`snap remove`コマンドで解決しました。
+
+本当の教訓：**ログインフリーズ ≠ 起動の遅さ**。`systemd-analyze blame`は、パスワードを入力した後に何が起こっているかを示しません。ログイン後の問題を見つけるには、`systemd-analyze --user blame`と`journalctl -b | grep -iE "failed|timeout"`を使用してください。
+
+snapdの30 + 5nのタイムアウト計算式は、多くのsnapがインストールされているUbuntuマシンで、謎の1〜2分間のログイン遅延が発生する最も一般的な原因です。ログイン後にマシンが正確にN×30秒間フリーズする場合は、まずsnapサービスを確認してください。
+
+## こちらもどうぞ
+
+- [NVIDIA搭載Ubuntuでの2〜3分間のログイン遅延の修正（Xorg + nvidia-drmの問題）](/en/blog/ubuntu-login-issue)
+- [Ubuntuサーバーセキュリティ：実用的なLinux強化チェックリスト](/en/blog/ubuntu-server-security-fundamentals)
+- [LinuxでディレクトリをPATHに追加する方法（永続的な修正）](/en/blog/how-to-add-a-directory-to-your-path)
+- [OpenTelemetryによる分散トレーシング](/en/blog/opentelemetry-distributed-tracing)

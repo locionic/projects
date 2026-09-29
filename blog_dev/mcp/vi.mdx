@@ -1,0 +1,233 @@
+---
+title: "Xây dựng máy chủ MCP đầu tiên của bạn từ đầu: Hướng dẫn Python & Claude đầy đủ"
+date: "2026-03-23"
+lastUpdated: "2026-09-18"
+summary: "Hướng dẫn từng bước để xây dựng các máy chủ Model Context Protocol (MCP) sản xuất với Python, FastMCP, typed tools, resources và tích hợp Claude Desktop."
+tags: ["ai", "claude", "python", "developer-tools", "anthropic", "mcp"]
+images: ['https://imgbed.locionic.com/file/1784436637905_mcp.jpg']
+category: Tech
+draft: false
+---
+
+Trong nhiều năm, việc kết nối các Mô hình Ngôn ngữ Lớn (LLM) với cơ sở dữ liệu nội bộ, hệ thống tệp cục bộ và công cụ dành cho nhà phát triển đòi hỏi phải viết các lược đồ gọi hàm riêng biệt cho từng nhà cung cấp LLM. Mỗi khi bạn chuyển đổi mô hình hoặc cập nhật một framework agent, bạn phải triển khai lại các định nghĩa công cụ, ranh giới ủy quyền và logic tuần tự hóa.
+
+**Giao thức Ngữ cảnh Mô hình (MCP)**, được Anthropic giới thiệu và được áp dụng rộng rãi trên Claude Desktop, Cursor và các môi trường phát triển AI hiện đại, giải quyết sự phân mảnh này. MCP là tiêu chuẩn mở, phổ quát—về cơ bản là **"USB-C của các tích hợp AI"**—cho phép LLM khám phá, kiểm tra và gọi các công cụ cục bộ và từ xa thông qua một giao diện JSON-RPC tiêu chuẩn.
+
+Trong hướng dẫn này, chúng ta sẽ phân tích kiến trúc của MCP, xây dựng một máy chủ MCP Python cấp độ sản xuất từ đầu bằng cách sử dụng `FastMCP`, triển khai các công cụ bảo mật và tài nguyên động, và kết nối trực tiếp nó vào Claude Desktop.
+
+---
+
+<AudioPlayer src="/static/audio/mcp.mp3" title="Tóm tắt âm thanh điều hành" />
+
+## Kiến trúc MCP: Cách Host, Client và Server kết nối
+
+Để hiểu cách MCP hoạt động, hãy xem xét ba thành phần cốt lõi trong giao thức:
+
+```
+┌────────────────────────────────────────────────────────┐
+│ MCP Host (Claude Desktop / Cursor IDE)                 │
+│                                                        │
+│   ┌────────────────────────────────────────────────┐   │
+│   │ MCP Client (Protocol Adapter & Security Layer) │   │
+│   └───────────────────────┬────────────────────────┘   │
+└───────────────────────────┼────────────────────────────┘
+                            │ (JSON-RPC 2.0 over Stdio or SSE)
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│ MCP Server (Your Python / TypeScript Application)      │
+│                                                        │
+│  ├── Tools:     Callable functions (read, write, API)  │
+│  ├── Resources: Read-only context (logs, DB rows)      │
+│  └── Prompts:   Pre-engineered prompt templates        │
+└────────────────────────────────────────────────────────┘
+```
+
+1. **MCP Host**: Ứng dụng chạy giao diện mô hình AI (ví dụ: Claude Desktop, trình chỉnh sửa Zed).
+2. **MCP Client**: Trình điều khiển giao thức nội bộ bên trong host chịu trách nhiệm đàm phán khả năng, thực thi quyền bảo mật và chuyển tiếp các lệnh gọi công cụ.
+3. **MCP Server**: Một tiến trình nhẹ độc lập (hoặc dịch vụ từ xa) quảng cáo các khả năng có sẵn của nó và thực thi các hoạt động được yêu cầu.
+
+### Các phương thức truyền tải: Stdio so với Server-Sent Events (SSE)
+
+- **Stdio Transport**: Host khởi tạo máy chủ Python của bạn dưới dạng một tiến trình con và giao tiếp qua đầu vào/đầu ra tiêu chuẩn (`stdin`/`stdout`). Đây là chế độ tiêu chuẩn, không có overhead cho các máy phát triển cục bộ.
+- **SSE Transport**: Host kết nối với một máy chủ HTTP bên ngoài qua Server-Sent Events để truyền tải các cập nhật. Chế độ này được sử dụng cho các microservice được lưu trữ trên đám mây và các trình kết nối SaaS doanh nghiệp.
+
+---
+
+## 1. Thiết lập môi trường Python của bạn với `uv`
+
+Chúng ta sẽ sử dụng `uv`, trình quản lý gói Python cực nhanh, để khởi tạo dự án và cài đặt SDK MCP Python chính thức:
+
+```bash
+# Create project directory
+mkdir local-dev-mcp && cd local-dev-mcp
+
+# Initialize Python workspace
+uv init
+uv add mcp pydantic
+```
+
+---
+
+## 2. Xây dựng máy chủ với `FastMCP`
+
+SDK Python cung cấp `FastMCP`, một framework cấp cao được mô phỏng theo FastAPI. Nó tự động trích xuất các lược đồ tham số, gợi ý kiểu và chuỗi tài liệu thành các lược đồ công cụ JSON-RPC hợp lệ.
+
+Tạo `server.py`:
+
+```python
+# server.py: Production Local Developer MCP Server
+import os
+from pathlib import Path
+from pydantic import BaseModel, Field
+from mcp.server.fastmcp import FastMCP
+
+# Initialize the MCP Server with identity and version
+mcp = FastMCP("Developer-Workspace-Tools", version="1.0.0")
+
+# Define a safe base directory to prevent directory traversal attacks
+SAFE_WORKSPACE = Path(os.getenv("MCP_WORKSPACE_DIR", "./workspace")).resolve()
+SAFE_WORKSPACE.mkdir(parents=True, exist_ok=True)
+
+def resolve_safe_path(relative_path: str) -> Path:
+    """Guarantees file operations remain strictly inside the authorized workspace."""
+    resolved = (SAFE_WORKSPACE / relative_path).resolve()
+    if not str(resolved).startswith(str(SAFE_WORKSPACE)):
+        raise PermissionError(f"Access denied: '{relative_path}' attempts path traversal.")
+    return resolved
+
+# ====================================================================
+# Primitive 1: Tools (Callable Actions)
+# ====================================================================
+
+@mcp.tool()
+def save_code_snippet(filename: str, code: str, language: str = "python") -> str:
+    """
+    Saves a code snippet to the authorized local workspace.
+    
+    Args:
+        filename: Name of the file including extension (e.g., 'auth_utils.py')
+        code: Full code content to write
+        language: Programming language identifier for metadata
+    """
+    target_path = resolve_safe_path(filename)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(target_path, "w", encoding="utf-8") as f:
+        f.write(code)
+        
+    return f"Successfully wrote {len(code)} bytes to {filename} (Language: {language})"
+
+@mcp.tool()
+def list_workspace_files() -> list[dict]:
+    """Lists all files in the developer workspace with file size and modified timestamps."""
+    files = []
+    for p in SAFE_WORKSPACE.rglob("*"):
+        if p.is_file():
+            stat = p.stat()
+            files.append({
+                "relative_path": str(p.relative_to(SAFE_WORKSPACE)),
+                "size_bytes": stat.st_size,
+                "modified_timestamp": stat.st_mtime,
+            })
+    return files
+
+# ====================================================================
+# Primitive 2: Resources (Context Streams)
+# ====================================================================
+
+@mcp.resource("workspace://logs/{log_name}")
+def get_system_log(log_name: str) -> str:
+    """Reads a designated log file from the workspace for debugging context."""
+    log_path = resolve_safe_path(f"logs/{log_name}.log")
+    if not log_path.exists():
+        return f"Log file '{log_name}' not found."
+        
+    with open(log_path, "r", encoding="utf-8") as f:
+        # Return the last 50 lines to conserve context window
+        lines = f.readlines()
+        return "".join(lines[-50:])
+
+if __name__ == "__main__":
+    # Runs the Stdio transport event loop
+    mcp.run()
+```
+
+---
+
+## 3. Cấu hình Claude Desktop
+
+Để cho phép Claude Desktop khám phá và gọi máy chủ MCP mới của bạn, hãy cấu hình tệp cấu hình JSON của nó:
+
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Linux**: `~/.config/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+Thêm định nghĩa máy chủ của bạn vào `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "developer-workspace": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/absolute/path/to/local-dev-mcp",
+        "server.py"
+      ],
+      "env": {
+        "MCP_WORKSPACE_DIR": "/absolute/path/to/workspace"
+      }
+    }
+  }
+}
+```
+
+Khởi động lại Claude Desktop. Bạn sẽ thấy một biểu tượng 🔌 **búa/công cụ** mới xuất hiện ở góc dưới bên phải của hộp nhập liệu trò chuyện. Nhấp vào đó sẽ hiển thị các công cụ đã đăng ký của bạn: `save_code_snippet` và `list_workspace_files`.
+
+---
+
+## 4. Kiểm thử và gỡ lỗi với MCP Inspector
+
+Trước khi kết nối với Claude Desktop, bạn có thể kiểm thử và gỡ lỗi máy chủ MCP của mình một cách tương tác bằng cách sử dụng **MCP Inspector** dựa trên trình duyệt chính thức:
+
+```bash
+# Launch the interactive MCP debugger
+npx @modelcontextprotocol/inspector uv run server.py
+```
+
+Inspector khởi chạy một giao diện người dùng web cục bộ nơi bạn có thể:
+- Kiểm tra các lược đồ JSON được tạo tự động cho tất cả các công cụ và tài nguyên.
+- Thực thi các công cụ với các đối số JSON tùy chỉnh và xem các phản hồi JSON-RPC thô.
+- Xác minh việc xử lý lỗi và từ chối duyệt đường dẫn.
+
+---
+
+## Các phương pháp bảo mật tốt nhất cho máy chủ MCP sản xuất
+
+1. **Bảo vệ duyệt đường dẫn**: Luôn giải quyết các đường dẫn tệp dựa trên một thư mục cơ sở rõ ràng bằng cách sử dụng `pathlib.Path.resolve()`. Không bao giờ tin tưởng các chuỗi đường dẫn tương đối được truyền trực tiếp bởi một LLM.
+2. **Vùng an toàn chỉ đọc**: Nếu một công cụ chỉ cần đọc dữ liệu đo từ xa hoặc các bản ghi cơ sở dữ liệu, hãy kết nối với một vai trò cơ sở dữ liệu chỉ có đặc quyền `SELECT` nghiêm ngặt.
+3. **Stdio sạch sẽ**: Không bao giờ sử dụng các câu lệnh `print()` để gỡ lỗi trong máy chủ MCP. Vì đầu ra tiêu chuẩn được dành riêng nghiêm ngặt cho các thông báo JSON-RPC, đầu ra văn bản tùy ý sẽ làm hỏng giao thức truyền tải. Sử dụng `logging` Python tiêu chuẩn được cấu hình để ghi vào `sys.stderr`.
+
+---
+
+## Các câu hỏi thường gặp
+
+### Một máy chủ MCP có thể gọi các API đám mây bên ngoài không?
+Có. Một máy chủ MCP đơn giản là mã tiêu chuẩn. Bạn có thể sử dụng `httpx` hoặc `requests` bên trong các triển khai công cụ của mình để gọi API GitHub, webhook Slack, vé Jira hoặc các cụm Kubernetes nội bộ.
+
+### Claude quyết định khi nào gọi một công cụ MCP như thế nào?
+Claude kiểm tra chữ ký hàm và docstrings được quảng cáo bởi máy chủ MCP của bạn. Viết các docstrings mô tả (giải thích công cụ làm gì, các tham số có ý nghĩa gì và khi nào nên gọi nó) là yếu tố quan trọng nhất để gọi công cụ đáng tin cậy.
+
+### Sự khác biệt giữa Công cụ MCP và Tài nguyên MCP là gì?
+- **Công cụ** là các hành động có tác dụng phụ (ghi tệp, thực thi lệnh, truy vấn API bên ngoài) yêu cầu sự chấp thuận rõ ràng của người dùng trong giao diện người dùng host.
+- **Tài nguyên** là các luồng dữ liệu thụ động, chỉ đọc (như đính kèm tệp hoặc đưa nhật ký cơ sở dữ liệu vào ngữ cảnh) mà host có thể đọc mà không có rủi ro tác dụng phụ.
+
+---
+
+## Bạn cũng có thể thích
+
+- [Xây dựng các tác nhân AI đáng tin cậy với MCP: Hướng dẫn đầy đủ](/en/blog/building-reliable-ai-agents-with-mcp)
+- [Xây dựng các tác nhân AI tự động trong Rust](/en/blog/rust-autonomous-ai-agents)
+- [Tương lai của các tác nhân AI trong kỹ thuật phần mềm](/en/blog/future-of-ai-agents)
+- [Kỹ thuật phần mềm xanh: Tối ưu hóa khối lượng công việc AI để đạt hiệu quả năng lượng vào năm 2026](/en/blog/green-software-engineering-ai-workloads)

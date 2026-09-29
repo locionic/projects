@@ -1,0 +1,218 @@
+---
+title: "2026年のWebAssembly: WASI、Component Model、そして本番環境でのWasm実行"
+date: '2026-08-16'
+summary: "2026年にWebAssemblyを本番環境で実行するための実用的なガイド。WASI preview 2、Component Model、Cloudflare Workers、Fermyon Spin、Wasmtime embeddings、そして実際のベンチマーク数値について解説します。"
+tags: ["webassembly", "wasm", "backend", "frontend"]
+images: ['/static/images/wasm-2026.png']
+draft: false
+---
+
+「WebAssembly everywhere」という話は何度も繰り返されてきたので、聞き飽きた人もいるかもしれません。そこで、今回はマニフェストは抜きにして、実際に何が出荷され、実際のトレードオフは何で、2026年にはどのような実用的なWasmデプロイメントが実現しているのかを見ていきましょう。
+
+<AudioPlayer src="/static/audio/wasm-2026.mp3" title="Executive Audio Briefing" />
+
+## 実際に何が変わったのか：WASI Preview 2とコンポーネントモデル
+
+サーバーサイドWasmを実用的にしたのは、WASIとコンポーネントモデルの2つです。これらはよく一緒に言及されますが、解決する問題は異なります。
+
+**WASI (WebAssembly System Interface)** は、Wasmモジュールがホストと通信する方法を提供します。ファイル読み込み、ネットワーク接続、環境変数の取得などです。WASI Preview 1はフラットなPOSIX風の名前空間でした。WASI Preview 2（2025年初頭から安定版）は、**WIT** (WebAssembly Interface Types) で定義された型付きケーパビリティインターフェースにすべてを再構築しました。
+
+```wit
+// http-handler.wit
+package my:service;
+
+interface handler {
+  use wasi:http/types@0.2.0.{incoming-request, outgoing-response, response-outparam};
+  handle: func(request: incoming-request, response-out: response-outparam);
+}
+
+world http-service {
+  export handler;
+}
+```
+
+このWITファイルが契約書となります。ツールはホストとゲストのバインディングを自動的に生成します。モジュールは、Wasmtime、Cloudflareのランタイム、Spinのいずれで実行されているかを知りません。ホストがインターフェースを満たします。
+
+**コンポーネントモデル**は、生のWasmモジュールを、互いにリンクできるコンポーネントにラップします。異なる言語でコンパイルされた2つのコンポーネント、例えばRustの画像処理ライブラリとPythonのオーケストレーションレイヤーは、JSONやHTTPを介さずにWITインターフェースを介して直接呼び出すことができます。ランタイムがそれらを接続します。
+
+## Cloudflare Workers：本番環境でのリアルWasm
+
+Cloudflare WorkersはWasmをネイティブで実行し、おそらく今日最も広く使われている本番Wasmランタイムです。すべてのWorkerはアイソレートで実行されるWasmモジュールです。コールドスタートは秒単位ではなくマイクロ秒単位で測定されます。
+
+```javascript
+// worker.js — loading a compiled Rust Wasm module
+import wasm from './my-lib_bg.wasm';
+import { init, process_payload } from './my-lib.js';
+
+export default {
+  async fetch(request) {
+    await init(wasm);
+    const body = await request.arrayBuffer();
+    const result = process_payload(new Uint8Array(body));
+    return new Response(result, {
+      headers: { 'content-type': 'application/json' }
+    });
+  }
+};
+```
+
+Rust側は`wasm32-unknown-unknown`と`wasm-bindgen`でコンパイルされます。
+
+```rust
+use wasm_bindgen::prelude::*;
+use serde_json::Value;
+
+#[wasm_bindgen]
+pub fn process_payload(data: &[u8]) -> String {
+    let parsed: Value = serde_json::from_slice(data)
+        .unwrap_or(Value::Null);
+    // ... processing logic
+    serde_json::to_string(&parsed).unwrap()
+}
+```
+
+ビルドとデプロイ：
+```bash
+wasm-pack build --target bundler
+wrangler deploy
+```
+
+モジュールはコールドリクエストで約0.3msで起動します。比較として、Node.js Lambdaのコールドスタートは通常200-800msです。
+
+## Fermyon Spin：WasmでHTTPマイクロサービスを構築する
+
+[Spin](https://developer.fermyon.com/spin) は、Wasmネイティブなバックエンドフレームワークの最も明確な例です。Rust、Python、Go、またはJSでコンポーネントを記述します。各コンポーネントは特定のルートを処理します。
+
+```toml
+# spin.toml
+spin_manifest_version = 2
+
+[application]
+name = "api-service"
+version = "0.1.0"
+
+[[trigger.http]]
+route = "/users/..."
+component = "user-handler"
+
+[[trigger.http]]
+route = "/auth/..."
+component = "auth-handler"
+
+[component.user-handler]
+source = "target/wasm32-wasip1/release/user_handler.wasm"
+allowed_outbound_hosts = ["https://db.internal"]
+
+[component.auth-handler]
+source = "target/wasm32-wasip1/release/auth_handler.wasm"
+allowed_outbound_hosts = []
+```
+
+`allowed_outbound_hosts`フィールドは、ケーパビリティモデルが機能していることを示しています。`auth-handler`はネットワークアクセスを一切持ちません。たとえJWT解析ロジックに脆弱性があったとしても、モジュールは外部に情報を送信できません。
+
+ユーザーハンドラーのRustコンポーネント：
+
+```rust
+use spin_sdk::http::{IncomingRequest, ResponseBuilder};
+use spin_sdk::http_component;
+use spin_sdk::variables;
+
+#[http_component]
+async fn handle(req: IncomingRequest) -> anyhow::Result<impl IntoResponse> {
+    let db_url = variables::get("db_url")?;
+    // Spin's built-in SQLite or PostgreSQL via spin_sdk::pg
+    let conn = spin_sdk::pg::Connection::open(&db_url).await?;
+    let rows = conn.query("SELECT id, name FROM users LIMIT 20", &[]).await?;
+
+    let users: Vec<serde_json::Value> = rows.iter().map(|r| {
+        serde_json::json!({
+            "id": r.get::<i64>(0),
+            "name": r.get::<&str>(1)
+        })
+    }).collect();
+
+    Ok(ResponseBuilder::new(200)
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(&users)?)
+        .build())
+}
+```
+
+Fermyon Cloudにデプロイするか、`spin up`でセルフホストします。サービス全体は`.wasm`ファイルとTOMLのセットであり、Dockerfileもコンテナレジストリもありません。
+
+## PythonサービスへのWasmtimeの組み込み
+
+既存のPythonサービスがあり、Wasmプラグインを安全に実行したい場合、例えばユーザーが実行する変換ロジックをアップロードできるようにしたい場合、WasmtimeのPythonバインディングが適切なツールです。
+
+```python
+from wasmtime import Store, Module, Linker, WasiConfig
+from pathlib import Path
+
+class WasmPluginRunner:
+    def __init__(self, wasm_path: str):
+        self.store = Store()
+        wasi = WasiConfig()
+        wasi.inherit_stdout()
+        self.store.set_wasi(wasi)
+
+        self.linker = Linker(self.store.engine)
+        self.linker.define_wasi()
+
+        module = Module.from_file(self.store.engine, wasm_path)
+        self.instance = self.linker.instantiate(self.store, module)
+
+    def run_transform(self, input_data: bytes) -> bytes:
+        memory = self.instance.exports(self.store)["memory"]
+        transform = self.instance.exports(self.store)["transform"]
+
+        # Allocate in Wasm linear memory, call the function, read result back
+        alloc = self.instance.exports(self.store)["alloc"]
+        ptr = alloc(self.store, len(input_data))
+        memory.write(self.store, input_data, ptr)
+
+        result_ptr = transform(self.store, ptr, len(input_data))
+        # Read length prefix + data from result_ptr
+        result_len = int.from_bytes(
+            memory.read(self.store, result_ptr, result_ptr + 4), 'little'
+        )
+        return bytes(memory.read(self.store, result_ptr + 4, result_ptr + 4 + result_len))
+```
+
+プラグインの作成者は、Rustコードを`wasm32-wasip2`にコンパイルし、`.wasm`ファイルを送ってきます。彼らはあなたの環境変数を読み取ったり、ネットワーク接続を開いたり、ファイルシステムにアクセスしたりすることはできません。サンドボックスがセキュリティモデルです。
+
+## パフォーマンスの現実的な確認
+
+| ワークロード | V8 JS | ネイティブ | Wasm (Wasmtime) |
+|---|---|---|---|
+| SHA-256ハッシュ (1MB) | 12ms | 2.1ms | 2.4ms |
+| JSONパース (10MB) | 89ms | — | 94ms (serdeを使用) |
+| 画像リサイズ (Lanczos) | 340ms | 41ms | 48ms |
+| コールドスタート (HTTPハンドラー) | 180ms (Node) | — | 0.3ms |
+
+Wasmは、間接呼び出しのオーバーヘッドと境界チェックのため、計算量の多いタスクではネイティブよりも約5〜20%遅くなります。I/Oバウンドなほとんどのサーバーワークロードでは、この違いは問題になりません。コールドスタートの利点が、エッジ/サーバーレスデプロイメントにおける真の差別化要因です。
+
+## Wasmがまだ苦手なこと
+
+以下の目的でWasmを使用しないでください。
+
+- **長時間接続** — WebSocket、SSE。ほとんどのWasmランタイムはリクエスト/レスポンスパターンを中心に設計されています。
+- **重いスレッド処理** — スレッドモデル（`wasm-threads`）はブラウザではサポートされていますが、サーバーランタイムではサポートが不安定です。
+- **メモリを大量に消費するワークロード** — 4GBの線形メモリ制限は今日では実用的な問題ではありませんが、単一のアドレス空間は仮想メモリのトリックが使えないことを意味します。
+- **迅速なイテレーション** — RustからWasmへのコンパイル時間はかなりかかります。毎時間変更されるスクリプトの場合、イテレーション速度ではPythonやJSが依然として優位です。
+
+## 実用的な意思決定フレームワーク
+
+以下のうち少なくとも2つが必要な場合は、本番環境でWasmを使用してください。
+1. **サブミリ秒のコールドスタート** (エッジ/サーバーレス)
+2. **プラグインの分離** (信頼できないユーザーコード、マルチテナント)
+3. **ポリグロットな構成** (Rustのパフォーマンスが重要なコア + Pythonの接着剤)
+4. **予測可能なパフォーマンス** (ホットパスでのGC一時停止なし)
+
+長時間の接続、成熟した可観測性ツール、またはチームの既存のDockerワークフローが必要な場合は、コンテナを使用してください。
+
+## こちらもどうぞ
+
+- [WebAssembly Deep Dive: Rust, Wasmtime, and the Extism Plugin System](/en/blog/wasm-deep-dive)
+- [WebAssembly (Wasm) Beyond the Browser: A New Era of Compute](/en/blog/wasm-beyond-browser)
+- [Docker BuildKit Cache Mount and Multi-Stage Optimization](/en/blog/docker-buildkit-cache-mount-optimization)
+- [FastAPI with Docker Multi-Stage Builds](/en/blog/fastapi-docker-multistage-build)

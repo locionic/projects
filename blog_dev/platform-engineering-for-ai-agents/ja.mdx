@@ -1,0 +1,187 @@
+---
+title: "AI向けプラットフォームエンジニアリング: 自律エージェントのためのインフラストラクチャ設計"
+date: "2026-08-04"
+lastUpdated: "2026-09-18"
+summary: "フリート規模のAIエージェントインフラストラクチャを設計するためのDevOpsガイド。OpenTelemetryトレーシング、Firecracker実行サンドボックス、ステートマシン、コストサーキットブレーカーについて解説。"
+tags: ["ai", "platform-engineering", "devops", "autonomous-agents", "kubernetes"]
+images: ["/static/images/platform-engineering-golden-paths.png"]
+category: Tech
+draft: false
+---
+
+開発者のラップトップでLangChainやAutoGenを使ってプロトタイプのAIエージェントを構築するのは比較的簡単です。LLMにプロンプトを与え、Python関数をツールとして接続し、その実行を観察するだけです。
+
+しかし、本番環境で何百もの自律型AIエージェントのフリートを稼働させるのは、まったく異なるエンジニアリング上の課題です。予測可能なメモリとCPUフットプリントで決定論的なコードを実行する従来のマイクロサービスとは異なり、自律型エージェントは**非決定論的で、長時間実行され、自己指示型のワークフロー**です。これらはネストされたループを開始し、動的なサブエージェントを生成し、外部APIを呼び出し、リアルタイムで任意のコードを実行します。
+
+プラットフォームエンジニアリングチームがAIエージェントを標準のHTTPタイムアウトポリシーを持つ標準のKubernetesポッドにデプロイすると、無限のエージェントループ、APIレート制限の枯渇、暴走する課金スパイク、侵害された内部ネットワークといった連鎖的な障害にすぐに遭遇するでしょう。
+
+このガイドでは、エンタープライズAIエージェントフリートを安全かつ確実に実行できるInternal Developer Platform（IDP）を構築するために必要なアーキテクチャの青写真について解説します。
+
+---
+
+<AudioPlayer src="/static/audio/platform-engineering-for-ai-agents.mp3" title="エグゼクティブオーディオブリーフィング" />
+
+## 非決定論的ワークロード：なぜエージェントは従来のプラットフォームを破壊するのか
+
+従来のクラウドインフラストラクチャは、リクエスト-レスポンスサイクルに最適化されています。
+- HTTPリクエストがIngressコントローラーに到達する。
+- ステートレスなポッドが100ms～500ms以内にビジネスロジックを処理する。
+- データベースレコードが更新され、レスポンスが返され、リソースはすぐに解放される。
+
+自律型エージェントは、これらの前提のすべてを覆します。
+
+1. **無制限の実行寿命**: 市場調査を行うエージェントやプルリクエストをデバッグするエージェントは、45分間実行され、80回の連続したLLM呼び出しと数百回のツール呼び出しを実行する可能性があります。
+2. **動的なツール実行とセキュリティリスク**: エージェントがCSVを解析したりSQLクエリをテストしたりするためにコードを記述して実行する場合、そのコードは本番コンテナ内で実行できません。厳密に隔離された実行サンドボックスが必要です。
+3. **連鎖的なトークン消費**: エージェントの推論ループにおける単一のロジックバグが、再帰的なAPI呼び出しを引き起こし、数百万のトークンを消費し、数分以内に数千ドルのLLM API料金を発生させる可能性があります。
+
+```
+[Agent Platform Engineering Architecture]
+
+  User / Event Trigger
+         │
+         ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │ Agent Gateway & Rate Limiter (Token Budget Enforcement)  │
+  └────────────────────────────┬─────────────────────────────┘
+                               │
+         ▼                     ▼                      ▼
+  ┌──────────────┐      ┌──────────────┐       ┌──────────────┐
+  │ Agent Worker │      │ Agent Worker │       │ Agent Worker │
+  │ (Reasoning)  │      │ (Reasoning)  │       │ (Reasoning)  │
+  └──────┬───────┘      └──────┬───────┘       └──────┬───────┘
+         │                     │                      │
+         ├─────────────────────┼──────────────────────┤
+         ▼                     ▼                      ▼
+  ┌────────────────┐    ┌─────────────────┐    ┌──────────────────┐
+  │ Isolated E2B / │    │ OpenTelemetry   │    │ Postgres / Redis │
+  │ Firecracker VM │    │ Tracing & Evals │    │ Checkpoint Store │
+  │ (Code Sandbox) │    │ (Audit Logging) │    │ (State Recovery) │
+  └────────────────┘    └─────────────────┘    └──────────────────┘
+```
+
+---
+
+## 1. 強化された実行サンドボックス: Firecracker & E2B
+
+自律型エージェントがタスクを実行するためにPythonまたはBashコードを生成する場合、そのコードをKubernetesワーカーポッド内で実行すると、深刻なコンテナブレイクアウトおよびラテラルムーブメントのリスクが生じます。
+
+プラットフォームチームは、オンデマンドの**エフェメラルサンドボックスサービス**を提供する必要があります。
+
+- **Firecracker MicroVMs**: Dockerコンテナ（ホストLinuxカーネルを共有する）とは異なり、MicroVMは125ミリ秒未満の起動時間で真のハードウェアレベルのKVM分離を提供します。
+- **ネットワークエグレスフィルタリング**: すべてのサンドボックスは、厳格なデフォルト拒否ネットワークルールで動作する必要があります。エージェントが内部クラウドメタデータエンドポイント（`169.254.169.254`）や本番データベースに到達するのを防ぐため、eBPFまたはCiliumネットワークポリシーを介してアウトバウンドトラフィックが制限されます。
+- **厳格なリソースクォータ**: サンドボックスは、厳格なメモリ（例：512MB RAM）とCPU制限を適用し、60秒間の非アクティブ状態の後には自動ウォッチドッグ終了を行います。
+
+```python
+# Production Agent Sandbox Invocation using Ephemeral MicroVMs
+from e2b_code_interpreter import Sandbox
+
+def execute_agent_code(python_code: str) -> dict:
+    """Executes arbitrary agent-generated code in an isolated microVM sandbox."""
+    # Instantiates a fresh Firecracker microVM in <200ms
+    with Sandbox(template="python-data-science") as sandbox:
+        try:
+            execution = sandbox.run_code(
+                python_code,
+                timeout=30, # Hard ceiling prevents infinite CPU loops
+            )
+            return {
+                "stdout": execution.logs.stdout,
+                "stderr": execution.logs.stderr,
+                "error": execution.error,
+                "exit_code": 0 if not execution.error else 1,
+            }
+        except Exception as e:
+            return {"error": f"Sandbox execution timeout: {str(e)}", "exit_code": -1}
+```
+
+---
+
+## 2. 特殊な可観測性: 推論チェーンのトレース
+
+CPU使用率やHTTP 500エラー率を監視しても、エージェントが幻覚を起こしているか、推論の罠にはまっているかについては何もわかりません。
+
+プラットフォームチームは、プロンプト入力、取得されたコンテキストチャンク、ツール呼び出し引数、トークン使用量、レイテンシなど、すべてのステップをトレースする**OpenTelemetry GenAI Semantic Conventions**でエージェントを計測する必要があります。
+
+```python
+from opentelemetry import trace
+
+tracer = trace.get_tracer("ai.platform.agent", "1.0.0")
+
+def execute_agent_step(agent_id: str, step_index: int, prompt: str, model: str):
+    with tracer.start_as_current_span(f"agent.step.{step_index}") as span:
+        span.set_attribute("gen_ai.system", "anthropic")
+        span.set_attribute("gen_ai.request.model", model)
+        span.set_attribute("agent.id", agent_id)
+        span.set_attribute("agent.step_index", step_index)
+        
+        # Scrub PII before attaching to trace span
+        sanitized_prompt = scrub_pii(prompt)
+        span.set_attribute("gen_ai.prompt", sanitized_prompt)
+
+        response = call_llm_with_tools(prompt)
+        
+        # Capture usage metrics for real-time cost attribution
+        span.set_attribute("gen_ai.usage.prompt_tokens", response.usage.prompt_tokens)
+        span.set_attribute("gen_ai.usage.completion_tokens", response.usage.completion_tokens)
+        span.set_attribute("agent.tools_called", [t.name for t in response.tool_calls])
+        
+        return response
+```
+
+これらのトレースをOpenTelemetryコレクター（JaegerまたはSigNozによってバックアップされている）にエクスポートすることで、プラットフォームオペレーターは即座に以下のクエリを実行できます。
+- *どのツールの失敗率が最も高いか？*
+- *解決されたJiraチケットあたりの平均トークンコストはいくらか？*
+- *エージェントループが同一の引数を繰り返したのはどこか？*
+
+---
+
+## 3. トークン予算とサーキットブレーカー
+
+無限ループに陥った暴走エージェントは、組織の月間OpenAIまたはAnthropic APIクォータを1時間以内に使い果たしてしまう可能性があります。
+
+プラットフォームエンジニアリングは、ゲートウェイレベルで**多層サーキットブレーカー**を実装する必要があります。
+
+```python
+# Redis-Backed Sliding Window Token Circuit Breaker
+import redis
+
+r = redis.Redis.from_url(os.getenv("REDIS_URL"))
+
+def check_token_quota(tenant_id: str, requested_tokens: int, max_hourly_budget: int = 250_000):
+    key = f"quota:tokens:{tenant_id}"
+    current_spent = r.incrby(key, requested_tokens)
+    
+    # Set 1-hour expiration on initial spend
+    if current_spent == requested_tokens:
+        r.expire(key, 3600)
+        
+    if current_spent > max_hourly_budget:
+        # Trip the circuit breaker
+        raise Exception(f"Hourly token quota exceeded for tenant {tenant_id}. Execution halted.")
+```
+
+さらに、エージェントは以下を強制する必要があります。
+1. **最大イテレーション制限**: タスクあたりの推論ステップを15～20に厳しく制限する。
+2. **繰り返し検出**: エージェントがまったく同じツールをまったく同じ引数で2回連続して実行した場合、即座に実行を停止し、ヒューマン・イン・ザ・ループ介入をトリガーする。
+
+---
+
+## よくある質問
+
+### エージェントをKubernetesコンテナで直接実行すべきではないのはなぜですか？
+標準のKubernetesコンテナはホストのLinuxカーネルを共有します。エージェントが悪意のあるエクスプロイトを含むLLMによって生成されたコードを実行したり、内部コンテナネットワークをプローブしようとしたりすると、コンテナから脱出したり、内部クラスターサービスを侵害したりする可能性があります。Firecracker MicroVMのようなサンドボックスは、ハードウェアレベルの仮想化を提供し、各エージェントの実行を完全に分離します。
+
+### ワーカーの再起動時に長時間実行されるエージェントの状態をどのように処理しますか？
+PostgreSQLの追記専用ログを使用したイベント駆動型チェックポイントを使用します。各推論ステップまたはツール実行後、エージェントはその状態ベクトルとメモリ履歴をデータベースにコミットします。Kubernetesワーカーポッドがプリエンプトされた場合、新しいポッドは、最後の検証済みチェックポイントから直接エージェントのワークフローを再開し、進行状況を失うことはありません。
+
+### 複数の同時エージェント間でLLMのレート制限を処理する最善の方法は何ですか？
+モデルプロバイダーの前に内部AIゲートウェイ（LiteLLMやPortkeyなど）をデプロイします。ゲートウェイは分散トークンバケットを管理し、複数のプロバイダーAPIキー間でリクエストをロードバランスし、HTTP 429レート制限応答に遭遇した場合は自動的にセカンダリモデルまたはクラウドリージョンにフォールバックします。
+
+---
+
+## こちらもおすすめ
+
+- [Platform Engineering: Building Golden Paths for Developers](/en/blog/platform-engineering-golden-paths)
+- [Kubernetes Operators: Building Custom Controllers with the Operator SDK](/en/blog/kubernetes-2026-08-06)
+- [Kubernetes Operators and custom resources](/en/blog/kubernetes-operators)
+- [Building Kubernetes Operators in Go: Managing Stateful Applications](/en/blog/kubernetes-operators-golang)

@@ -1,0 +1,406 @@
+---
+title: "k6とGrafanaによる分散負荷テストとパフォーマンスプロファイリング"
+date: '2026-07-29'
+tags: ["testing", "grafana", "performance", "prometheus"]
+draft: false
+summary: "トラフィックスパイクに見舞われるまでAPIは高速だと思っていましたが、本番環境がクラッシュする前にボトルネックを見つけるため、k6、Grafana、Prometheusを使って分散負荷テストをセットアップした方法をご紹介します。"
+images: ['/static/images/k6-grafana-distributed-load-testing-featured.jpg']
+authors: ['default']
+category: Tech
+---
+
+
+以前は、`curl`を叩いたり、ラップトップから基本的な負荷スクリプトを実行したりしてAPIをテストしていました。すべて問題ないように見えましたが、大規模なマーケティングキャンペーンを実施した途端、データベースがすぐにダウンしてしまいました。
+
+ユーザーがシステムの限界に気づく*前に*、その限界を見つけることが重要です。そこで私はk6、Grafana、Prometheusに移行しました。このスタックは、JavaScriptで分散テストをスクリプト化し、リアルタイムのレイテンシメトリクスをストリーミングし、50,000人の同時仮想ユーザーを投入したときにサーバーがどこでボトルネックになっているかを実際に確認できる、開発者にとって使いやすい方法を提供します。
+
+<AudioPlayer src="/static/audio/k6-grafana-distributed-load-testing.mp3" title="Executive Audio Briefing" />
+
+## ローカルの負荷スクリプトでは不十分な理由
+
+単一のマシンからロードジェネレーターを実行している場合、バックエンドサーバーに負荷をかける前に、自身のローカルネットワークやCPUがボトルネックになることがよくあります。最新のマイクロサービスをテストする場合、複数のワーカーノードに仮想ユーザーの負荷を分散させる必要があります。
+
+![Distributed Load Testing Architecture](/static/images/k6-grafana-distributed-load-testing-distributed-architecture.jpg)
+
+k6はGoで構築されており、組み込みのJavaScript V8エンジンを使用しているため、私はk6が大好きです。メモリフットプリントが非常に小さいのです。仮想ユーザーごとに重いOSスレッドを生成する古いJavaベースのツールとは異なり、k6はゴルーチンを使用します。単一の4-vCPUインスタンスで、毎秒30,000以上のリクエストを快適に生成できます。
+
+```javascript
+// Example: Basic k6 load testing script with custom thresholds and checks
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+export const options = {
+  stages: [
+    { duration: '30s', target: 50 },  // Ramp-up to 50 Virtual Users
+    { duration: '1m', target: 200 },  // Stay at 200 VUs for peak load test
+    { duration: '30s', target: 0 },   // Ramp-down to 0 VUs
+  ],
+  thresholds: {
+    http_req_duration: ['p(95)<250', 'p(99)<500'], // 95% of requests must complete under 250ms
+    http_req_failed: ['rate<0.01'],                 // Error rate must remain under 1%
+  },
+};
+
+export default function () {
+  const res = http.get('https://api.example.com/v1/catalog');
+  
+  check(res, {
+    'status is 200': (r) => r.status === 200,
+    'response body contains catalog': (r) => r.body.includes('products'),
+  });
+
+  sleep(1); // Simulating realistic user think-time between requests
+}
+```
+
+このゴルーチンアーキテクチャを理解することで、k6が従来のGUIロードジェネレーターと比較して優れた計算効率を提供する理由が説明できます。ただし、ターゲットスループットが毎秒100,000リクエストを超える場合、複数のワーカーノードにネットワークソケット生成を分散させるために、Kubernetes上の`k6-operator`を使用した分散負荷生成が必須になります。
+
+```yaml
+# Kubernetes Spec: Distributed load test using k6-operator Custom Resource
+apiVersion: k6.io/v1alpha1
+kind: K6
+metadata:
+  name: distributed-black-friday-test
+  namespace: load-testing
+spec:
+  parallelism: 4 # Spawns 4 parallel worker pods running k6
+  script:
+    configMap:
+      name: k6-test-scripts
+      file: load-test.js
+  arguments: --tag testid=black-friday-sim
+  runner:
+    resources:
+      limits:
+        cpu: "2"
+        memory: "2Gi"
+      requests:
+        cpu: "1"
+        memory: "1Gi"
+```
+
+`k6-operator`は、ランナーポッドのライフサイクルを自動的に管理し、実行イテレーション範囲を分割し、シナリオログを集約し、リアルタイムのパフォーマンステレメトリを中央監視システムにストリーミングします。
+
+標準のHTTP APIに加えて、最新のリアルタイムアプリケーションはWebSocketやgRPCプロトコルでも通信します。k6は、プロトコルバッファを使用したgRPCサービスのテストや、双方向WebSocketストリームのテストをネイティブにサポートしています。この汎用性により、エンジニアリングチームは、統一されたスクリプトAPI内で、リアルタイムチャットサーバー、ストリーミングプッシュ通知、高頻度取引プラットフォームの負荷テストを行うことができます。
+
+```javascript
+// Example: Testing gRPC endpoints under load using k6/net/grpc
+import grpc from 'k6/net/grpc';
+import { check, sleep } from 'k6';
+
+const client = new grpc.Client();
+client.load(['definitions'], 'user_service.proto');
+
+export const options = {
+  vus: 50,
+  duration: '1m',
+};
+
+export default function () {
+  client.connect('grpc.example.com:443', { plaintext: false });
+
+  const response = client.invoke('user.UserService/GetUserProfile', { userId: 101 });
+  check(response, {
+    'status is OK': (r) => r && r.status === grpc.StatusOK,
+  });
+
+  client.close();
+  sleep(1);
+}
+```
+
+## しきい値とチェックを含むカスタムk6シナリオをスクリプト化する方法
+
+高度なk6パフォーマンス テストをスクリプト化するには、現実的なユーザー行動、トラフィックの急増、APIワークフローシーケンスをモデル化したカスタム実行シナリオを定義する必要があります。k6の`scenarios`を使用すると、開発者は単一のテスト実行内で異なるトラフィックパターンを組み合わせることができます。
+
+![Scenarios and Threshold Configs](/static/images/k6-grafana-distributed-load-testing-scenarios-thresholds.jpg)
+
+k6は、`ramping-arrival-rate`、`constant-vus`、`per-vu-iterations`を含むいくつかのシナリオ実行モデルをサポートしています。`ramping-arrival-rate`エグゼキューターは特に価値があります。これは、ターゲットサーバーの応答がどれほど遅くなっても、毎秒固定のリクエストレートを維持し、ターゲットのレイテンシースパイクがロードジェネレーターを人為的にスロットリングするのを防ぐためです。
+
+```javascript
+// Advanced multi-scenario k6 load test script
+import http from 'k6/http';
+import { check, group, sleep } from 'k6';
+import { Rate, Trend } from 'k6/metrics';
+
+// Custom Prometheus metrics registered in k6
+const checkoutErrorRate = new Rate('checkout_failure_rate');
+const DBProcessingTrend = new Trend('db_query_duration_ms');
+
+export const options = {
+  scenarios: {
+    constant_browsing: {
+      executor: 'constant-vus',
+      vus: 100,
+      duration: '3m',
+    },
+    checkout_spike: {
+      executor: 'ramping-arrival-rate',
+      startRate: 10,
+      timeUnit: '1s',
+      preAllocatedVUs: 50,
+      maxVUs: 300,
+      stages: [
+        { duration: '1m', target: 50 },  // 50 checkouts/sec
+        { duration: '2m', target: 200 }, // Spike to 200 checkouts/sec
+      ],
+    },
+  },
+  thresholds: {
+    'checkout_failure_rate': ['rate<0.005'], // Checkout errors must stay under 0.5%
+    'http_req_duration{scenario:checkout_spike}': ['p(95)<400'],
+  },
+};
+
+export default function () {
+  group('Browsing Catalog', function () {
+    const res = http.get('https://api.example.com/v1/products');
+    check(res, { 'catalog status 200': (r) => r.status === 200 });
+  });
+
+  group('Executing Checkout', function () {
+    const payload = JSON.stringify({ cartId: 'cart_9912', paymentToken: 'tok_test' });
+    const params = { headers: { 'Content-Type': 'application/json' } };
+    
+    const res = http.post('https://api.example.com/v1/checkout', payload, params);
+    const success = check(res, { 'checkout success': (r) => r.status === 201 });
+    
+    checkoutErrorRate.add(!success);
+    if (res.headers['X-DB-Duration']) {
+      DBProcessingTrend.add(parseFloat(res.headers['X-DB-Duration']));
+    }
+  });
+
+  sleep(2);
+}
+```
+
+`Rate`や`Trend`のようなカスタムメトリクスを登録することで、開発者は標準のHTTPリクエスト期間に加えて、ビジネスドメインのパフォーマンス指標をキャプチャできます。メトリクスにシナリオ識別子をタグ付けすることで、Grafanaダッシュボードは、簡単なカタログ閲覧のレイテンシーからチェックアウトトランザクションのレイテンシーを分離できます。
+
+| シナリオエグゼキューター | 主要な制御メカニズム | 理想的なテストユースケース |
+| --- | --- | --- |
+| `constant-vus` | 固定数の仮想ユーザー | ベースライン容量テスト |
+| `ramping-vus` | 時間とともに変化するVU数 | 標準的なストレステストとソークテスト |
+| `constant-arrival-rate` | 毎秒固定のリクエスト数 | オープンモデルAPIスループットテスト |
+| `ramping-arrival-rate` | 時間とともに変化するRPSレート | トラフィックスパイクとブラックフライデーのシミュレーション |
+
+到着レートエグゼキューターを使用すると、バックエンドの応答時間が遅くなっても、テストランナーがリクエスト生成を停止することはありません。このオープンモデルテストアプローチは、現実世界のユーザーのトラフィック急増を正確にシミュレートします。
+
+```javascript
+// Parameterizing test dataset inputs using SharedArray in k6
+import { SharedArray } from 'k6/data';
+
+const userCredentials = new SharedArray('user credentials pool', function () {
+  // SharedArray parses heavy JSON fixtures once into shared V8 memory
+  return JSON.parse(open('data/users.json'));
+});
+
+export default function () {
+  const user = userCredentials[Math.floor(Math.random() * userCredentials.length)];
+  const res = http.post('https://api.example.com/v1/login', JSON.stringify(user), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+  check(res, { 'login ok': (r) => r.status === 200 });
+}
+```
+
+## k6メトリクスをPrometheusとGrafanaにストリーミングする方法
+
+k6からPrometheusとGrafanaにリアルタイムのパフォーマンステレメトリをストリーミングすることで、ロードテストがアクティブに実行されている間、サーバーの動作に関する即座の視覚的洞察が得られます。k6はネイティブのRemote Writeプロトコルをサポートしており、外部のサイドカーコレクターエージェントを必要とせずに、メトリクスサンプルをPrometheusまたはVictoriaMetricsエンドポイントに直接エクスポートします。
+
+![Prometheus Grafana Metrics Pipeline](/static/images/k6-grafana-distributed-load-testing-prometheus-grafana.jpg)
+
+k6 Prometheus出力エンジンを設定するには、テスト実行中にコマンドラインフラグを渡すか、環境変数を設定する必要があります。k6は、メトリクスを標準のPrometheusゲージ、カウンター、サマリーデータ型としてフォーマットします。
+
+```bash
+# Executing k6 test with direct Prometheus Remote Write output integration
+K6_PROMETHEUS_REMOTE_URL="http://prometheus.monitoring.svc:9090/api/v1/write" \
+K6_PROMETHEUS_FLUSH_INTERVAL="2s" \
+k6 run \
+  -o experimental-prometheus-rw \
+  --tag test_run_id="build-4091" \
+  load-test.js
+```
+
+k6がメトリクスシリーズをPrometheusにストリーミングすると、GrafanaダッシュボードはPromQLクエリを実行して、リクエストスループット、エラーレート、パーセンタイルレイテンシを、CPU使用率、メモリRSS、データベース接続プール飽和度などのサーバーインフラストラクチャメトリクスと並行してプロットできます。
+
+```promql
+# PromQL Query Examples for Grafana Dashboard Panels
+
+# 1. Real-time Requests Per Second (RPS) by HTTP Status Code
+sum(rate(k6_http_reqs_total[30s])) by (status)
+
+# 2. 95th Percentile Response Latency in Milliseconds by Endpoint Path
+histogram_quantile(0.95, sum(rate(k6_http_req_duration_bucket[1m])) by (le, expected_response, url))
+
+# 3. Virtual User (VU) Active Worker Count Over Time
+k6_vus_active
+
+# 4. Custom Error Rate Percentage
+(sum(rate(k6_checkout_failure_rate_total{result="true"}[1m])) / sum(rate(k6_checkout_failure_rate_total[1m]))) * 100
+```
+
+Grafanaでk6クライアント側の応答レイテンシとKubernetesポッドのCPUスロットリングメトリクスを関連付けることで、正確なシステムボトルネックを簡単に診断できます。データベース接続プールキューの深さと同時に95パーセンタイルのリクエストレイテンシが急増した場合、開発者はWebサーバーのCPU制限ではなく、データベースのロックが根本原因であると特定できます。
+
+```json
+// Grafana Panel JSON Snippet: 95th Percentile Latency Alert Rule
+{
+  "title": "95th Percentile API Latency Alert",
+  "type": "timeseries",
+  "targets": [
+    {
+      "expr": "histogram_quantile(0.95, sum(rate(k6_http_req_duration_bucket[1m])) by (le))",
+      "legendFormat": "p95 latency (ms)"
+    }
+  ],
+  "fieldConfig": {
+    "defaults": {
+      "thresholds": {
+        "mode": "absolute",
+        "steps": [
+          { "color": "green", "value": null },
+          { "color": "yellow", "value": 250 },
+          { "color": "red", "value": 500 }
+        ]
+      }
+    }
+  }
+}
+```
+
+自動化されたGrafanaアラートを設定すると、CIパイプラインの実行中にロードテストのレイテンシがSLA制限を超えた場合に、即座にSlackまたはPagerDuty通知がトリガーされます。
+
+## 高並行性下でのレイテンシボトルネックをプロファイリングする方法
+
+高仮想ユーザー並行性下でのレイテンシボトルネックをプロファイリングするには、k6メトリクス出力と並行してサーバー側の実行トレースを分析する必要があります。ロードテストで99パーセンタイルで予期しないテールレイテンシースパイクが明らかになった場合、開発者はボトルネックがデータベースクエリロック、CPUスレッドの枯渇、またはガベージコレクションの一時停止に起因するかどうかを特定する必要があります。
+
+![Latency Profiling and Diagnostics](/static/images/k6-grafana-distributed-load-testing-latency-profiling.jpg)
+
+分散トレーシングヘッダー伝播は、k6テストイテレーションをOpenTelemetry、Jaeger、Grafana Tempoなどのバックエンドアプリケーション追跡ツールに接続します。k6 HTTPリクエストにW3C Trace Contextヘッダー（`traceparent`）を挿入することで、開発者は複雑なマイクロサービス呼び出しチェーンを通じて個々の遅いk6リクエストを追跡できます。
+
+```javascript
+// k6 script injecting OpenTelemetry Trace Context headers for request tracing
+import http from 'k6/http';
+import { check } from 'k6';
+import crypto from 'k6/crypto';
+
+function generateTraceparent() {
+  const version = '00';
+  const traceId = crypto.hexDigest('sha256', `${Math.random()}`).substring(0, 32);
+  const parentId = crypto.hexDigest('sha256', `${Math.random()}`).substring(0, 16);
+  const flags = '01'; // Sampled flag enabled
+  return `${version}-${traceId}-${parentId}-${flags}`;
+}
+
+export default function () {
+  const params = {
+    headers: {
+      'Content-Type': 'application/json',
+      'traceparent': generateTraceparent(), // Propagate trace header to backend
+    },
+  };
+
+  const res = http.get('https://api.example.com/v1/orders/recent', params);
+  check(res, { 'status is 200': (r) => r.status === 200 });
+}
+```
+
+負荷がかかったGoまたはNode.jsマイクロサービスをプロファイリングする場合、継続的なpprofプロファイリングは、ピーク負荷間隔中にV8ヒープ割り当てとCPUフレームグラフをキャプチャします。ベースライン負荷でキャプチャされたpprof CPUプロファイルと200 VU負荷でキャプチャされたプロファイルを比較することで、CPUサイクルを消費している正確な関数が強調表示されます。
+
+```bash
+# Executing Go pprof CPU profile during k6 load test run
+go tool pprof -http=:8081 http://backend-service:6060/debug/pprof/profile?seconds=30
+```
+
+500 VU実行で収集された経験的なロードテストデータをプロファイリングした結果、マイクロサービスアーキテクチャにおけるレイテンシ劣化の主な原因は、インデックス化されていないデータベースJOINクエリ、過剰なJSONシリアル化オーバーヘッド、非同期イベントループにおけるスレッドプール枯渇の3つであることが明らかになりました。これら3つの問題を修正することで、同じトラフィック負荷下で99パーセンタイルの応答レイテンシが1,200ミリ秒から85ミリ秒に短縮されました。
+
+```typescript
+// Example: Node.js Express server middleware tracking internal execution stages
+import { Request, Response, NextFunction } from 'express';
+
+export function performanceHeaderMiddleware(req: Request, res: Response, next: NextFunction) {
+  const start = process.hrtime();
+  
+  res.on('finish', () => {
+    const diff = process.hrtime(start);
+    const timeInMs = (diff[0] * 1e3 + diff[1] * 1e-6).toFixed(2);
+    // Expose internal server processing time in header for k6 analysis
+    res.setHeader('X-Server-Execution-Time', `${timeInMs}ms`);
+  });
+  
+  next();
+}
+```
+
+## チームは継続的デプロイでロードテストを自動化すべきか？
+
+継続的デプロイパイプライン内でパフォーマンステストを自動化することで、パフォーマンス回帰コミットが本番環境に到達するのを防ぎます。すべてのプルリクエストで自動化されたk6スモークテストを実行し、毎晩完全な回帰ロードテストを実行することで、ソフトウェアリリースに対するパフォーマンス安全ゲートを確立します。
+
+k6をGitHub ActionsまたはGitLab CIに統合するには、ヘッドレスk6 CLIステップを実行し、定義されたしきい値基準に基づいて終了コードを評価します。SLAしきい値（95パーセンタイルレイテンシが300ミリ秒を超えるなど）が失敗した場合、k6はコード99で終了し、CIパイプラインビルドを自動的に失敗させます。
+
+```yaml
+# GitHub Actions workflow executing automated k6 performance regression gate
+name: Performance Testing Gate
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  k6-load-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull k6 Docker Image
+        run: docker pull grafana/k6:latest
+
+      - name: Run k6 Load Test
+        run: |
+          docker run --rm \
+            -v $(pwd):/ci \
+            -w /ci \
+            grafana/k6:latest run \
+            --thresholds "http_req_duration=p(95)<300" \
+            e2e/load-tests/smoke-test.js
+```
+
+自動化されたパフォーマンスゲートを確立することは、チームのエンジニアリング文化を変革します。大規模なプロモーションイベント中にスケーリングのバグを発見するのではなく、機能開発のプルリクエストレビュー中にパフォーマンスの回帰が表面化され、解決されます。
+
+k6ロードテストとGrafanaダッシュボード、Prometheusアラートを組み合わせることで、包括的なパフォーマンスエンジニアリングツールキットが提供されます。現実的なトラフィックシナリオをスクリプト化し、リアルタイムのテレメトリをストリーミングし、CIでしきい値ゲートを自動化することで、チームは最新のWebアプリケーションを完全に自信を持ってスケーリングできます。
+
+ステージング環境に対して自動化されたロードテストを定期的に実行することで、容量管理に関する組織の筋肉記憶が構築されます。インフラエンジニアとソフトウェア開発者は統一されたパフォーマンスメトリクスを共有し、システムが高トラフィック要求下でも回復力を維持できるようにします。
+
+アプリケーションリポジトリ内に機能コードとともに自動化されたロードテストスクリプトを維持することで、テストシナリオがAPIエンドポイントと同期して進化することが保証されます。チームは、データに基づいたパフォーマンス検証により、データベースのインデックス作成を安全に最適化し、キャッシュ構成を更新し、マイクロサービスインターフェースをリファクタリングできます。
+
+6〜12時間実行されるスケジュールされたソークテストを確立することで、3分間の短いロードテストでは見逃されるような、微妙なメモリリーク、接続プールリーク、未クローズのファイルディスクリプタハンドルが表面化します。夜間ビルド環境でソークテストを自動化することで、詳細なシステム健全性保証が提供されます。
+
+インシデント後のレビューでパフォーマンステストレポートを使用することで、インフラストラクチャチームと開発チーム間の透明性が生まれます。インフラストラクチャ移行前後のスループットベースラインを文書化することで、アーキテクチャ変更がエンドユーザーに真のパフォーマンス向上をもたらすことが保証されます。
+
+連続するリリースバージョン間でパフォーマンステレメトリを評価することで、エンジニアリングリーダーは、本番環境でシステム制限が破られる前に、段階的なパフォーマンス劣化を特定できます。
+
+## こちらもおすすめ
+
+- [Microservices Contract Testing with Pact & Node.js](/en/blog/contract-testing-pact-nodejs-microservices)
+- [Playwright E2E Testing: 4 Rules for Zero Flaky Tests](/en/blog/getting-started-with-playwright-for-e2e-testing)
+- [Best Playwright Alternatives for Enterprise Automation](/en/blog/best-playwright-alternatives)
+- [Playwright vs Selenium for Enterprise Browser Automation](/en/blog/playwright-vs-selenium-enterprise-guide)
+
+## よくある質問
+
+### Grafana k6とは何ですか？また、なぜ負荷テストに使用されるのですか？
+Grafana k6は、JavaScriptテストスクリプトでGoで書かれた、開発者中心のオープンソース負荷テストツールです。高性能と低リソース消費のために設計されており、開発者は最小限のハードウェアで数千の同時仮想ユーザーをシミュレートしながら、REST、GraphQL、およびWebSocket APIをテストできます。
+
+### k6はリアルタイムメトリクスをGrafanaにどのようにストリーミングしますか？
+k6は、Prometheus Remote Write出力エクスポーター（`-o experimental-prometheus-rw`）を使用して、テレメトリをPrometheusまたはGrafana Mimirに直接ストリーミングします。Prometheusはメトリクスを保存し、Grafanaダッシュボードがリアルタイムのリクエストスループット、エラーレート、パーセンタイルレイテンシをプロットできるようにします。
+
+### k6におけるVUと到着レートの違いは何ですか？
+仮想ユーザー（VUs）は、ユーザーセッションをシミュレートする同時実行スレッドを表します。到着レート（`ramping-arrival-rate`）は、サーバーの応答時間に関係なく、毎秒固定数のHTTPリクエストを指定し、バックエンドの応答が遅いためにロードジェネレーターのスループットが低下するのを防ぎます。
+
+### k6のしきい値はCIビルドの失敗ゲートをどのように自動化しますか？
+k6の`thresholds`は、パフォーマンスの合格/不合格ルール（`p(95)<250ms`や`http_req_failed<1%`など）を定義します。実行中にいずれかのしきい値が破られた場合、k6はコード99で終了し、GitHub ActionsやGitLab CIなどのCIツールにビルドを自動的に失敗させるよう通知します。
+
+### k6テストは複数のマシンに分散できますか？
+はい、k6テストは`k6-operator`を使用してKubernetesクラスター全体に分散できます。オペレーターは並列ワーカーランナーポッドを起動し、負荷イテレーションを自動的に分割し、パフォーマンステレメトリを中央のPrometheusおよびGrafanaインスタンスに集約します。
+
+### カスタム認証トークンをk6スクリプトに渡すにはどうすればよいですか？
+カスタム認証トークンは、環境変数（`__ENV.AUTH_TOKEN`）を介してk6スクリプトに渡すか、メインの仮想ユーザーシナリオ関数が実行される前に`http.post()`認証呼び出しを使用してスクリプト内で動的に生成できます。

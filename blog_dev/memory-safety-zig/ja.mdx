@@ -1,0 +1,117 @@
+---
+title: "Zigにおけるメモリ安全性"
+date: 2026-08-27
+summary: "borrowcheckerやガーベージコレクタなしでZigのメモリ安全性を探求：手動アロケーション戦略、GPAトラッキング、comptime保証について解説します。"
+tags: ["tech", "zig", "memory"]
+images: ["/static/images/memory-safety-zig.png"]
+draft: false
+---
+
+
+現代のシステムプログラミングにおけるメモリ安全性を開発者が議論する際、話題はほぼ例外なくRustとその有名なボローチェッカー（borrow checker）に向かいます。Rustは、use-after-freeやdouble-freeといったメモリエラーのクラス全体を排除するコンパイル時保証を提供します。しかし、比較的新しく、急速に成熟しているシステムプログラミング言語であるZigは、メモリ安全性を達成するために根本的に異なるアプローチを取っています。複雑な型システムと厳格なコンパイル時のエイリアシング（aliasing）ルールに依存するのではなく、Zigは明示的なアロケーション、ランタイムインストゥルメンテーション、そして開発者による制御を重視しています。この記事では、Zigにおけるメモリ安全性の技術的なニュアンスを探り、他のシステム言語との対比、そして言語機能とツールの組み合わせを通じていかに堅牢な安全性保証を達成しているかを検証します。
+
+<AudioPlayer src="/static/audio/memory-safety-zig.mp3" title="Executive Audio Briefing" />
+
+## 明示的なメモリ管理の哲学
+
+Zigの核となる哲学は、隠れた制御フローも隠れたメモリ割り当ても存在しないというものです。CやC++では、標準ライブラリ関数が舞台裏で`malloc`を使って暗黙的にメモリを割り当てることがよくありますが、Zigでは、メモリを割り当てる必要があるすべての関数に、プログラマがアロケーターを明示的に渡す必要があります。
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    // We explicitly create an allocator
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The allocator is passed as an argument
+    var list = std.ArrayList(i32).init(allocator);
+    defer list.deinit();
+
+    try list.append(42);
+}
+```
+
+この明示性により、開発者は割り当てられたすべてのオブジェクトのライフサイクルについて考えることを余儀なくされ、異なるユースケースに合わせてアロケーターを簡単に交換できるようになります。メモリ安全性の観点から見ると、これはメモリ使用が局所化され、透過的であることを意味し、不明瞭なライブラリの動作によって引き起こされるリークや管理ミスが発生する可能性を低減します。
+
+## 空間的メモリ安全性：境界チェックとポインタ
+
+空間的メモリ安全性とは、プログラムが割り当てられたオブジェクトの境界外のメモリにアクセスしないことを保証することです。C言語では、配列の境界チェックは事実上存在せず、悪名高いバッファオーバーフローの脆弱性につながります。Zigは、堅牢な境界チェックとより繊細なポインタシステムを通じてこれに対処します。
+
+Zigでは、配列とスライスは本質的にその長さを知っています。スライスの要素にアクセスすると、Zigは境界チェックを実行します。`Debug`および`ReleaseSafe`ビルドモードでは、範囲外のインデックスにアクセスすると、未定義の動作（UB）ではなく、決定論的に処理されるパニックが発生します。
+
+```zig
+const array = [_]i32{ 1, 2, 3 };
+// This will panic at runtime in Safe modes:
+// const out_of_bounds = array[5]; 
+```
+
+さらに、Zigは単一アイテムポインタ（`*T`）、複数アイテムポインタ（`[*]T`）、およびスライス（`[]T`）を区別します。単一アイテムポインタはポインタ演算には使用できません。メモリを反復処理する必要がある場合は、長さ情報を含み、境界チェックされた操作を可能にするスライスを使用する必要があります。この設計上の選択により、CやC++における空間的メモリ違反の主要な原因である誤ったポインタ演算の可能性が厳しく制限されます。
+
+## 時間的メモリ安全性：GeneralPurposeAllocator
+
+時間的メモリ安全性とは、メモリが解放された後にアクセスされないこと（use-after-free）と、メモリが複数回解放されないこと（double-free）を保証することです。Rustはライフタイムを追跡することでコンパイル時にこれを解決します。Zigは、主に`GeneralPurposeAllocator`（GPA）を介したランタイムインストゥルメンテーションに依存しています。
+
+ZigのGPAは、OSからメモリを要求するためのメカニズムであるだけでなく、強力なデバッグツールでもあります。`Debug`モードで実行すると、GPAはすべての割り当てと解放を追跡します。初期化解除時にメモリリークを検出でき、そして決定的に、use-after-freeエラーを検出できます。
+
+メモリが解放されると、GPAはそのメモリ領域をポイズン（汚染）することができます。その後、ダングリングポインタが逆参照された場合、ポイズンされたメモリは、データを静かに破損させたり、任意のコード実行を許可したりするのではなく、ハードクラッシュまたは検出可能な障害を引き起こします。この「フェイルファスト（fail-fast）」動作は、開発サイクル中にメモリバグを特定するために不可欠です。
+
+```zig
+test "use after free detection" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    const ptr = try allocator.create(i32);
+    ptr.* = 100;
+    
+    // Free the memory
+    allocator.destroy(ptr);
+
+    // This use-after-free will trigger a crash in Debug mode
+    // ptr.* = 200; 
+}
+```
+
+## `defer`と`errdefer`の役割
+
+Zigにおけるリソース管理は、`defer`と`errdefer`ステートメントに大きく依存しています。これらの構成要素は、C++のRAIIに似ていますが、暗黙的な破棄セマンティクスなしに、コードブロックがどのように終了するかにかかわらず、クリーンアップコードが実行されることを保証します。
+
+`defer`ステートメントは、現在のスコープの終わりに実行されるコードをスケジュールします。これは通常、メモリの解放やリソースの解放（例：ファイルハンドルのクローズ）に使用されます。
+
+`errdefer`ステートメントは、エラー処理においてさらに強力です。これは、現在のブロックがエラーで終了した場合にのみクリーンアップコードを実行するようにスケジュールします。これは、複数の割り当てを必要とする複雑なオブジェクトを構築する際に非常に貴重です。後続の割り当てが失敗した場合、`errdefer`は部分的に構築されたオブジェクトをきれいに破棄し、エラーパスでのメモリリークを防ぐことができます。
+
+```zig
+pub fn createComplexObject(allocator: std.mem.Allocator) !*ComplexObject {
+    const obj = try allocator.create(ComplexObject);
+    errdefer allocator.destroy(obj);
+
+    obj.buffer1 = try allocator.alloc(u8, 1024);
+    errdefer allocator.free(obj.buffer1);
+
+    // If this fails, buffer1 and obj will be cleanly freed
+    obj.buffer2 = try allocator.alloc(u8, 2048);
+
+    return obj;
+}
+```
+
+この構造化されたリソース管理アプローチは、開発者の認知負荷を大幅に軽減し、複雑なエラー処理ロジックによって引き起こされる時間的メモリエラーのリスクを最小限に抑えます。
+
+## トレードオフと今後の展望
+
+Zigのメモリ安全性へのアプローチは、開発者が`defer`を正しく使用し、`Debug`または`ReleaseSafe`モードでコードを徹底的にテストするという規律に大きく依存しています。Rustのボローチェッカーが提供するような、厳密で数学的に証明可能な保証を提供するものではありません。意図的または不注意な開発者は、`ReleaseFast`ビルド（パフォーマンスのために安全チェックが無効になっている）に忍び込む可能性のあるuse-after-freeバグをZigで記述する可能性があります。
+
+しかし、このトレードオフには明確な利点があります。Zigの学習曲線はRustよりも浅いと言えるでしょう。開発者はボローチェッカーと格闘する必要がないからです。安全なRustで実装するのが非常に難しいデータ構造（二重リンクリストやグラフなど）も、Zigでは簡単に実装できます。
+
+さらに、Zigの明示的なアロケーターは、高度なメモリ管理技術への道を開きます。例えば、アリーナアロケーターは、特定のタスクのために大量のメモリを割り当て、アリーナを破棄することで一度にすべてを解放し、個別の`destroy`や`free`呼び出しの必要性を完全に回避します。これにより、個々のオブジェクトが明示的に解放されることがないため、アリーナのコンテキスト内での時間的メモリエラーが排除されます。
+
+結論として、Zigはメモリ安全性に対して実用的で非常に効果的なアプローチを提供します。明示的な割り当て、デバッグビルドにおける強力なランタイムチェック、スライスによる堅牢な空間的安全性、そして`defer`を介したクリーンなリソース管理を組み合わせることで、Zigは開発者が制御を犠牲にしたり、厳しいコンパイル時の制約に対処したりすることなく、安全で高性能なシステムコードを記述できるようにします。これは、システムプログラミング言語の進化における魅力的な代替手段を表しています。
+
+## こちらもおすすめ
+
+- [Compiling C Programs with Make: What I Wish I Knew](/en/blog/compiling-c-programs-with-make-a-step-by)
+- [Unwritten Rules of Terminal Programs](/en/blog/unwritten-rules-of-terminal-programs)
+- [Why pipes sometimes get "stuck": buffering](/en/blog/why-pipes-sometimes-get-stuck-buffering)
+- [SSH and SCP: The Two Tools Every Developer Should Actually Understand](/en/blog/ssh-scp)

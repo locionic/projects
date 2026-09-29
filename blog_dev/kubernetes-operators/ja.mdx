@@ -1,0 +1,365 @@
+---
+title: "Kubernetes OperatorsとCustom Resources: あらゆるものを自動化する"
+date: "2026-09-13"
+lastmod: "2026-09-22"
+summary: "KubernetesのコントロールプレーンをOperatorとCustom Resource Definition (CRD) で拡張し、複雑なステートフルアプリケーションのライフサイクル管理を自動化する方法を学び、reconciliationループ、RBAC、テスト、本番環境パターンについて解説します。"
+tags: ["kubernetes", "operators", "devops", "cloud-native", "golang"]
+images: ["/static/images/kubernetes-operators.png"]
+draft: false
+---
+
+Kubernetesはステートレスなアプリケーションの管理に優れています。ステートレスなPodが停止しても、ReplicaSetが新しいPodを起動するため、人間の介入は不要です。しかし、データベース、メッセージキュー、分散キャッシュのような複雑なステートフルなアプリケーションを管理するには、Kubernetesがデフォルトでは持たない**ドメイン固有の運用知識**が必要です。
+
+そこで登場するのがOperatorパターンです。
+
+<AudioPlayer src="/static/audio/kubernetes-operators.mp3" title="Executive Audio Briefing" />
+
+## Kubernetes Operatorとは？
+
+Kubernetes Operatorは、Kubernetesアプリケーションをパッケージ化、デプロイ、管理するための手法です。Postgresクラスターのバックアップ方法、ダウンタイムなしでKafkaをアップグレードする方法、レプリカのフェイルオーバーを処理する方法といった人間の運用知識を、Kubernetesコントロールプレーン内でネイティブに実行されるソフトウェアにエンコードします。
+
+運用面から見ると、Operatorは1つ以上の**カスタムリソース**を監視し、変更に反応する単なる**コントローラー**です。クラスター内で標準のPodとして実行され、他のコンポーネントと同様にKubernetes APIサーバーと通信します。
+
+この概念は2016年にCoreOSによって導入され、以来、基本的なパターンとなっています。現在、[OperatorHub.io](https://operatorhub.io/)には、cert-managerからPrometheus、CockroachDBまで、あらゆるものに対応する何百ものコミュニティおよびベンダーのOperatorがリストされています。
+
+## カスタムリソース定義（CRD）
+
+Operatorは、Kubernetes APIサーフェスを拡張するために**カスタムリソース定義**（CRD）に依存しています。CRDは、クラスターに新しいリソースタイプを登録します。`Pods`、`Deployments`、`Services`だけを管理するのではなく、`PostgresCluster`、`KafkaTopic`、`RedisFailover`のような全く新しいリソースタイプを定義できます。
+
+以下は、最小限のCRD定義です。
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: postgresclusters.db.example.com
+spec:
+  group: db.example.com
+  scope: Namespaced
+  names:
+    plural: postgresclusters
+    singular: postgrescluster
+    kind: PostgresCluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                replicas:
+                  type: integer
+                  minimum: 1
+                version:
+                  type: string
+```
+
+このCRDが適用されると、ユーザーは標準の`kubectl`コマンドを使用して`PostgresCluster`オブジェクトを作成できます。
+
+```yaml
+apiVersion: db.example.com/v1alpha1
+kind: PostgresCluster
+metadata:
+  name: my-db
+  namespace: production
+spec:
+  replicas: 3
+  version: "16.2"
+```
+
+Operatorはこれらのオブジェクトを監視し、PVCのプロビジョニング、Postgres Podの起動、レプリケーションの設定、および完全なライフサイクルの管理といったアクションを実行します。
+
+## 調停ループ
+
+すべてのKubernetes Operatorの核となるのは、**調停ループ**（コントロールループまたはリコンサイラーとも呼ばれます）です。このループはシンプルなパターンに従います。
+
+1.  **監視** — カスタムリソース（またはPodやConfigMapなどの関連リソース）の変更を監視します。
+2.  **差分検出** — *望ましい状態*（CR仕様で宣言されたもの）と*現在の状態*（実際に実行されているもの）を比較します。
+3.  **実行** — 現在の状態を望ましい状態に収束させるために必要な最小限のアクションを実行します。
+4.  **繰り返し** — ループは冪等であり、関連する変更があった場合、または定期的な再同期後に再度実行されます。
+
+これは、Kubernetes自体が組み込みコントローラー（Deploymentコントローラー、ReplicaSetコントローラーなど）で内部的に使用しているのと同じループです。Operatorは、カスタムリソースのためにこのループに新しいエントリを追加しているだけです。
+
+```go
+func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    log := log.FromContext(ctx)
+
+    // 1. Fetch the PostgresCluster resource
+    var cluster dbv1.PostgresCluster
+    if err := r.Get(ctx, req.NamespacedName, &cluster); err != nil {
+        if errors.IsNotFound(err) {
+            // Resource was deleted — clean up external resources
+            return ctrl.Result{}, nil
+        }
+        return ctrl.Result{}, err
+    }
+
+    // 2. Reconcile StatefulSet
+    if err := r.reconcileStatefulSet(ctx, &cluster); err != nil {
+        log.Error(err, "Failed to reconcile StatefulSet")
+        return ctrl.Result{RequeueAfter: time.Second * 30}, err
+    }
+
+    // 3. Reconcile Service
+    if err := r.reconcileService(ctx, &cluster); err != nil {
+        log.Error(err, "Failed to reconcile Service")
+        return ctrl.Result{RequeueAfter: time.Second * 30}, err
+    }
+
+    // 4. Update status
+    cluster.Status.ReadyReplicas = r.countReadyReplicas(ctx, &cluster)
+    if err := r.Status().Update(ctx, &cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
+}
+```
+
+上記のリコンサイラーの重要なポイント：
+- リソースが見つからない場合（削除された場合）は、エラーなしで**`ctrl.Result{}`を返します**。
+- 失敗せずに次の調停をスケジュールするには、**`ctrl.Result{RequeueAfter: ...}`を返します**。
+- 実際に実行されている状態を反映するために、**常にステータスサブリソースを更新します**。
+- リコンサイラーは**冪等**でなければなりません。10回連続で呼び出しても、1回呼び出した場合と同じ結果になる必要があります。
+
+## Operatorの構築：Operator SDK vs controller-runtime
+
+Operatorを構築するには、主に2つのアプローチがあります。
+
+### 1. Operator SDK（ほとんどの場合に推奨）
+
+[Operator SDK](https://sdk.operatorframework.io/)は、Operatorのスキャフォールディング、コード生成、ライフサイクル管理を提供します。3つの構築アプローチをサポートしています。
+
+-   **Go** — 完全な制御、最高のパフォーマンス、本番環境のOperatorの標準です。
+-   **Helm** — 既存のHelmチャートをOperatorにラップします。シンプルなアプリケーションに適しています。
+-   **Ansible** — Ansibleプレイブックを調停ロジックとして使用します。運用重視のチームに適しています。
+
+新しいGo Operatorを初期化します。
+
+```bash
+operator-sdk init --domain=example.com --repo=github.com/example/postgres-operator
+operator-sdk create api --group=db --version=v1alpha1 --kind=PostgresCluster --resource --controller
+```
+
+これにより、以下がスキャフォールディングされます。
+- `api/v1alpha1/postgrescluster_types.go` — CRD Goタイプ
+- `controllers/postgrescluster_controller.go` — リコンサイラー
+- `config/crd/` — 生成されたCRD YAML
+- `config/rbac/` — 生成されたRBACルール
+
+### 2. controller-runtimeを直接使用する
+
+最大限の制御が必要な場合は、SDKのスキャフォールディングなしで[controller-runtime](https://github.com/kubernetes-sigs/controller-runtime)を直接使用できます。これはOperator SDKが内部で使用しているものです。
+
+```go
+mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+    Scheme: scheme,
+    Metrics: server.Options{BindAddress: ":8080"},
+    HealthProbeBindAddress: ":8081",
+    LeaderElection: true,
+    LeaderElectionID: "postgres-operator.example.com",
+})
+
+if err := (&controllers.PostgresClusterReconciler{
+    Client: mgr.GetClient(),
+    Scheme: mgr.GetScheme(),
+}).SetupWithManager(mgr); err != nil {
+    setupLog.Error(err, "unable to create controller")
+    os.Exit(1)
+}
+```
+
+**リーダー選出**（`LeaderElection: true`）は本番環境で非常に重要です。これにより、Operatorのレプリカのうち1つだけが常にアクティブに調停を行い、スプリットブレインシナリオを防ぎます。
+
+## RBACとセキュリティ
+
+Operatorは、リソースを監視および変更するためにRBACパーミッションを必要とします。Operator SDKはこれらを自動的に生成しますが、それらが何を許可するのかを理解しておく必要があります。
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: postgres-operator-role
+rules:
+  # Watch and manage PostgresCluster CRs
+  - apiGroups: ["db.example.com"]
+    resources: ["postgresclusters", "postgresclusters/status", "postgresclusters/finalizers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Manage underlying resources
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps", "secrets", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read Pod status for health checks
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+```
+
+**最小権限の原則**: Operatorが実際に必要とする動詞とリソースのみを許可します。`cluster-admin`バインディングは避けてください。
+
+## ファイナライザー：リソース削除時のクリーンアップ
+
+ユーザーが`PostgresCluster` CRを削除すると、KubernetesはetcdからCRを削除しますが、クラウドストレージバケット、ロードバランサー、外部DNSレコードなどの外部リソースは自動的にクリーンアップされません。
+
+**ファイナライザー**がこれを解決します。これらはリソースの`metadata.finalizers`フィールドにある文字列マーカーです。Kubernetesは、すべてのファイナライザーが削除されるまで、リソースを永続的に削除しません。
+
+```go
+const finalizerName = "db.example.com/cleanup"
+
+func (r *PostgresClusterReconciler) handleFinalizer(ctx context.Context, cluster *dbv1.PostgresCluster) error {
+    if cluster.DeletionTimestamp.IsZero() {
+        // Resource is NOT being deleted — ensure finalizer is registered
+        if !controllerutil.ContainsFinalizer(cluster, finalizerName) {
+            controllerutil.AddFinalizer(cluster, finalizerName)
+            return r.Update(ctx, cluster)
+        }
+    } else {
+        // Resource IS being deleted — run cleanup
+        if controllerutil.ContainsFinalizer(cluster, finalizerName) {
+            if err := r.cleanupExternalResources(ctx, cluster); err != nil {
+                return err
+            }
+            // Remove finalizer — allows Kubernetes to complete deletion
+            controllerutil.RemoveFinalizer(cluster, finalizerName)
+            return r.Update(ctx, cluster)
+        }
+    }
+    return nil
+}
+```
+
+OperatorがKubernetesクラスター外にリソース（S3バケット、Route53レコード、Datadogモニターなど）を作成する場合は、常にファイナライザーを実装してください。
+
+## ステータス条件：Operatorの状態の伝達
+
+不透明なステータスフィールドを使用するのではなく、Kubernetesの慣例である**ステータス条件**（構造化された機械可読なステータスメッセージ）に従ってください。
+
+```go
+meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+    Type:               "Ready",
+    Status:             metav1.ConditionTrue,
+    ObservedGeneration: cluster.Generation,
+    Reason:             "ReconciliationSucceeded",
+    Message:            fmt.Sprintf("PostgresCluster with %d replicas is ready", cluster.Spec.Replicas),
+})
+```
+
+これにより、オペレーター（人間）が素早くスキャンできる`kubectl describe`出力が生成されます。
+
+```
+Conditions:
+  Type    Status  Reason                    Message
+  ----    ------  ------                    -------
+  Ready   True    ReconciliationSucceeded   PostgresCluster with 3 replicas is ready
+```
+
+## Operatorのテスト
+
+### リコンサイラーの単体テスト
+
+ライブクラスターなしで調停ロジックをテストするには、`controller-runtime`の`fake.NewClientBuilder()`を使用します。
+
+```go
+func TestReconcile_CreatesStatefulSet(t *testing.T) {
+    cluster := &dbv1.PostgresCluster{
+        ObjectMeta: metav1.ObjectMeta{Name: "test-db", Namespace: "default"},
+        Spec:       dbv1.PostgresClusterSpec{Replicas: 3, Version: "16.2"},
+    }
+
+    r := &PostgresClusterReconciler{
+        Client: fake.NewClientBuilder().
+            WithScheme(scheme).
+            WithObjects(cluster).
+            Build(),
+        Scheme: scheme,
+    }
+
+    result, err := r.Reconcile(context.Background(), ctrl.Request{
+        NamespacedName: types.NamespacedName{Name: "test-db", Namespace: "default"},
+    })
+
+    assert.NoError(t, err)
+    assert.Equal(t, time.Minute*5, result.RequeueAfter)
+
+    // Verify StatefulSet was created
+    var sts appsv1.StatefulSet
+    err = r.Get(context.Background(), types.NamespacedName{Name: "test-db", Namespace: "default"}, &sts)
+    assert.NoError(t, err)
+    assert.Equal(t, int32(3), *sts.Spec.Replicas)
+}
+```
+
+### envtestによる統合テスト
+
+`envtest`パッケージは、実際のAPIサーバーとetcdをローカルで実行し、完全な調停フローをテストできるようにします。
+
+```go
+var testEnv *envtest.Environment
+
+func TestMain(m *testing.M) {
+    testEnv = &envtest.Environment{
+        CRDDirectoryPaths: []string{filepath.Join("..", "config", "crd", "bases")},
+    }
+    cfg, _ := testEnv.Start()
+    // ... setup manager and run tests
+    testEnv.Stop()
+}
+```
+
+## 本番デプロイメントチェックリスト
+
+Operatorを本番環境に投入する前に：
+
+- [ ] **リーダー選出が有効になっている** — マルチレプリカデプロイメントでのスプリットブレインを防ぎます
+- [ ] **ヘルスプローブが設定されている** — `/healthz`の活性、`/readyz`の準備
+- [ ] **メトリクスが公開されている** — `/metrics`でのPrometheusメトリクス（controller-runtimeが自動的に行います）
+- [ ] **ファイナライザーが実装されている** — 外部リソースのクリーンアップ用
+- [ ] **ステータス条件** — 構造化された機械可読なステータスフィールド
+- [ ] **RBAC最小権限** — `cluster-admin`なし、ワイルドカード動詞なし
+- [ ] **CRD検証** — 必須フィールドとデフォルト値を含むOpenAPI v3スキーマ
+- [ ] **レート制限** — APIサーバーのフラッディングを防ぐためにコントローラーで`RateLimiter`を設定します
+- [ ] **`envtest`統合テスト**が合格している
+- [ ] **OLMバンドル** — OperatorHub経由で配布する場合
+
+## 参考にすべき実世界のOperator
+
+| Operator | 管理対象 | 参考にすべき理由 |
+|---|---|---|
+| [Prometheus Operator](https://github.com/prometheus-operator/prometheus-operator) | Prometheus + Alertmanager | 優れたCRD設計、ステータスパターン |
+| [Cert-Manager](https://github.com/cert-manager/cert-manager) | TLS証明書 | 複雑なファイナライザーパターン、ACME統合 |
+| [Strimzi](https://strimzi.io/) | Kubernetes上のApache Kafka | 完全なステートフルライフサイクル管理 |
+| [CloudNativePG](https://cloudnative-pg.io/) | PostgreSQLクラスター | 本番グレードのPostgres Operator |
+
+## よくある質問
+
+**Operatorを書くべきか、それともHelmを使うべきか？**
+Helmはシンプルでステートレスなデプロイメントに最適です。アプリケーションに継続的に実行する必要がある運用ロジック（フェイルオーバーの決定、スキーマ移行、バックアップのスケジュール設定、クラスターのスケーリングポリシーなど）がある場合は、Operatorを使用してください。cronジョブや人間の管理が必要な場合は、Operatorの候補です。
+
+**GoなしでOperatorを書けますか？**
+はい。Operator SDKはバックエンド言語としてHelmとAnsibleをサポートしています。Pythonの場合、[kopf](https://kopf.readthedocs.io/)が人気のあるフレームワークです。ただし、Goは最高のパフォーマンス、ツール、そしてKubernetesエコシステム全体との整合性を提供します。
+
+**1つのOperatorでいくつのCRDを管理すべきですか？**
+焦点を絞ってください。特定のデータベースなど、明確に定義された1つのドメインを管理するOperatorは、すべてを管理するGod-Operatorよりも保守とテストが容易です。ここでは[単一責任の原則](https://en.wikipedia.org/wiki/Single-responsibility_principle)が適用されます。
+
+**Operatorとコントローラーの違いは何ですか？**
+技術的には、すべてのOperatorはコントローラーですが、すべてのコントローラーがOperatorではありません。「Operator」という用語は、特定のアプリケーションに関する**運用ドメイン知識**をエンコードするコントローラーを特に指します。汎用インフラストラクチャを管理するコントローラーは、通常、単にコントローラーと呼ばれます。
+
+## まとめ
+
+Kubernetes Operatorは、クラスターをコンテナスケジューラーから、複雑なワークロードのための完全に自己修復するプラットフォームへと変革します。このパターンは、シンプルなHelmベースのOperatorから、データベースのフェイルオーバー、証明書のローテーション、マルチクラスターレプリケーションを自動的に管理する洗練されたGoコントローラーまで、幅広く適用できます。
+
+ステートフルなアプリケーションの10以上のインスタンスを管理し、人間の運用作業がボトルネックになるとき、Operatorへの投資は報われます。その規模では、クラスター内で24時間365日実行されるエンコードされた運用知識は、ランブックやオンコールエンジニアよりもはるかに信頼性が高くなります。
+
+## こちらもおすすめです
+
+- [Building Kubernetes Operators in Go: Managing Stateful Applications](/en/blog/kubernetes-operators-golang)
+- [Kubernetes Custom Resource Definitions](/en/blog/kubernetes-custom-resources)
+- [Kubernetes Cost Optimization Strategies in 2026](/en/blog/k8s-cost-optimization)
+- [GitOps with Flux: Declarative Infrastructure for Kubernetes](/en/blog/devops-2026-08-07)

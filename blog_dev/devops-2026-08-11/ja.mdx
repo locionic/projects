@@ -1,0 +1,199 @@
+---
+title: "Kubernetesにおける高度なCI/CD: Blue-GreenデプロイメントとCanaryリリース"
+date: "2026-08-11"
+summary: "標準的なRollingUpdatesを超えて、ArgoRollouts、Istioトラフィックルーティング、Prometheus自動分析、即時ロールバックを活用し、Blue-GreenおよびCanaryデプロイメントパターンを習得しましょう。"
+tags: ["devops", "kubernetes", "ci-cd", "canary", "deployments", "argo-rollouts"]
+draft: false
+images: ['/static/images/devops-2026-08-11.png']
+---
+
+Kubernetesのデフォルトのデプロイ戦略である`RollingUpdate`は、小規模なサービスには十分ですが、ミッションクリティカルな本番システムには危険です。
+
+1.  **無制限の爆発半径（Unbounded Blast Radius）:** 新しいコンテナイメージに微妙なランタイムパニックやメモリリークが含まれている場合、`RollingUpdate`は健全なPodを徐々に100%置き換え、すべてのインスタンスが劣化してしまいます。
+2.  **メトリクス駆動のロールバックなし（No Metric-Driven Rollbacks）:** Kubernetesはコンテナの稼働状況/生存状況を示すHTTPプローブしかチェックしません。APIが空のJSONペイロードでHTTP 200を返したり、リクエストの3%で内部500エラーをスローしたりしても、KubernetesはPodを「健全」とみなし、ロールアウトを続行します。
+3.  **プレビュー検証なし（No Preview Validation）:** ライブユーザーのトラフィックをルーティングする前に、本番環境で新しいバージョンに対して健全性テストやスモークテストを実行することはできません。
+
+これを解決するために、先進的なエンジニアリングチームは**ブルー/グリーンデプロイメント**または**自動メトリクス分析によるカナリアリリース**を使用しています。
+
+---
+
+<AudioPlayer src="/static/audio/devops-2026-08-11.mp3" title="役員向け音声ブリーフィング" />
+
+## 1. RollingUpdate vs Blue-Green vs Canary
+
+| ディメンション | RollingUpdate (デフォルト) | ブルー/グリーンデプロイメント | カナリアリリース |
+|---|---|---|---|
+| **トラフィックシフト** | Podの段階的な置き換え | 0%から100%への即時切り替え | 段階的 (例: 5% $\to$ 20% $\to$ 100%) |
+| **爆発半径** | 時間をかけてユーザーの100% | 即座にユーザーの100% | 小規模なサンプルに限定 (例: 5%) |
+| **リソースオーバーヘッド** | 最大25%のサージ容量 | +100% (2倍のフルクラスター/レプリカ) | +10%～20%のカナリアPod |
+| **ロールバック速度** | 遅い (RollingUpdateの逆) | 即時 (ルーターをBlueに瞬時に戻す) | 即時 (カナリアトラフィックを0%にドロップ) |
+| **メトリクスゲート** | 基本的なLiveness/Readinessプローブ | 手動またはスクリプトによるスモークテスト | 自動化されたPrometheus/Datadogクエリ |
+
+---
+
+## 2. ブルー/グリーンデプロイメント: 即時切り替えパターン
+
+ブルー/グリーンでは、2つの同一の環境が同時に存在します。
+*   **Blue (アクティブ):** 本番トラフィックの100%を処理します。
+*   **Green (プレビュー):** 新しいバージョンをデプロイします。社内開発者は`preview.example.com`に対してスモークテストを実行します。
+
+```
+                       User Ingress / Load Balancer
+                                     │
+                      [ Active Service Selector ]
+                                     │
+                     ┌───────────────┴───────────────┐
+                     ▼ (100% traffic)                ▼ (0% traffic)
+              [ Blue Pods v1.2 ]              [ Green Pods v1.3 ]
+```
+
+テストが成功すると、サービスセレクターは`version: v1.2`から`version: v1.3`に切り替わります。切り替え後に壊滅的な障害が発生した場合は、サービスセレクターをBlueに瞬時に戻します。
+
+### ブルー/グリーンの黄金律: データベースの拡張/縮小
+
+切り替え期間中、BlueとGreenが同時に稼働するため、データベースは**両方のバージョンを同時にサポートする**必要があります。
+
+```
+Step 1 (Expand): Add nullable column or new table. Deploy DB migration.
+Step 2 (Deploy): Green version uses new column, Blue version ignores it.
+Step 3 (Cutover): Route traffic to Green.
+Step 4 (Contract): Drop old deprecated columns after Blue is destroyed.
+```
+
+---
+
+## 3. Argo Rolloutsによるカナリアリリース: 段階的なトラフィックシフト
+
+[Argo Rollouts](https://argoproj.github.io/argo-rollouts/)は、標準のKubernetes `Deployment`オブジェクトを`Rollout`カスタムリソースに置き換え、自動化されたカナリアステップとPrometheusメトリクス分析を提供します。
+
+```
+Incoming Traffic ───► Ingress / Service Mesh (Istio / NGINX / ALB)
+                            │
+            ┌───────────────┴───────────────┐
+            ▼ (95% Live Traffic)            ▼ (5% Canary Traffic)
+     [ Stable Service ]              [ Canary Service ]
+            │                               │
+     [ Stable Pods v1 ]              [ Canary Pods v2 ]
+                                            │
+                                            ▼
+                                [ Prometheus Query Engine ]
+                           (Error rate < 0.5%, p99 latency < 200ms)
+                                     │              │
+                              [ PASS: +20% ]   [ FAIL: Abort & Rollback ]
+```
+
+### 完全な本番環境の`Rollout`マニフェスト
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: payments-api
+  namespace: production
+spec:
+  replicas: 10
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: payments-api
+  template:
+    metadata:
+      labels:
+        app: payments-api
+    spec:
+      containers:
+        - name: payments-api
+          image: ghcr.io/my-org/payments-api:v2.4.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+  strategy:
+    canary:
+      canaryService: payments-api-canary
+      stableService: payments-api-stable
+      trafficRouting:
+        nginx:
+          stableIngress: payments-api-ingress
+      steps:
+        # Step 1: Route 5% traffic to canary and pause 10 minutes
+        - setWeight: 5
+        - pause: { duration: 10m }
+        # Step 2: Run automated Prometheus analysis
+        - analysis:
+            templates:
+              - templateName: http-error-rate-check
+        # Step 3: Increase traffic to 20%
+        - setWeight: 20
+        - pause: { duration: 30m }
+        # Step 4: Increase traffic to 50%
+        - setWeight: 50
+        - pause: { duration: 15m }
+```
+
+---
+
+## 4. Prometheusによる自動メトリクス分析
+
+デプロイ中にオンコールエンジニアがGrafanaダッシュボードを監視する代わりに、サービスレベル目標（SLO）を自動的に評価するように`AnalysisTemplate`を設定します。
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: http-error-rate-check
+  namespace: production
+spec:
+  metrics:
+    - name: success-rate
+      interval: 1m
+      successCondition: result[0] >= 0.995 # Must maintain 99.5% success rate
+      failureLimit: 3                      # Abort after 3 consecutive failed probes
+      provider:
+        prometheus:
+          address: http://prometheus-k8s.monitoring:9090
+          query: |
+            sum(rate(http_requests_total{app="payments-api", status=~"2..|3.."}[2m]))
+            /
+            sum(rate(http_requests_total{app="payments-api"}[2m]))
+
+    - name: p99-latency
+      interval: 1m
+      successCondition: result[0] <= 0.250 # Latency must stay under 250ms
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus-k8s.monitoring:9090
+          query: |
+            histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{app="payments-api"}[2m])) by (le))
+```
+
+### カナリアが失敗した場合どうなるか？
+
+新しいイメージが5%のカナリアスライスで500エラーをスローした場合:
+1.  Prometheusクエリは`success-rate < 0.995`を返します。
+2.  Argo Rolloutsは3回連続のメトリクス障害を検出します。
+3.  **即時自動ロールバック:** カナリアサービス上のトラフィックウェイトは直ちに0%にリセットされます。
+4.  カナリアPodは終了されます。
+5.  ロールアウトステータスは`Degraded`に移行し、エンジニアリングチャネルにSlackアラートが発報されます。
+6.  ユーザーの95%は欠陥を経験しませんでした。
+
+---
+
+## 5. 実装チェックリストの要約
+
+1.  **拡張/縮小データベース移行を採用**し、スキーマクラッシュなしで古いコードバージョンと新しいコードバージョンの両方が同時に実行されるようにします。
+2.  カナリア分析ルールを作成する前に、**SLOを定量的に定義**します（p99レイテンシ < X ms、5xxエラー率 < Y%）。
+3.  **保守的なカナリアウェイトから開始**します: 5%を10分間 $\to$ 20%を30分間 $\to$ 100%。
+4.  既存のサービスメッシュ（Istio/Linkerd）またはIngress（NGINX/Traefik）と連携して、動的なヘッダーベースおよびウェイトベースのルーティングのために**Argo RolloutsまたはFlaggerを使用**します。
+
+---
+
+## こちらもおすすめ
+
+-   [GitOps with Flux: Declarative Infrastructure and CD for Kubernetes](/en/blog/devops-2026-08-07)
+-   [ArgoCD GitOps Multi-Cluster Deployment Patterns](/en/blog/argocd-gitops-multi-cluster-deployments)
+-   [High-Performance Observability with eBPF in Kubernetes](/en/blog/ebpf-kubernetes-observability)
+-   [Prometheus & Grafana Alerting: SLO Burn Rate Design](/en/blog/prometheus-grafana-alerting-burn-rate-design)

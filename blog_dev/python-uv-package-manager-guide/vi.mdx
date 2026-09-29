@@ -1,0 +1,227 @@
+---
+title: "Astral uv trong Docker: Build đa giai đoạn, BuildKit Caching & CI nhanh"
+date: "2026-09-18"
+summary: "Tăng tốc build Docker Python từ vài phút xuống vài giây bằng Astral uv, các target đa giai đoạn, BuildKit persistent cache mounts và các runtime image tinh gọn."
+tags: ["python", "docker", "devops", "performance", "cicd"]
+draft: false
+proficiencyLevel: "Intermediate"
+programmingLanguage: "Python"
+images: 
+  - "/static/images/python-uv-docker-multistage-build-featured.jpg"
+  - "/static/images/python-uv-docker-multistage-build-infographic.png"
+---
+
+Bất kỳ nhà phát triển nào xây dựng container Python đều đã trải qua vòng lặp phản hồi chậm chạp của việc vô hiệu hóa lớp Docker. Bạn thay đổi một dòng mã ứng dụng, chạy `docker build`, và nhìn terminal của mình mất bốn phút để tải lại PyTorch, Pandas, hoặc các tiện ích mở rộng C nặng từ PyPI.
+
+Với trình quản lý gói dựa trên Rust của Astral `uv` và bộ nhớ đệm Docker BuildKit, bạn có thể giảm thời gian xây dựng lại đó xuống dưới hai giây.
+
+**So sánh bản dựng nhanh:**
+
+<AudioPlayer src="/static/audio/python-uv-package-manager-guide.mp3" title="Tóm tắt âm thanh dành cho điều hành" />
+
+| Chiến lược | Thời gian xây dựng lạnh | Xây dựng lại chỉ mã | Kích thước ảnh cuối cùng | Bề mặt tấn công CVE |
+| :--- | :--- | :--- | :--- | :--- |
+| `pip install -r reqs.txt` | ~65s | ~45s (nếu bị vô hiệu hóa) | ~850MB | Cao (trình biên dịch được giữ lại) |
+| `poetry install` | ~110s | ~60s | ~920MB | Cao (thời gian chạy poetry được giữ lại) |
+| **uv Multi-Stage + BuildKit** | **~4.5s** | **~1.2s** | **~140MB** | **Tối thiểu (pure virtualenv)** |
+
+![Bản dựng Docker Python được tối ưu hóa với uv](/static/images/python-uv-docker-multistage-build-infographic.png)
+
+---
+
+## Ba lỗi của Dockerfile Python truyền thống
+
+Hầu hết các Dockerfile sản xuất đều mắc phải ba vấn đề về hiệu suất cấu trúc:
+
+1.  **Trình biên dịch vẫn còn trong ảnh cuối cùng:** Chạy `apt-get install gcc build-essential` bên trong một Dockerfile một giai đoạn sẽ để lại trình biên dịch, tệp tiêu đề và bộ nhớ đệm của trình quản lý gói bên trong container sản xuất, làm tăng kích thước ảnh lên hơn 1GB.
+2.  **Đánh tráo bộ nhớ đệm lớp:** Đặt `COPY . .` trước khi cài đặt các phụ thuộc sẽ vô hiệu hóa bộ nhớ đệm phụ thuộc trên mỗi commit.
+3.  **Không có bộ nhớ đệm wheel liên tục trong CI:** Chạy `docker build` trên các runner GitHub Actions mới sẽ tải lại mọi wheel từ PyPI trên mỗi yêu cầu kéo.
+
+Giải pháp là một quy trình đa giai đoạn sạch sẽ sử dụng tệp nhị phân `uv` độc lập chính thức và các gắn kết bộ nhớ đệm liên tục của BuildKit.
+
+---
+
+## Giai đoạn 1: Lấy tệp nhị phân uv độc lập
+
+Thay vì chạy `RUN pip install uv` (yêu cầu Python và thêm một lớp không cần thiết), hãy sao chép tệp nhị phân Rust đã được biên dịch sẵn trực tiếp từ ảnh chính thức của Astral:
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+FROM python:3.12-slim AS builder
+
+# Copy the standalone uv binary directly (sub-millisecond copy)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+```
+
+Điều này đảm bảo `uv` có sẵn ngay lập tức mà không có chi phí xây dựng.
+
+---
+
+## Giai đoạn 2: Đồng bộ hóa phụ thuộc hai bước
+
+Để ngăn các chỉnh sửa mã nguồn chạy lại quá trình tải xuống phụ thuộc, hãy chia quá trình cài đặt của bạn thành hai giai đoạn riêng biệt:
+
+```dockerfile
+WORKDIR /app
+
+# Enable bytecode compilation and standalone copy linking
+ENV UV_COMPILE_BYTECODE=1
+ENV UV_LINK_MODE=copy
+
+# Step A: Copy ONLY lockfiles first
+COPY pyproject.toml uv.lock ./
+
+# Step B: Install dependencies without installing the root project
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project
+```
+
+Lưu ý `--no-install-project`. Điều này yêu cầu `uv` xây dựng môi trường ảo và tải xuống tất cả các phụ thuộc của bên thứ ba mà chưa cần có mã nguồn ứng dụng của bạn.
+
+Bây giờ, sao chép mã nguồn của bạn và chạy đồng bộ hóa cuối cùng:
+
+```dockerfile
+# Step C: Copy application source code
+COPY src/ ./src/
+
+# Step D: Fast sync to install your project into the existing virtualenv
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+```
+
+Khi bạn chỉnh sửa `src/main.py`, Docker sẽ sử dụng lại lớp được lưu trong bộ nhớ đệm từ Bước B. Bước D thực thi trong vòng chưa đầy 300 mili giây vì tất cả các wheel đã có sẵn trong `.venv`.
+
+---
+
+## Giai đoạn 3: Runner sản xuất tinh gọn
+
+Giai đoạn xây dựng chứa `uv`, siêu dữ liệu gói và các công cụ xây dựng trung gian. Không có cái nào trong số này thuộc về môi trường sản xuất.
+
+Trong Giai đoạn 2, bắt đầu từ một cơ sở `python:3.12-slim` sạch, tạo một người dùng không phải root và chỉ sao chép thư mục `.venv`:
+
+```dockerfile
+FROM python:3.12-slim AS runner
+
+# Create non-root system user
+RUN groupadd -r appgroup && useradd -r -g appgroup appuser
+
+WORKDIR /app
+
+# Copy the pre-built virtual environment from builder
+COPY --from=builder --chown=appuser:appgroup /app/.venv /app/.venv
+COPY --from=builder --chown=appuser:appgroup /app/src /app/src
+
+# Put virtualenv binaries at the front of PATH
+ENV PATH="/app/.venv/bin:$PATH"
+
+USER appuser
+
+EXPOSE 8000
+
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+Vì `PATH` trỏ đến `/app/.venv/bin`, việc chạy `uvicorn` sẽ thực thi tệp nhị phân bên trong môi trường ảo của bạn trực tiếp mà không cần `python -m` hoặc các tập lệnh kích hoạt.
+
+Nếu bạn đang chọn một ngăn xếp ASGI để chạy bên trong container này, hãy xem so sánh hiệu suất của chúng tôi về [FastAPI vs Litestar: Performance & Memory](/en/blog/fastapi-vs-litestar-comparison). Để đảm bảo các worker bất đồng bộ của bạn vẫn ổn định mà không bị lỗi OOM dưới tải sản xuất, hãy kết hợp điều này với hướng dẫn của chúng tôi về [profiling async Python memory leaks in production](/en/blog/python-async-memory-leak-profiling).
+
+---
+
+## Dockerfile sản xuất hoàn chỉnh, sẵn sàng sao chép-dán
+
+Đây là Dockerfile đa giai đoạn hoàn chỉnh, đã được tăng cường sẵn sàng cho sản xuất:
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+# Stage 1: Build virtual environment
+FROM python:3.12-slim AS builder
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /app
+
+# Optimize uv execution inside containers
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
+# 1. Cache third-party dependencies independently of source code
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project
+
+# 2. Copy source code and perform final project sync
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+# Stage 2: Final minimal production runtime
+FROM python:3.12-slim AS runner
+
+RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
+
+WORKDIR /app
+
+# Copy only the compiled virtualenv and application source
+COPY --from=builder --chown=appuser:appuser /app/.venv /app/.venv
+COPY --from=builder --chown=appuser:appuser /app/src /app/src
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+USER appuser
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+---
+
+## Duy trì các gắn kết bộ nhớ đệm BuildKit trong GitHub Actions
+
+Trên các máy cục bộ, Docker BuildKit tự động lưu bộ nhớ đệm `/root/.cache/uv` giữa các bản dựng. Trên các runner GitHub Actions phù du, bộ nhớ đệm đó biến mất khi runner kết thúc.
+
+Để duy trì bộ nhớ đệm `uv` giữa các lần chạy CI, hãy cấu hình phần phụ trợ bộ nhớ đệm GitHub Actions của Docker (xem bài viết chuyên sâu của chúng tôi về [Docker BuildKit cache mounts and multi-stage optimization](/en/blog/docker-buildkit-cache-mount-optimization) để biết các loại bộ nhớ đệm từ xa và bộ xuất registry):
+
+```yaml
+name: Docker Build & Push
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+Bằng cách thêm `cache-to: type=gha,mode=max`, BuildKit xuất gắn kết `/root/.cache/uv` liên tục sang bộ nhớ đệm của GitHub. Các bản dựng PR tiếp theo sẽ kéo các wheel đã được lưu trong bộ nhớ đệm trực tiếp mà không cần chạm vào mạng.
+
+---
+
+## Quy tắc chung
+
+Nếu bản dựng Docker của bạn mất hơn năm giây để giải quyết các phụ thuộc trong quá trình phát triển ứng dụng thông thường, thì ranh giới lưu bộ nhớ đệm lớp của bạn đã được đặt quá sớm.
+
+Chỉ sao chép các tệp khóa, đồng bộ hóa với `--no-install-project`, gắn `/root/.cache/uv` và chỉ sao chép thư mục `.venv` vào runner cuối cùng của bạn.
+
+## Bạn cũng có thể thích
+
+- [FastAPI Docker Multistage Builds: Giảm kích thước ảnh của bạn 70%](/en/blog/fastapi-docker-multistage-build)
+- [Tại sao ảnh Docker của tôi là 1GB (Và cách tôi thu nhỏ chúng xuống 50MB)](/en/blog/docker-image-optimization)
+- [Docker Compose cho phát triển cục bộ: Hướng dẫn thiết lập hoàn chỉnh](/en/blog/docker-compose-local-development)
+- [Hướng dẫn Dev Containers: Môi trường Docker trong VS Code](/en/blog/devcontainers-for-consistent-environments)

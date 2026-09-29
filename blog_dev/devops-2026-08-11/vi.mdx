@@ -1,0 +1,199 @@
+---
+title: "CI/CD nâng cao: Triển khai Blue-Green và Canary trên Kubernetes"
+date: "2026-08-11"
+summary: "Vượt xa RollingUpdates tiêu chuẩn: nắm vững các mẫu triển khai Blue-Green và Canary với Argo Rollouts, định tuyến lưu lượng Istio, phân tích tự động Prometheus và rollback tức thì."
+tags: ["devops", "kubernetes", "ci-cd", "canary", "deployments", "argo-rollouts"]
+draft: false
+images: ['/static/images/devops-2026-08-11.png']
+---
+
+Chiến lược triển khai mặc định của Kubernetes, `RollingUpdate`, đủ dùng cho các dịch vụ nhỏ, nhưng lại nguy hiểm đối với các hệ thống sản xuất quan trọng:
+
+1. **Phạm vi ảnh hưởng không giới hạn:** Nếu một image container mới chứa lỗi panic runtime hoặc rò rỉ bộ nhớ tinh vi, `RollingUpdate` sẽ dần dần thay thế 100% các pod khỏe mạnh cho đến khi tất cả các instance bị suy giảm hiệu suất.
+2. **Không có khả năng rollback dựa trên số liệu:** Kubernetes chỉ kiểm tra các probe HTTP readiness/liveness của container. Nếu API của bạn trả về HTTP 200 với payload JSON rỗng hoặc ném lỗi 500 nội bộ trên 3% yêu cầu, Kubernetes vẫn coi pod là "khỏe mạnh" và tiếp tục triển khai.
+3. **Không có xác thực xem trước:** Bạn không thể chạy các bài kiểm tra sanity hoặc smoke test đối với phiên bản mới trong môi trường sản xuất trước khi chuyển lưu lượng người dùng thực đến đó.
+
+Để giải quyết vấn đề này, các đội ngũ kỹ thuật tiên tiến sử dụng **Triển khai Blue-Green** hoặc **Phát hành Canary với Phân tích số liệu tự động**.
+
+---
+
+<AudioPlayer src="/static/audio/devops-2026-08-11.mp3" title="Tóm tắt âm thanh dành cho điều hành" />
+
+## 1. RollingUpdate so với Blue-Green so với Canary
+
+| Khía cạnh | RollingUpdate (Mặc định) | Triển khai Blue-Green | Phát hành Canary |
+|---|---|---|---|
+| **Chuyển đổi lưu lượng** | Thay thế pod tăng dần | Chuyển đổi tức thì từ 0% sang 100% | Tăng dần (ví dụ: 5% $\to$ 20% $\to$ 100%) |
+| **Phạm vi ảnh hưởng** | 100% người dùng theo thời gian | 100% người dùng ngay lập tức | Cô lập với một mẫu nhỏ (ví dụ: 5%) |
+| **Chi phí tài nguyên** | +25% dung lượng tăng đột biến tối đa | +100% (2x cụm/bản sao đầy đủ) | +10%–20% pod canary |
+| **Tốc độ rollback** | Chậm (đảo ngược RollingUpdate) | Tức thì (chuyển router trở lại Blue) | Tức thì (giảm lưu lượng canary xuống 0%) |
+| **Cổng số liệu** | Probe Liveness/Readiness cơ bản | Smoke test thủ công hoặc theo kịch bản | Truy vấn Prometheus/Datadog tự động |
+
+---
+
+## 2. Triển khai Blue-Green: Mô hình chuyển đổi tức thì
+
+Trong Blue-Green, hai môi trường giống hệt nhau tồn tại đồng thời:
+* **Blue (Hoạt động):** Phục vụ 100% lưu lượng sản xuất.
+* **Green (Xem trước):** Triển khai phiên bản mới. Các nhà phát triển nội bộ chạy smoke test đối với `preview.example.com`.
+
+```
+                       User Ingress / Load Balancer
+                                     │
+                      [ Active Service Selector ]
+                                     │
+                     ┌───────────────┴───────────────┐
+                     ▼ (100% traffic)                ▼ (0% traffic)
+              [ Blue Pods v1.2 ]              [ Green Pods v1.3 ]
+```
+
+Khi các bài kiểm tra đạt, bộ chọn dịch vụ sẽ chuyển từ `version: v1.2` sang `version: v1.3`. Nếu xảy ra lỗi nghiêm trọng sau khi chuyển đổi, hãy chuyển bộ chọn dịch vụ trở lại Blue ngay lập tức.
+
+### Quy tắc vàng của Blue-Green: Mở rộng/Thu hẹp cơ sở dữ liệu
+
+Vì Blue và Green chạy đồng thời trong cửa sổ chuyển đổi, cơ sở dữ liệu của bạn **phải hỗ trợ cả hai phiên bản cùng một lúc**:
+
+```
+Step 1 (Expand): Add nullable column or new table. Deploy DB migration.
+Step 2 (Deploy): Green version uses new column, Blue version ignores it.
+Step 3 (Cutover): Route traffic to Green.
+Step 4 (Contract): Drop old deprecated columns after Blue is destroyed.
+```
+
+---
+
+## 3. Phát hành Canary với Argo Rollouts: Chuyển đổi lưu lượng tăng dần
+
+[Argo Rollouts](https://argoproj.github.io/argo-rollouts/) thay thế đối tượng `Deployment` Kubernetes tiêu chuẩn bằng một Custom Resource `Rollout`, cung cấp các bước Canary tự động và phân tích số liệu Prometheus.
+
+```
+Incoming Traffic ───► Ingress / Service Mesh (Istio / NGINX / ALB)
+                            │
+            ┌───────────────┴───────────────┐
+            ▼ (95% Live Traffic)            ▼ (5% Canary Traffic)
+     [ Stable Service ]              [ Canary Service ]
+            │                               │
+     [ Stable Pods v1 ]              [ Canary Pods v2 ]
+                                            │
+                                            ▼
+                                [ Prometheus Query Engine ]
+                           (Error rate < 0.5%, p99 latency < 200ms)
+                                     │              │
+                              [ PASS: +20% ]   [ FAIL: Abort & Rollback ]
+```
+
+### Manifest `Rollout` sản xuất hoàn chỉnh
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: payments-api
+  namespace: production
+spec:
+  replicas: 10
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: payments-api
+  template:
+    metadata:
+      labels:
+        app: payments-api
+    spec:
+      containers:
+        - name: payments-api
+          image: ghcr.io/my-org/payments-api:v2.4.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+  strategy:
+    canary:
+      canaryService: payments-api-canary
+      stableService: payments-api-stable
+      trafficRouting:
+        nginx:
+          stableIngress: payments-api-ingress
+      steps:
+        # Step 1: Route 5% traffic to canary and pause 10 minutes
+        - setWeight: 5
+        - pause: { duration: 10m }
+        # Step 2: Run automated Prometheus analysis
+        - analysis:
+            templates:
+              - templateName: http-error-rate-check
+        # Step 3: Increase traffic to 20%
+        - setWeight: 20
+        - pause: { duration: 30m }
+        # Step 4: Increase traffic to 50%
+        - setWeight: 50
+        - pause: { duration: 15m }
+```
+
+---
+
+## 4. Phân tích số liệu tự động với Prometheus
+
+Thay vì để các kỹ sư trực theo dõi bảng điều khiển Grafana trong quá trình triển khai, hãy cấu hình một `AnalysisTemplate` để tự động đánh giá Mục tiêu Mức độ Dịch vụ (SLO) của bạn:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: http-error-rate-check
+  namespace: production
+spec:
+  metrics:
+    - name: success-rate
+      interval: 1m
+      successCondition: result[0] >= 0.995 # Must maintain 99.5% success rate
+      failureLimit: 3                      # Abort after 3 consecutive failed probes
+      provider:
+        prometheus:
+          address: http://prometheus-k8s.monitoring:9090
+          query: |
+            sum(rate(http_requests_total{app="payments-api", status=~"2..|3.."}[2m]))
+            /
+            sum(rate(http_requests_total{app="payments-api"}[2m]))
+
+    - name: p99-latency
+      interval: 1m
+      successCondition: result[0] <= 0.250 # Latency must stay under 250ms
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus-k8s.monitoring:9090
+          query: |
+            histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{app="payments-api"}[2m])) by (le))
+```
+
+### Điều gì xảy ra khi Canary thất bại?
+
+Nếu image mới gây ra lỗi 500 trên 5% lát canary:
+1. Truy vấn Prometheus trả về `success-rate < 0.995`.
+2. Argo Rollouts phát hiện 3 lỗi số liệu liên tiếp.
+3. **Tự động Rollback tức thì:** Trọng số lưu lượng ngay lập tức được đặt lại về 0% trên dịch vụ canary.
+4. Các pod canary bị chấm dứt.
+5. Trạng thái Rollout chuyển sang `Degraded`, kích hoạt cảnh báo Slack đến kênh kỹ thuật.
+6. 95% người dùng không bao giờ gặp phải lỗi.
+
+---
+
+## 5. Danh sách kiểm tra triển khai tóm tắt
+
+1. **Áp dụng các di chuyển cơ sở dữ liệu Mở rộng/Thu hẹp** để cả phiên bản mã cũ và mới chạy đồng thời mà không gặp lỗi schema.
+2. **Xác định SLO một cách định lượng** (độ trễ p99 < X ms, tỷ lệ lỗi 5xx < Y%) trước khi viết các quy tắc phân tích Canary.
+3. **Bắt đầu với trọng số canary thận trọng:** 5% trong 10 phút $\to$ 20% trong 30 phút $\to$ 100%.
+4. **Sử dụng Argo Rollouts hoặc Flagger** với Service Mesh (Istio/Linkerd) hoặc Ingress (NGINX/Traefik) hiện có của bạn để định tuyến dựa trên tiêu đề và trọng số động.
+
+---
+
+## Bạn cũng có thể thích
+
+- [GitOps với Flux: Cơ sở hạ tầng khai báo và CD cho Kubernetes](/en/blog/devops-2026-08-07)
+- [Các mô hình triển khai đa cụm ArgoCD GitOps](/en/blog/argocd-gitops-multi-cluster-deployments)
+- [Khả năng quan sát hiệu suất cao với eBPF trong Kubernetes](/en/blog/ebpf-kubernetes-observability)
+- [Cảnh báo Prometheus & Grafana: Thiết kế tỷ lệ đốt SLO](/en/blog/prometheus-grafana-alerting-burn-rate-design)

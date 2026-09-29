@@ -1,0 +1,237 @@
+---
+title: "2026年におけるクラウドネイティブセキュリティの進化"
+date: "2026-09-18"
+lastUpdated: "2026-09-22"
+summary: "2026年のクラウドネイティブセキュリティは、TetragonによるeBPF runtime defense、自動化されたSLSAコンプライアンス、ゼロトラストのサービスメッシュmTLS、SPIFFE/SPIREワークロードID、in-toto attestationによるサプライチェーンの完全性で進化します。"
+tags: ["security", "cloud-native", "kubernetes", "devsecops"]
+images: ["/static/images/cloud-native-security.png"]
+draft: false
+---
+
+2026年、クラウドネイティブセキュリティは根本的なアーキテクチャの変革を遂げました。境界は消滅し、ワークロードは一時的（ephemeral）になり、クラスターは複数のクラウドにまたがっています。侵害されたコンテナの爆発半径（blast radius）は、多層防御（defense-in-depth）がなければ壊滅的なものになりかねません。従来のセキュリティパラダイム、すなわち静的なファイアウォールルール、VPNトンネル、境界検査は、動的なマイクロサービストポロジーをモデル化できません。
+
+この記事では、今日のクラウドネイティブセキュリティを定義する4つのアーキテクチャの柱について説明します。ワークロードアイデンティティ、サプライチェーンの整合性、ランタイムの振る舞い防御、そしてポリシーアズコードによる強制です。各セクションには、特定のツールを使った本番環境レベルの設定が含まれています。
+
+<AudioPlayer src="/static/audio/cloud-native-security.mp3" title="役員向け音声ブリーフィング" />
+
+## 柱1：SPIFFEとSPIREによるワークロードアイデンティティ
+
+最も根本的な変化は、ネットワークロケーションベースの信頼（IPアドレス、VLANセグメント）を**暗号化されたワークロードアイデンティティ**に置き換えることです。すべてのサービスは、どこにあるかではなく、自分が誰であるかを証明しなければなりません。
+
+**SPIFFE** (Secure Production Identity Framework for Everyone) は標準を提供します。すべてのワークロードは、URIとして表現されるSPIFFE IDを取得します: `spiffe://trust-domain/namespace/workload-name`。このアイデンティティは、SPIFFE Verifiable Identity Document (SVID) と呼ばれる短命のX.509証明書として提供され、**SPIRE** (the SPIFFE Runtime Environment) によって自動的にローテーションされます。
+
+```yaml
+# SPIRE agent ClusterSpiffeID registration via the SPIRE Kubernetes Workload Registrar
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSpiffeID
+metadata:
+  name: payment-service
+spec:
+  spiffeIDTemplate: "spiffe://prod.example.org/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodMeta.ServiceAccountName }}"
+  podSelector:
+    matchLabels:
+      app: payment-service
+  dnsNameTemplates:
+    - "payment-service.{{ .PodMeta.Namespace }}.svc.cluster.local"
+```
+
+SPIREがSVIDを発行すると、Envoyサイドカープロキシはそれらを使用して、すべてのサービスペア間で相互TLS (mTLS) を確立します。IstioとLinkerdはどちらもSPIFFE Workload APIを介してSPIREと統合されています。
+
+決定的な利点は、攻撃者がKubernetesノードを侵害し、ポッドネットワークにアクセスできたとしても、`payment-service`のSVIDを偽造して`order-service`から支払いデータを抜き出すことはできないということです。X.509証明書は、ワークロードのアイデンティティに暗号学的に結合されています。
+
+**SVIDのローテーション**は自動で設定可能です。高セキュリティのワークロードでは、短いTTLを設定します。
+
+```yaml
+# SPIRE Server configuration
+server:
+  default_svid_ttl: "1h"
+  ca_ttl: "24h"
+  ca_key_type: "ec-p384"
+```
+
+TTLが短いと、証明書が何らかの形で抜き取られた場合の露出期間が制限されます。
+
+## 柱2：ソフトウェアサプライチェーンの整合性
+
+SolarWindsとXZ Utilsへの攻撃は、ビルドパイプライン自体が攻撃対象であることを示しました。2026年には、サプライチェーンセキュリティは規制対象業界で必須となり、あらゆる場所でますます期待されています。
+
+### SLSA (Supply-chain Levels for Software Artifacts)
+
+SLSAレベル3では以下が求められます。
+1. **スクリプト化されたビルド** — 手動ビルドステップなし
+2. **ソースのバージョン管理** — 署名されたコミット
+3. **ビルドサービス** — 密閉された（hermetic）、隔離されたビルド環境（GitHub Actions、Google Cloud Build）
+4. **プロベナンス** — 何がどのようにビルドされたかを示す署名付き証明
+
+GitHub ActionsでSLSAプロベナンスを自動的に生成します。
+
+```yaml
+# .github/workflows/build.yml
+jobs:
+  build:
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build container image
+        run: |
+          docker build -t myapp:${{ github.sha }} .
+          docker push registry.example.com/myapp:${{ github.sha }}
+      
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: registry.example.com/myapp
+          subject-digest: sha256:${{ steps.build.outputs.digest }}
+          push-to-registry: true
+```
+
+### SBOMの生成と継続的な評価
+
+すべてのコンテナイメージは、SPDXまたはCycloneDX形式の署名付きSBOMを持つべきです。Syftがそれらを生成し、GrypeがNVDに対してリアルタイムで評価します。
+
+```bash
+# Generate SBOM attached to the image
+syft registry.example.com/myapp:latest \
+  -o spdx-json \
+  --file myapp-sbom.spdx.json
+
+# Evaluate against CVE databases
+grype sbom:myapp-sbom.spdx.json \
+  --fail-on critical \
+  --only-fixed
+```
+
+これをCIに必須のゲートとして統合します。デプロイ後にゼロデイが公開された場合、SBOMインベントリによって、どの実行中のワークロードが影響を受けるかがすぐにわかり、すべてをパニック的にパッチ適用するのではなく、的を絞った修正が可能になります。
+
+### in-totoサプライチェーン証明
+
+最高の保証を得るために、in-totoは開発者のコミットからコンテナイメージのプッシュまで、サプライチェーンのすべてのステップの暗号学的証拠を記録します。
+
+```python
+# in-toto link metadata for the "build" step
+import in_toto.runlib
+
+link = in_toto.runlib.in_toto_run(
+    name="build",
+    link_signing_key=signing_key,
+    material_paths=["src/", "requirements.txt"],
+    product_paths=["dist/app.tar.gz"],
+    run_command=["python", "setup.py", "build"]
+)
+link.dump("build.link")
+```
+
+`.link`ファイルの連鎖は、ソースから成果物までの法廷で認められる証拠の足跡を提供します。これは、開発者の署名キーなしでは、侵害されたCIシステムが偽造できないものです。
+
+## 柱3：eBPFによるランタイム防御
+
+予防策は必要ですが、それだけでは不十分です。ゼロデイ脆弱性や設定ミスのあるコンテナは、依然としてプロセスの侵害につながる可能性があります。ランタイムセキュリティは、振る舞い強制レイヤーを提供します。
+
+**eBPF** (extended Berkeley Packet Filter) は、Linuxカーネル内でサンドボックス化されたプログラムを実行し、アプリケーションコードを変更したりカーネルモジュールをロードしたりすることなく、システムコール、ファイルアクセス、ネットワーク接続に対するゼロオーバーヘッドの可視性を提供します。
+
+**Tetragon** (Cilium製) は、eBPFカーネルイベントを強制ポリシーに変換します。
+
+```yaml
+# Tetragon TracingPolicy: block shell execution from web service pods
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: prevent-shell-from-web
+spec:
+  kprobes:
+  - call: "sys_execve"
+    syscall: true
+    selectors:
+    - matchNamespaces:
+      - namespace: production
+        values: [web-service]
+      matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "/bin/sh"
+        - "/bin/bash"
+        - "/usr/bin/python3"
+        - "/usr/bin/curl"
+      matchActions:
+      - action: Sigkill
+        argName: comm
+```
+
+このポリシーは、`web-service`のプロダクションポッド内でシェルを`execve`しようとするプロセスをすべて強制終了します。これにより、基盤となるCVEが以前に知られていなかったとしても、RCEの試みを即座に封じ込めます。
+
+**Cilium Network Policy**は、レイヤー7 (HTTP/gRPC) のアクセス制御をカーネルレベルで強制します。
+
+```yaml
+apiVersion: cilium.io/v1
+kind: CiliumNetworkPolicy
+metadata:
+  name: payment-service-policy
+spec:
+  endpointSelector:
+    matchLabels:
+      app: payment-service
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: order-service
+    toPorts:
+    - ports:
+      - port: "8080"
+        protocol: TCP
+      rules:
+        http:
+        - method: "POST"
+          path: "/v1/charge"
+```
+
+`order-service`のみが`payment-service`上の`POST /v1/charge`を呼び出すことができます。侵害されたポッドからの内部横移動を含む他のすべてのトラフィックは、アプリケーションに到達する前にカーネルレベルでドロップされます。
+
+## 柱4：OPA Gatekeeperによるポリシーアズコード
+
+KubernetesのAdmission Controlは、デプロイ時にクラスター全体のセキュリティポリシーを強制します。OPA Gatekeeperは、すべてのAPIサーバーリクエストをRegoポリシーに対して評価します。
+
+```rego
+# Deny containers running as root
+package kubernetes.admission
+
+deny[msg] {
+  input.request.kind.kind == "Pod"
+  container := input.request.object.spec.containers[_]
+  not container.securityContext.runAsNonRoot == true
+  msg := sprintf("Container '%v' must not run as root. Set securityContext.runAsNonRoot: true", [container.name])
+}
+
+# Require read-only root filesystem
+deny[msg] {
+  input.request.kind.kind == "Pod"
+  container := input.request.object.spec.containers[_]
+  not container.securityContext.readOnlyRootFilesystem == true
+  msg := sprintf("Container '%v' must have a read-only root filesystem", [container.name])
+}
+```
+
+これらのポリシーは、スケジューラに到達する前に安全でないポッドのデプロイをブロックします。GitOps (Flux v2, ArgoCD) と組み合わせることで、クラスターの状態は完全にポリシーによってゲートされ、手動の`kubectl apply`がAdmission Controlを迂回することはできません。
+
+## 多層防御アーキテクチャ
+
+4つの柱は、一貫した多層防御モデルを構成します。
+
+| レイヤー | ツール | ブロックするもの |
+|---|---|---|
+| アイデンティティ | SPIFFE/SPIRE + mTLS | ネットワークスプーフィング、横移動 |
+| サプライチェーン | SLSA + SBOM + in-toto | 侵害されたビルド、悪意のある依存関係 |
+| ランタイム | Tetragon eBPF | RCE、シェル生成、データ抜き取り |
+| ポリシー | OPA Gatekeeper | 設定ミスのあるワークロード、権限昇格 |
+
+単一のレイヤーだけでは不十分です。アイデンティティをバイパスした攻撃者（盗まれたSVID）は、依然としてランタイムの振る舞い検出に遭遇します。SBOMチェックを通過した侵害されたビルドは、Admission時のOPAポリシー強制に直面します。
+
+## こちらもどうぞ
+
+- [AI生成コードの保護：2026年のShift-Left DevSecOps戦略](/en/blog/securing-ai-generated-code-shift-left)
+- [CI/CDパイプラインにおけるAIエージェントの未来](/en/blog/ai-agents-in-cicd-pipelines)
+- [AIのためのプラットフォームエンジニアリング：自律型エージェントのためのインフラストラクチャ設計](/en/blog/platform-engineering-for-ai-agents)
+- [プラットフォームエンジニアリング：開発者のためのゴールデンパスの構築](/en/blog/platform-engineering-golden-paths)

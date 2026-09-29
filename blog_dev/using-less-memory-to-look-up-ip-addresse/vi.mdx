@@ -1,0 +1,291 @@
+---
+draft: false
+title: "Giảm bộ nhớ khi tra cứu địa chỉ IP trong Mess With DNS"
+images: ['https://imgbed.locionic.com/file/1784441605215_using-less-memory-to-look-up-ip-addresse.jpg']
+date: '2024-10-27'
+lastUpdated: '2026-09-22'
+tags: ["networking", "go", "memory-optimization", "database"]
+category: Tech
+summary: "Tìm hiểu cách tôi giảm dung lượng cơ sở dữ liệu tra cứu IP từ 117MB xuống 46MB trong một Go DNS playground, loại bỏ lỗi OOM trên các máy chủ đám mây hạn chế tài nguyên — sử dụng pprof, netip.Addr và khử trùng lặp ASN."
+---
+
+Tôi có một sân chơi DNS tên là Mess With DNS. Đó là một dự án thú vị, nhưng nó cứ bị sập liên tục. Máy chủ chỉ có 465MB RAM, và cơ sở dữ liệu tra cứu địa chỉ IP đã chiếm mất 117MB. Tức là một phần tư tổng bộ nhớ đã biến mất.
+
+PowerDNS chiếm thêm 100MB nữa. Bản thân Mess With DNS cần 200MB. Cộng tất cả lại thì máy chủ luôn hoạt động ở mức giới hạn. Chỉ cần một yêu cầu không tốt là bùm, OOM kill.
+
+Đây là cách tôi đã chẩn đoán và khắc phục nó.
+
+<AudioPlayer src="/static/audio/using-less-memory-to-look-up-ip-addresse.mp3" title="Tóm tắt âm thanh dành cho lãnh đạo" />
+
+<Callout type="danger" title="Khủng hoảng bộ nhớ">
+  Trong tổng số 465MB RAM, cơ sở dữ liệu tra cứu địa chỉ IP đã chiếm **117MB**. Kết hợp với PowerDNS (100MB) và Mess With DNS (200MB), máy chủ luôn bị đẩy đến giới hạn — chỉ còn khoảng 48MB dung lượng trống.
+</Callout>
+
+## Bước đầu tiên: Đo lường thực tế
+
+Trước khi động vào bất cứ thứ gì, tôi cần hiểu cái gì đang sử dụng bộ nhớ và tại sao. Gói `pprof` của Go giúp việc này trở nên đơn giản:
+
+```go
+import (
+    "runtime"
+    "runtime/pprof"
+    "os"
+)
+
+func dumpHeapProfile(path string) error {
+    runtime.GC() // force GC so the profile reflects live allocations
+    f, err := os.Create(path)
+    if err != nil {
+        return err
+    }
+    defer f.Close()
+    return pprof.WriteHeapProfile(f)
+}
+```
+
+Sau đó phân tích nó:
+
+```bash
+# capture a heap profile from a running process
+go tool pprof -alloc_space http://localhost:6060/debug/pprof/heap
+
+# or from a saved file
+go tool pprof -inuse_space heap.prof
+```
+
+Hồ sơ ngay lập tức chỉ ra hai cấp phát: dữ liệu ASN được lưu trữ dư thừa cho mỗi dải IP, và kiểu slice byte `net.IP` cũ. Nếu không phân tích trước, tôi đã đoán sai.
+
+## Cấu trúc dữ liệu ban đầu
+
+Cơ sở dữ liệu tra cứu IP ánh xạ các dải CIDR tới ASN gốc của chúng — nhà cung cấp dịch vụ Internet hoặc nhà điều hành mạng sở hữu các địa chỉ đó. Đây là cấu trúc ban đầu trông như thế nào:
+
+```go
+type IPRange struct {
+    Start   net.IP // byte slice: 24 bytes header + 16 bytes data
+    End     net.IP
+    Country string
+    ASN     uint32
+    OrgName string // "Cloudflare, Inc." — duplicated for every range
+    OrgDesc string // duplicated again
+}
+
+var ranges []IPRange // 500,000+ entries
+```
+
+Kiểu `net.IP` được định nghĩa là `type IP []byte`. Một slice của Go có ba trường — con trỏ, độ dài, dung lượng — đó là 24 byte header, cộng với một mảng backing được cấp phát riêng trên heap. Mỗi `IPRange` mang hai trong số đó.
+
+Và mỗi `IPRange` lưu trữ các chuỗi `OrgName` và `OrgDesc` của nó nội tuyến. Nếu 10.000 dải thuộc về Cloudflare, bạn lưu trữ "Cloudflare, Inc." 10.000 lần.
+
+## Thử điều hiển nhiên trước
+
+Suy nghĩ đầu tiên của tôi là SQLite. Di chuyển cơ sở dữ liệu sang đĩa, giữ RAM cho những thứ thực sự cần tốc độ. Đơn giản, phải không?
+
+Sai rồi.
+
+SQLite không hỗ trợ số nguyên lớn đúng cách. Địa chỉ IPv6 phải được lưu trữ dưới dạng chuỗi văn bản. Điều đó có vẻ sai, nhưng tôi vẫn tiếp tục để xem liệu nó có hoạt động không.
+
+Vấn đề thực sự là hiệu suất. Tra cứu đĩa **chậm hơn 500 lần** so với tìm kiếm nhị phân dựa trên mảng mà tôi đã có. Tôi không nói về micro giây ở đây — chúng ta đang ở trong lãnh thổ "treo máy rõ rệt". Một sân chơi DNS bị treo không phải là một sân chơi. Nó là một cỗ máy gây bực bội.
+
+Vì vậy, đó là một ngõ cụt.
+
+## Làm mọi thứ tệ hơn với Trie
+
+Tiếp theo tôi thử một trie. Về lý thuyết, trie rất tốt cho việc khớp tiền tố, đó chính xác là những gì tra cứu IP cần. Tôi tự tin rằng điều này sẽ hoạt động.
+
+Nó không hoạt động.
+
+Trie đã làm bộ nhớ phình to lên **800MB**. Đó là nhiều RAM hơn cả máy chủ có, chấm hết. Và nó bằng cách nào đó còn chậm hơn cả tìm kiếm nhị phân ban đầu. Tôi đã làm cho vấn đề tồi tệ hơn, chứ không tốt hơn.
+
+<Callout type="idea" title="Những gì tôi học được sớm">
+  Đôi khi cấu trúc dữ liệu thanh lịch không phải là cấu trúc phù hợp. Một mảng đơn giản với tìm kiếm nhị phân đã đánh bại các phương pháp phức tạp hơn về cả tốc độ và bộ nhớ. Đừng thay thế những gì đang hoạt động — hãy sửa những gì lãng phí.
+</Callout>
+
+Đến lúc này tôi lùi lại. Tôi đã có một thứ hoạt động tốt: tìm kiếm nhị phân dựa trên mảng. Nó nhanh và chính xác. Vấn đề duy nhất là bộ nhớ. Vậy thay vì thay thế toàn bộ, tại sao không sửa những gì tôi đã có?
+
+## Điều thực sự hiệu quả
+
+Tôi quay lại phương pháp ban đầu và tìm kiếm sự lãng phí. Hai điều lớn ngay lập tức nổi bật từ kết quả pprof.
+
+### Sửa lỗi 1: Loại bỏ trùng lặp thông tin ASN
+
+Kéo dữ liệu ASN vào một mảng riêng và lưu trữ một chỉ mục số thay vì dữ liệu chuỗi nội tuyến:
+
+```go
+type ASNRecord struct {
+    OrgName string
+    OrgDesc string
+    Country string
+    ASN     uint32
+}
+
+type IPRange struct {
+    Start   netip.Addr // value type — no heap allocation
+    End     netip.Addr
+    ASNIdx  uint32 // index into a shared ASNRecord slice
+}
+
+var asnRecords []ASNRecord // one entry per unique ASN
+var ranges []IPRange       // many entries, tiny per-entry cost
+```
+
+Xây dựng bảng đã loại bỏ trùng lặp trong quá trình tải cơ sở dữ liệu:
+
+```go
+func buildIndex(rows []rawRow) ([]IPRange, []ASNRecord) {
+    asnMap := make(map[uint32]uint32) // ASN number -> index
+    var asnRecords []ASNRecord
+    var ranges []IPRange
+
+    for _, row := range rows {
+        idx, ok := asnMap[row.ASN]
+        if !ok {
+            idx = uint32(len(asnRecords))
+            asnRecords = append(asnRecords, ASNRecord{
+                OrgName: row.OrgName,
+                OrgDesc: row.OrgDesc,
+                Country: row.Country,
+                ASN:     row.ASN,
+            })
+            asnMap[row.ASN] = idx
+        }
+        ranges = append(ranges, IPRange{
+            Start:  row.Start,
+            End:    row.End,
+            ASNIdx: idx,
+        })
+    }
+    return ranges, asnRecords
+}
+```
+
+Điều này đã tiết kiệm được **50MB**. Dữ liệu ASN giờ đây nằm ở một nơi; các dải chỉ mang một chỉ mục 4 byte.
+
+### Sửa lỗi 2: Chuyển sang `netip.Addr`
+
+Mã ban đầu sử dụng kiểu `net.IP` cũ của Go. Nó là một `[]byte` — một header slice (24 byte trên 64-bit) cộng với một mảng backing được cấp phát trên heap (16 byte cho IPv6). Mỗi địa chỉ IP trong mỗi `IPRange` đều chạm vào heap.
+
+Go 1.18 đã giới thiệu `netip.Addr` trong `net/netip`. Nó là một **kiểu giá trị**: một giá trị 128-bit cộng với một chỉ mục vùng 16-bit, được lưu trữ trên stack hoặc nội tuyến trong một struct. Không cấp phát heap.
+
+```go
+// Before: heap allocation per address
+start := net.ParseIP("2a06:98c0::")  // []byte on heap
+
+// After: pure stack value
+start, _ := netip.ParseAddr("2a06:98c0::")  // no heap
+```
+
+Tìm kiếm nhị phân vẫn hoạt động giống hệt — `netip.Addr` hỗ trợ các toán tử so sánh:
+
+```go
+func lookup(ranges []IPRange, ip netip.Addr) *ASNRecord {
+    lo, hi := 0, len(ranges)-1
+    for lo <= hi {
+        mid := (lo + hi) / 2
+        r := ranges[mid]
+        if ip.Compare(r.Start) >= 0 && ip.Compare(r.End) <= 0 {
+            return &asnRecords[r.ASNIdx]
+        }
+        if ip.Compare(r.Start) < 0 {
+            hi = mid - 1
+        } else {
+            lo = mid + 1
+        }
+    }
+    return nil
+}
+```
+
+Việc chuyển đổi kiểu đã tiết kiệm thêm **20MB**. Tất cả mà không thay đổi thuật toán tra cứu — tìm kiếm nhị phân vẫn là O(log n) và chạy với cùng tốc độ.
+
+## Bố cục bộ nhớ: Trước và sau
+
+Đây là cách dung lượng bộ nhớ thay đổi trên mỗi mục `IPRange`:
+
+```
+BEFORE (per IPRange, with net.IP):
+┌──────────────────────────────────────────┐
+│ Start  net.IP  [ptr|len|cap] = 24 bytes  │
+│         heap → [16 bytes]                │
+│ End    net.IP  [ptr|len|cap] = 24 bytes  │
+│         heap → [16 bytes]                │
+│ Country string  16 bytes                 │
+│ ASN     uint32   4 bytes                 │
+│ OrgName string  16 bytes + heap string   │
+│ OrgDesc string  16 bytes + heap string   │
+└──────────────────────────────────────────┘
+~120+ bytes per entry (plus heap strings)
+
+AFTER (per IPRange, with netip.Addr):
+┌──────────────────────────────────────────┐
+│ Start  netip.Addr  17 bytes (no heap)    │
+│ End    netip.Addr  17 bytes (no heap)    │
+│ ASNIdx uint32       4 bytes              │
+└──────────────────────────────────────────┘
+~38 bytes per entry (all inline, no heap)
+```
+
+Với 500.000 dải, sự khác biệt đó cộng dồn đáng kể.
+
+## Kết quả
+
+Cơ sở dữ liệu tra cứu IP đã giảm từ **117MB xuống 46MB** — giảm 61%. Tốc độ tìm kiếm nhị phân vẫn giữ nguyên. Máy chủ không còn bị sập nữa.
+
+| Chỉ số | Trước | Sau | Thay đổi |
+|--------|--------|-------|--------|
+| Bộ nhớ tra cứu IP | 117MB | 46MB | −61% |
+| Dung lượng trống | ~48MB | ~119MB | +71MB |
+| Thuật toán tra cứu | tìm kiếm nhị phân | tìm kiếm nhị phân | không đổi |
+| Độ trễ truy vấn | nhanh | nhanh | không đổi |
+
+<Callout type="info" title="Phân tích hiệu năng trong môi trường sản xuất">
+  Nếu bạn đang theo dõi các cấp phát trực tiếp trong một dịch vụ Go sản xuất, hãy sử dụng trình xử lý `net/http/pprof`:
+
+  ```go
+  import _ "net/http/pprof"
+  go http.ListenAndServe(":6060", nil)
+  ```
+
+  Sau đó `go tool pprof -inuse_space http://localhost:6060/debug/pprof/heap` hiển thị những gì đang hoạt động ngay bây giờ. Sử dụng `-alloc_space` để xem các cấp phát tích lũy theo thời gian.
+</Callout>
+
+## Những gì tôi sẽ làm khác đi
+
+Nếu có thể quay ngược thời gian, tôi sẽ bỏ qua trie hoàn toàn. Đó là công cụ sai cho kích thước dữ liệu mà tôi đang xử lý. Có thể nó sẽ hoạt động ở quy mô internet, nhưng đây không phải là bảng BGP của Google. Đó là một dự án sở thích với một tập dữ liệu đã biết, có giới hạn.
+
+Tôi cũng sẽ **phân tích hiệu năng trước** thay vì đoán mò. Một phiên pprof heap nhanh chóng đã cho tôi thấy vấn đề trùng lặp ASN trong vài phút thay vì những ngày tôi dành để thử SQLite và trie. Đo lường luôn tốt hơn là giả định.
+
+Bài học thực sự? Bạn không phải lúc nào cũng cần một giải pháp thông minh. Đôi khi bạn cần nhìn vào những gì bạn đã có và hỏi: *sự lãng phí ở đâu?*
+
+### Các nguyên tắc bộ nhớ Go chung được áp dụng ở đây
+
+- **Sử dụng các kiểu giá trị bất cứ khi nào có thể.** `netip.Addr`, `[16]byte`, các struct với các trường có kích thước cố định — bất cứ thứ gì tránh được con trỏ heap đều giảm áp lực GC và tiết kiệm bộ nhớ.
+- **Chuẩn hóa dữ liệu lặp lại.** Nếu nhiều bản ghi chia sẻ cùng một chuỗi hoặc bản ghi con, hãy lưu trữ nó một lần và tham chiếu bằng chỉ mục. Đây là cùng một nguyên tắc đằng sau chuẩn hóa cơ sở dữ liệu.
+- **Phân tích hiệu năng trước khi tối ưu hóa.** Một phiên pprof 10 phút tốt hơn hàng giờ tái cấu trúc mang tính suy đoán. Các cấp phát trông nhỏ trong một struct có thể cộng dồn thành gigabyte ở quy mô lớn.
+- **Kiểm tra hiệu năng các thay thế của bạn.** Trước khi triển khai quá trình di chuyển `netip.Addr`, hãy chạy `go test -bench=. -benchmem` trên đường dẫn nóng tra cứu để xác nhận rằng bạn chưa gây ra sự thoái lui nào.
+
+```bash
+# Quick benchmark template
+func BenchmarkLookup(b *testing.B) {
+    ip, _ := netip.ParseAddr("1.1.1.1")
+    b.ResetTimer()
+    for i := 0; i < b.N; i++ {
+        lookup(ranges, ip)
+    }
+}
+```
+
+Máy chủ đã ổn định kể từ đó. 71MB dung lượng trống bổ sung nghe có vẻ không nhiều — nhưng khi bạn có tổng cộng 465MB, đó là sự khác biệt giữa một dịch vụ đáng tin cậy và một dịch vụ bị sập dưới tải bình thường.
+
+<Callout type="info" title="Bài viết liên quan">
+  <ul>
+    <li><a href="/en/blog/unwritten-rules-of-terminal-programs">Các quy tắc bất thành văn của chương trình Terminal</a> — Các quy ước và mẫu Terminal</li>
+    <li><a href="/en/blog/why-pipes-sometimes-get-stuck-buffering">Tại sao Pipes đôi khi bị kẹt: Giải thích về bộ đệm</a> — Các vấn đề về bộ đệm trong pipelines</li>
+  </ul>
+</Callout>
+
+## Bạn cũng có thể thích
+
+- [Bảng tổng hợp MySQL: Các truy vấn bạn thực sự sẽ sử dụng](/en/blog/getting-started-with-mysql-queries)
+- [Làm chủ Rust cho phát triển web](/en/blog/mastering-rust-web-dev)
+- [Các chiến lược phân mảnh cơ sở dữ liệu hiện đại cho sự tăng trưởng siêu tốc](/en/blog/db-sharding)
+- [Các chiến lược gieo dữ liệu cơ sở dữ liệu với Prisma và TypeScript](/en/blog/prisma-seed-typescript-strategies)

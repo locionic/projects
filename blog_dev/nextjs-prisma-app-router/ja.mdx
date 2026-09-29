@@ -1,0 +1,257 @@
+---
+title: "Next.js App RouterとPrisma: セットアップとコネクションプーリング"
+date: '2026-07-28'
+lastUpdated: '2026-08-22'
+tags: ["nextjs", "database", "react", "web-development"]
+category: Tech
+draft: false
+featured: true
+summary: "App RouterでのNext.jsとPrismaの完全ガイドで、グローバルなコネクションプール枯渇の防止、型安全なクエリ、サーバーアクションミューテーション、シードスクリプトについて解説します。"
+images: ['/static/images/nextjs-prisma-app-router.png']
+authors: ['default']
+---
+
+<Image 
+  src="/static/images/nextjs-prisma-app-router.png" 
+  alt="Next.js App Router and Prisma Architecture Guide" 
+  width={1200} 
+  height={630} 
+  className="rounded-xl shadow-lg border border-gray-200 dark:border-gray-800"
+/>
+
+<AudioPlayer src="/static/audio/nextjs-prisma-app-router.mp3" title="エグゼクティブ・オーディオ・ブリーフィング" />
+
+<ArticleSeries
+  name="モダンNext.jsアーキテクチャシリーズ"
+  current={3}
+  articles={[
+    { title: "Next.jsのハイドレーションエラーとミスマッチ418の修正", href: "/en/blog/nextjs-hydration-errors" },
+    { title: "Next.js App Routerのクリーンなフォルダ構造", href: "/en/blog/nextjs-app-router-folder-structure" },
+    { title: "Prisma ORMによるフルスタックNext.js", href: "/en/blog/nextjs-prisma-app-router" }
+  ]}
+/>
+
+Next.js App Routerが導入されたとき、それはフルスタックReact開発における根本的なパラダイムシフトを意味しました。React Server Components（RSC）とPrisma ORMを組み合わせることで、開発者はサーバーコンポーネントから直接データベースをクエリでき、クライアント側のフェッチウォーターフォールをゼロにし、完全なTypeScriptの安全性と、楽なServer Actionミューテーションを実現します。
+
+この包括的なガイドでは、コネクションプーリング、プール枯渇を防ぐためのグローバルシングルトン、型安全なServer Actions、自動化されたデータベースシードスクリプトなど、本番環境に対応したNext.jsとPrismaアプリケーションを構築する方法を探ります。
+
+---
+
+## 1. プロジェクトの初期化とPrismaスキーマ
+
+Prismaをインストールし、データベース接続を初期化します。
+
+```bash
+npm install prisma @prisma/client
+npx prisma init
+```
+
+`prisma/schema.prisma`内にリレーショナルモデルを定義します。
+
+```prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  posts     Post[]
+  createdAt DateTime @default(now())
+}
+
+model Post {
+  id        String   @id @default(cuid())
+  title     String
+  content   String?
+  published Boolean  @default(false)
+  authorId  String
+  author    User     @relation(fields: [authorId], references: [id])
+  createdAt DateTime @default(now())
+}
+```
+
+---
+
+## 2. コネクションプールの枯渇防止（グローバルシングルトン）
+
+ローカル開発中、Next.js Fast Refreshはファイル編集ごとにNode.jsモジュールキャッシュをクリアします。個々のルートファイル内で`new PrismaClient()`をインスタンス化すると、ホットリロードのたびに新しいデータベース接続が作成され、すぐにPostgreSQLの`max_connections`エラーが発生します。
+
+`lib/prisma.ts`に堅牢なシングルトンを作成します。
+
+```typescript
+// lib/prisma.ts
+import { PrismaClient } from '@prisma/client'
+
+const prismaClientSingleton = () => {
+  return new PrismaClient({
+    log: process.env.NODE_ENV === 'development' ? ['query', 'error', 'warn'] : ['error'],
+  })
+}
+
+declare global {
+  var prismaGlobal: undefined | ReturnType<typeof prismaClientSingleton>
+}
+
+const prisma = globalThis.prismaGlobal ?? prismaClientSingleton()
+
+export default prisma
+
+if (process.env.NODE_ENV !== 'production') globalThis.prismaGlobal = prisma
+```
+
+---
+
+## 3. React Server Componentsでの直接データフェッチ
+
+Server Componentsはサーバー上でのみ実行されるため、接続文字列を公開したり、中間APIルートを構築したりすることなく、Prismaを直接クエリできます。
+
+```tsx
+// app/posts/page.tsx
+import prisma from '@/lib/prisma'
+import Link from 'next/link'
+
+export const revalidate = 3600 // Cache page for 1 hour
+
+export default async function PostsPage() {
+  const posts = await prisma.post.findMany({
+    where: { published: true },
+    include: { author: { select: { name: true, email: true } } },
+    orderBy: { createdAt: 'desc' },
+  })
+
+  return (
+    <main className="max-w-4xl mx-auto p-8">
+      <h1 className="text-3xl font-bold mb-6">Published Articles</h1>
+      <div className="grid gap-4">
+        {posts.map((post) => (
+          <article key={post.id} className="p-5 border rounded-xl shadow-sm">
+            <h2 className="text-xl font-semibold">{post.title}</h2>
+            <p className="text-sm text-gray-500">By {post.author.name}</p>
+          </article>
+        ))}
+      </div>
+    </main>
+  )
+}
+```
+
+---
+
+## 4. Server Actionsによる型安全なデータミューテーション
+
+データをミューテーションするには、`'use server'`でServer Actionsを宣言し、キャッシュタグを再検証します。
+
+```typescript
+// app/actions/createPost.ts
+'use server'
+
+import prisma from '@/lib/prisma'
+import { revalidatePath } from 'next/cache'
+import { redirect } from 'next/navigation'
+
+export async function createPost(formData: FormData) {
+  const title = formData.get('title') as string
+  const content = formData.get('content') as string
+  const authorId = formData.get('authorId') as string
+
+  if (!title || !authorId) {
+    throw new Error('Title and Author are required')
+  }
+
+  const post = await prisma.post.create({
+    data: { title, content, published: true, authorId },
+  })
+
+  revalidatePath('/posts')
+  redirect(`/posts/${post.id}`)
+}
+```
+
+---
+
+## 5. データベースの自動シード
+
+開発データベースをシードするには、`prisma/seed.ts`を作成します。
+
+```typescript
+// prisma/seed.ts
+import { PrismaClient } from '@prisma/client'
+
+const prisma = new PrismaClient()
+
+async function main() {
+  await prisma.post.deleteMany()
+  await prisma.user.deleteMany()
+
+  const user = await prisma.user.create({
+    data: {
+      email: 'admin@locionic.com',
+      name: 'Locionic',
+      posts: {
+        create: [
+          { title: 'Next.js App Router Architecture', published: true },
+          { title: 'Prisma Connection Pooling Guide', published: true },
+        ],
+      },
+    },
+  })
+  console.log('Database seeded successfully:', user.email)
+}
+
+main()
+  .catch((e) => {
+    console.error(e)
+    process.exit(1)
+  })
+  .finally(async () => {
+    await prisma.$disconnect()
+  })
+```
+
+`package.json`にシードスクリプトの設定を追加します。
+
+```json
+"prisma": {
+  "seed": "ts-node --compiler-options {\"module\":\"CommonJS\"} prisma/seed.ts"
+}
+```
+
+`npx prisma db seed`でシードコマンドを実行します。
+
+<FAQ>
+  <Question>開発中にNext.jsがPrismaでデータベース接続を使い果たすのはなぜですか？</Question>
+  <Answer>
+    Next.js Fast Refreshはファイル変更ごとにモジュールを再構築し、ホットリロードのたびに新しいPrismaClientインスタンスを作成します。クライアントをNode.jsのグローバルオブジェクト（`globalThis.prismaGlobal`）にアタッチすることで、開発サーバーのライフサイクル中に単一の接続プールインスタンスのみが存在するようにします。
+  </Answer>
+
+  <Question>Client Components内でPrismaを使用できますか？</Question>
+  <Answer>
+    いいえ、Prismaはブラウザのランタイム内では実行できない直接的なTCPデータベースソケット接続を必要とします。Prismaのクエリは、Server Components、Route Handlers、またはServer Actions内でのみ実行してください。
+  </Answer>
+
+  <Question>サーバーレスデプロイメントのコネクションプーリングはどのように設定しますか？</Question>
+  <Answer>
+    VercelやAWS Lambdaのようなサーバーレスプラットフォームにデプロイする場合、PgBouncer、Neon Serverless Pooling、Supabase Supavisor、またはPrisma Accelerateと`?pgbouncer=true&connection_limit=1`のようなコネクションプーラーを介して接続します。
+  </Answer>
+
+  <Question>Prismaでデータベースシードを実行するにはどうすればよいですか？</Question>
+  <Answer>
+    `package.json`に`prisma/seed.ts`を指す`prisma.seed`コマンドを定義し、`npx prisma db seed`を実行してデモデータを決定論的に投入します。
+  </Answer>
+</FAQ>
+
+---
+
+## こちらもおすすめ
+
+- [Next.js App Routerのフォルダ構造：ベストプラクティスとエンタープライズアーキテクチャ（2026年版）](/en/blog/nextjs-app-router-folder-structure)
+- [React Testing Library user-event v14：ベストプラクティスとfireEventへの移行（2026年版）](/en/blog/react-testing-library-user-event-best-practices)
+- [RustとWebAssemblyでReactをスーパーチャージ：包括的なガイド](/en/blog/rust-wasm-react)
+- [フロントエンド開発者のためのRust：実践的な移行ガイド](/en/blog/rust-frontend-webassembly)

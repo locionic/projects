@@ -1,0 +1,233 @@
+---
+title: "PythonとClaudeでゼロから始めるMCPサーバー構築：完全ガイド"
+date: "2026-03-23"
+lastUpdated: "2026-09-18"
+summary: "Python、FastMCP、型付きツール、リソース、Claude Desktop連携を用いて、本番環境向けModel Context Protocol (MCP)サーバーを構築するステップバイステップガイドです。"
+tags: ["ai", "claude", "python", "developer-tools", "anthropic", "mcp"]
+images: ['https://imgbed.locionic.com/file/1784436637905_mcp.jpg']
+category: Tech
+draft: false
+---
+
+長年、大規模言語モデル（LLM）を社内データベース、ローカルファイルシステム、開発者ツールに接続するには、LLMプロバイダーごとに専用の関数呼び出しスキーマを作成する必要がありました。モデルを切り替えたり、エージェントフレームワークを更新したりするたびに、ツール定義、認証境界、シリアル化ロジックを再実装しなければなりませんでした。
+
+Anthropicが導入し、Claude Desktop、Cursor、および最新のAI開発環境で広く採用されている**モデルコンテキストプロトコル（MCP）**は、この断片化を解決します。MCPは、LLMが標準化されたJSON-RPCインターフェースを介してローカルおよびリモートのツールを検出し、検査し、呼び出すことを可能にする、ユニバーサルでオープンな標準、つまり**「AI統合のUSB-C」**です。
+
+このガイドでは、MCPのアーキテクチャを分解し、`FastMCP`を使用して本番環境レベルのPython MCPサーバーをゼロから構築し、セキュアなツールと動的リソースを実装し、それをClaude Desktopに直接接続します。
+
+---
+
+<AudioPlayer src="/static/audio/mcp.mp3" title="Executive Audio Briefing" />
+
+## MCPアーキテクチャ：ホスト、クライアント、サーバーの接続方法
+
+MCPがどのように機能するかを理解するために、プロトコルにおける3つの主要な参加者を見てみましょう。
+
+```
+┌────────────────────────────────────────────────────────┐
+│ MCP Host (Claude Desktop / Cursor IDE)                 │
+│                                                        │
+│   ┌────────────────────────────────────────────────┐   │
+│   │ MCP Client (Protocol Adapter & Security Layer) │   │
+│   └───────────────────────┬────────────────────────┘   │
+└───────────────────────────┼────────────────────────────┘
+                            │ (JSON-RPC 2.0 over Stdio or SSE)
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│ MCP Server (Your Python / TypeScript Application)      │
+│                                                        │
+│  ├── Tools:     Callable functions (read, write, API)  │
+│  ├── Resources: Read-only context (logs, DB rows)      │
+│  └── Prompts:   Pre-engineered prompt templates        │
+└────────────────────────────────────────────────────────┘
+```
+
+1. **MCPホスト**: AIモデルインターフェースを実行するアプリケーション（例：Claude Desktop、Zedエディター）。
+2. **MCPクライアント**: ホスト内の内部プロトコルドライバーで、機能のネゴシエート、セキュリティ権限の強制、ツール呼び出しの転送を行います。
+3. **MCPサーバー**: 利用可能な機能をアドバタイズし、要求された操作を実行するスタンドアロンの軽量プロセス（またはリモートサービス）。
+
+### トランスポート：Stdio vs Server-Sent Events (SSE)
+
+- **Stdioトランスポート**: ホストはPythonサーバーを子プロセスとして起動し、標準入出力（`stdin`/`stdout`）を介して通信します。これは、ローカル開発マシン向けの標準的でオーバーヘッドのないモードです。
+- **SSEトランスポート**: ホストは、ストリーミング更新のためにServer-Sent Eventsを介して外部HTTPサーバーに接続します。このモードは、クラウドホスト型マイクロサービスやエンタープライズSaaSコネクタで使用されます。
+
+---
+
+## 1. `uv`を使ったPython環境のセットアップ
+
+超高速Pythonパッケージマネージャーである`uv`を使用して、プロジェクトを初期化し、公式のPython MCP SDKをインストールします。
+
+```bash
+# Create project directory
+mkdir local-dev-mcp && cd local-dev-mcp
+
+# Initialize Python workspace
+uv init
+uv add mcp pydantic
+```
+
+---
+
+## 2. `FastMCP`を使ったサーバーの構築
+
+Python SDKは、FastAPIをモデルにした高レベルフレームワークである`FastMCP`を提供します。これは、パラメータースキーマ、型ヒント、ドキュメント文字列を自動的に有効なJSON-RPCツールスキーマに抽出します。
+
+`server.py`を作成します。
+
+```python
+# server.py: Production Local Developer MCP Server
+import os
+from pathlib import Path
+from pydantic import BaseModel, Field
+from mcp.server.fastmcp import FastMCP
+
+# Initialize the MCP Server with identity and version
+mcp = FastMCP("Developer-Workspace-Tools", version="1.0.0")
+
+# Define a safe base directory to prevent directory traversal attacks
+SAFE_WORKSPACE = Path(os.getenv("MCP_WORKSPACE_DIR", "./workspace")).resolve()
+SAFE_WORKSPACE.mkdir(parents=True, exist_ok=True)
+
+def resolve_safe_path(relative_path: str) -> Path:
+    """Guarantees file operations remain strictly inside the authorized workspace."""
+    resolved = (SAFE_WORKSPACE / relative_path).resolve()
+    if not str(resolved).startswith(str(SAFE_WORKSPACE)):
+        raise PermissionError(f"Access denied: '{relative_path}' attempts path traversal.")
+    return resolved
+
+# ====================================================================
+# Primitive 1: Tools (Callable Actions)
+# ====================================================================
+
+@mcp.tool()
+def save_code_snippet(filename: str, code: str, language: str = "python") -> str:
+    """
+    Saves a code snippet to the authorized local workspace.
+    
+    Args:
+        filename: Name of the file including extension (e.g., 'auth_utils.py')
+        code: Full code content to write
+        language: Programming language identifier for metadata
+    """
+    target_path = resolve_safe_path(filename)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(target_path, "w", encoding="utf-8") as f:
+        f.write(code)
+        
+    return f"Successfully wrote {len(code)} bytes to {filename} (Language: {language})"
+
+@mcp.tool()
+def list_workspace_files() -> list[dict]:
+    """Lists all files in the developer workspace with file size and modified timestamps."""
+    files = []
+    for p in SAFE_WORKSPACE.rglob("*"):
+        if p.is_file():
+            stat = p.stat()
+            files.append({
+                "relative_path": str(p.relative_to(SAFE_WORKSPACE)),
+                "size_bytes": stat.st_size,
+                "modified_timestamp": stat.st_mtime,
+            })
+    return files
+
+# ====================================================================
+# Primitive 2: Resources (Context Streams)
+# ====================================================================
+
+@mcp.resource("workspace://logs/{log_name}")
+def get_system_log(log_name: str) -> str:
+    """Reads a designated log file from the workspace for debugging context."""
+    log_path = resolve_safe_path(f"logs/{log_name}.log")
+    if not log_path.exists():
+        return f"Log file '{log_name}' not found."
+        
+    with open(log_path, "r", encoding="utf-8") as f:
+        # Return the last 50 lines to conserve context window
+        lines = f.readlines()
+        return "".join(lines[-50:])
+
+if __name__ == "__main__":
+    # Runs the Stdio transport event loop
+    mcp.run()
+```
+
+---
+
+## 3. Claude Desktopの設定
+
+Claude Desktopが新しいMCPサーバーを検出して呼び出せるように、JSON設定ファイルを構成します。
+
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Linux**: `~/.config/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+`mcpServers`の下にサーバー定義を追加します。
+
+```json
+{
+  "mcpServers": {
+    "developer-workspace": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/absolute/path/to/local-dev-mcp",
+        "server.py"
+      ],
+      "env": {
+        "MCP_WORKSPACE_DIR": "/absolute/path/to/workspace"
+      }
+    }
+  }
+}
+```
+
+Claude Desktopを再起動します。チャット入力ボックスの右下隅に新しい🔌 **ハンマー/ツールアイコン**が表示されます。これをクリックすると、登録されたツールである`save_code_snippet`と`list_workspace_files`が表示されます。
+
+---
+
+## 4. MCP Inspectorを使ったテストとデバッグ
+
+Claude Desktopに接続する前に、公式のブラウザベースの**MCP Inspector**を使用して、MCPサーバーを対話的にテストおよびデバッグできます。
+
+```bash
+# Launch the interactive MCP debugger
+npx @modelcontextprotocol/inspector uv run server.py
+```
+
+インスペクターはローカルのWeb UIを起動し、そこで次のことができます。
+- すべてのツールとリソースの自動生成されたJSONスキーマを検査する。
+- カスタムJSON引数でツールを実行し、生のJSON-RPC応答を表示する。
+- エラー処理とパス横断拒否を検証する。
+
+---
+
+## 本番MCPサーバーのセキュリティベストプラクティス
+
+1. **パス横断保護**: ファイルパスは常に`pathlib.Path.resolve()`を使用して明示的なベースディレクトリに対して解決してください。LLMによって直接渡される相対パス文字列を信頼しないでください。
+2. **読み取り専用エンクレーブ**: ツールがテレメトリーやデータベースレコードの読み取りのみを必要とする場合、厳密な`SELECT`のみの権限を持つデータベースロールで接続してください。
+3. **Stdioのクリーンさ**: MCPサーバーでデバッグのために`print()`ステートメントを使用しないでください。標準出力はJSON-RPCメッセージ専用であるため、任意のテキスト出力はワイヤプロトコルを破損します。標準のPython `logging`を`sys.stderr`に書き込むように設定して使用してください。
+
+---
+
+## よくある質問
+
+### MCPサーバーは外部のクラウドAPIを呼び出すことができますか？
+はい、できます。MCPサーバーは単なる標準コードです。ツール実装内で`httpx`や`requests`を使用して、GitHub API、Slack Webhook、Jiraチケット、または内部Kubernetesクラスターを呼び出すことができます。
+
+### ClaudeはいつMCPツールを呼び出すかをどのように決定しますか？
+Claudeは、MCPサーバーによってアドバタイズされる関数シグネチャとドキュメント文字列を検査します。ツールの機能、パラメーターの意味、および呼び出すべきタイミングを説明する記述的なドキュメント文字列を作成することが、信頼性の高いツール呼び出しにとって最も重要な要素です。
+
+### MCPツールとMCPリソースの違いは何ですか？
+- **ツール**は、ファイルへの書き込み、コマンドの実行、外部APIのクエリなど、ホストUIでの明示的なユーザー承認を必要とする副作用のあるアクションです。
+- **リソース**は、ホストが副作用のリスクなしに読み取ることができる受動的な読み取り専用データストリーム（ファイルの添付やデータベースログのコンテキストへの供給など）です。
+
+---
+
+## こちらもおすすめです
+
+- [Building Reliable AI Agents with MCP: The Complete Guide](/en/blog/building-reliable-ai-agents-with-mcp)
+- [Building Autonomous AI Agents in Rust](/en/blog/rust-autonomous-ai-agents)
+- [The Future of AI Agents in Software Engineering](/en/blog/future-of-ai-agents)
+- [Green Software Engineering: Optimizing ai Workloads for Energy Efficiency in 2026](/en/blog/green-software-engineering-ai-workloads)

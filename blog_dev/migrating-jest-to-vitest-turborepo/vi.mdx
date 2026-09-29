@@ -1,0 +1,241 @@
+---
+title: "Di chuyển từ Jest sang Vitest trong kiến trúc Turborepo Monorepo"
+date: "2026-08-12"
+lastUpdated: "2026-09-18"
+summary: "Hướng dẫn di chuyển từng bước hoàn chỉnh để chuyển đổi các bộ kiểm thử Jest sang Vitest trong Turborepo monorepo TypeScript với thời gian thực thi nhanh hơn 10 lần."
+tags: ["testing", "vitest", "jest", "turborepo", "typescript"]
+images: ["/static/images/jest-vitest.jpg"]
+category: Tech
+draft: false
+---
+
+Khi các codebase doanh nghiệp mở rộng thành các monorepo TypeScript lớn, tốc độ thực thi kiểm thử trở thành yếu tố quyết định lớn nhất đến tốc độ phát triển của lập trình viên. Khi một pull request yêu cầu chạy hơn 500 bộ kiểm thử đơn vị và tích hợp trên hàng chục gói liên kết với nhau, một pipeline kiểm thử chậm chạp sẽ làm tê liệt quá trình tích hợp liên tục và đình trệ quá trình phát triển cục bộ.
+
+Trong gần một thập kỷ, **Jest** đã là framework kiểm thử JavaScript mặc định. Tuy nhiên, khi kết hợp với các monorepo TypeScript được quản lý bởi **Turborepo**, Jest bộc lộ những nút thắt kiến trúc nghiêm trọng: các bước biên dịch Babel/`ts-jest` dư thừa, các pipeline transformer riêng biệt với bundler ứng dụng của bạn, và tiêu thụ bộ nhớ lớn trong quá trình chạy worker kiểm thử song song.
+
+**Vitest**, được xây dựng trực tiếp trên máy chủ phát triển cực nhanh của Vite và pipeline chuyển đổi module ES, cung cấp một giải pháp thay thế trực tiếp giúp loại bỏ việc biên dịch trùng lặp và mở khóa tốc độ thực thi nhanh hơn nhiều lần.
+
+Trong hướng dẫn này, chúng ta sẽ đi qua quá trình di chuyển từ Jest sang Vitest một cách toàn diện trong một workspace Turborepo sản xuất, bao gồm cấu hình workspace, mocking bản dịch và các chiến lược caching CI.
+
+---
+
+<AudioPlayer src="/static/audio/migrating-jest-to-vitest-turborepo.mp3" title="Tóm tắt âm thanh điều hành" />
+
+## Tại sao Jest gây tắc nghẽn các Turborepo Workspaces
+
+Trong một monorepo TypeScript với 20 gói, Jest thường thực thi các kiểm thử bằng cách gọi `ts-jest` hoặc `@babel/preset-typescript` trên mỗi tệp được import. Ngay cả khi công cụ build của bạn sử dụng Vite, esbuild, hoặc SWC để biên dịch mã sản xuất của bạn, Jest vẫn duy trì pipeline transpilation riêng biệt, độc lập của nó:
+
+```
+[Legacy Monorepo Pipeline]
+  Build Tool (Vite / ESBuild) ──► Fast ESM Compilation ──► Production Bundle
+                                       ▲
+                                (Duplicated effort)
+                                       ▼
+  Testing Tool (Jest + ts-jest) ──► Slow CJS Compilation ──► Test Runner (High Memory)
+```
+
+Kiến trúc phân tách này tạo ra ba vấn đề chính:
+
+1. **Biên dịch dư thừa**: Mỗi worker kiểm thử biên dịch lại cùng các thư viện TypeScript dùng chung một cách độc lập trong bộ nhớ.
+2. **Không tương thích ESM/CommonJS**: Kiểm thử các gói chỉ xuất bản ESM thuần túy (như các phiên bản hiện đại của `node-fetch`, `chalk`, hoặc `nanoid`) yêu cầu cấu hình regex `transformIgnorePatterns` phức tạp trong `jest.config.js`.
+3. **Rò rỉ bộ nhớ và chi phí worker**: Trình chạy VM cô lập của Jest làm rò rỉ bộ nhớ trên các bộ kiểm thử lớn, thường xuyên dẫn đến lỗi `JavaScript heap out of memory` trên các runner GitHub Actions trừ khi `--runInBand` được áp dụng (điều này phá hủy tính song song).
+
+---
+
+## Lợi thế của Vitest trong Monorepos
+
+Vitest giải quyết các vấn đề kiến trúc này bằng cách chia sẻ cùng một pipeline chuyển đổi, hệ sinh thái plugin và cấu hình như Vite:
+
+- **Pipeline duy nhất**: Vitest sử dụng bộ nhớ đệm chuyển đổi được cấu hình sẵn của Vite. Nếu Vite biết cách giải quyết các bí danh đường dẫn (`@/components/*`) hoặc biên dịch TSX, Vitest xử lý nó một cách giống hệt mà không có sự sai lệch cấu hình.
+- **Worker Pools thông qua `tinypool`**: Vitest sử dụng các luồng worker nhẹ thay vì các tiến trình con NodeJS nặng nề, giảm đáng kể chi phí khởi tạo tiến trình.
+- **ESM gốc & Vite Workspaces**: Vitest hiểu các module ECMAScript một cách tự nhiên và cung cấp hỗ trợ gốc cho các workspace đa dự án thông qua `vitest.workspace.ts`.
+
+---
+
+## Hướng dẫn di chuyển từng bước
+
+### Bước 1: Dọn dẹp các Dependency của Jest
+
+Xóa Jest, `ts-jest`, định nghĩa kiểu Jest và các transformer Babel khỏi thư mục gốc monorepo của bạn:
+
+```bash
+# In your monorepo root
+npm uninstall jest @types/jest ts-jest babel-jest
+npm install -D vitest @vitest/ui @vitest/coverage-v8
+```
+
+### Bước 2: Cấu hình tệp `vitest.workspace.ts` gốc
+
+Thay vì duy trì các trình chạy kiểm thử nhị phân riêng biệt trong mỗi gói con, hãy định nghĩa một tệp workspace gốc thống nhất để khám phá tất cả các ứng dụng và gói:
+
+```ts
+// vitest.workspace.ts
+import { defineWorkspace } from 'vitest/config';
+
+export default defineWorkspace([
+  'apps/*/vite.config.ts',
+  'apps/*/vitest.config.ts',
+  'packages/*/vitest.config.ts',
+]);
+```
+
+### Bước 3: Tạo cấu hình gói tiêu chuẩn hóa
+
+Bên trong mỗi gói (ví dụ: `packages/utils/vitest.config.ts`), tạo một cấu hình tập trung mở rộng các cài đặt dùng chung:
+
+```ts
+// packages/utils/vitest.config.ts
+import { defineConfig } from 'vitest/config';
+import path from 'node:path';
+
+export default defineConfig({
+  test: {
+    globals: true,
+    environment: 'node', // Use 'happy-dom' or 'jsdom' for UI packages
+    include: ['src/**/*.{test,spec}.{ts,tsx}'],
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'json', 'html'],
+      exclude: ['node_modules/**', 'dist/**'],
+    },
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
+  },
+});
+```
+
+Đối với các gói frontend kiểm thử các thành phần React hoặc Next.js, hãy cài đặt `happy-dom` (nhanh hơn đáng kể so với `jsdom`) và chỉ định:
+
+```ts
+// packages/ui/vitest.config.ts
+import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    globals: true,
+    environment: 'happy-dom',
+    setupFiles: ['./src/test/setup.ts'],
+  },
+});
+```
+
+---
+
+## Mocking bản dịch API: Từ `jest` sang `vi`
+
+Vitest cung cấp một tiện ích mocking tương thích 1-đổi-1 thông qua đối tượng `vi`:
+
+| API của Jest | API của Vitest | Ghi chú |
+| :--- | :--- | :--- |
+| `jest.fn()` | `vi.fn()` | Cùng chữ ký và theo dõi cuộc gọi |
+| `jest.spyOn()` | `vi.spyOn()` | Bảo toàn kiểu đầy đủ |
+| `jest.mock()` | `vi.mock()` | Vitest tự động nâng `vi.mock` |
+| `jest.useFakeTimers()` | `vi.useFakeTimers()` | Sử dụng `@sinonjs/fake-timers` nội bộ |
+| `jest.clearAllMocks()` | `vi.clearAllMocks()` | Xóa lịch sử mock |
+
+### Ví dụ: Mocking các dịch vụ bất đồng bộ
+
+```typescript
+// user-service.test.ts
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { fetchUserProfile } from './user-service';
+
+// Mock external HTTP client module
+vi.mock('./api-client', () => ({
+  apiClient: {
+    get: vi.fn(),
+  },
+}));
+
+import { apiClient } from './api-client';
+
+describe('fetchUserProfile', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('fetches and transforms user details correctly', async () => {
+    const mockUser = { id: 'usr_123', name: 'Alex Doe', email: 'alex@example.com' };
+    vi.mocked(apiClient.get).mockResolvedValueOnce({ data: mockUser });
+
+    const result = await fetchUserProfile('usr_123');
+
+    expect(apiClient.get).toHaveBeenCalledWith('/users/usr_123');
+    expect(result).toEqual({
+      id: 'usr_123',
+      displayName: 'Alex Doe',
+    });
+  });
+});
+```
+
+---
+
+## Cấu hình Turborepo Pipeline Caching
+
+Để đảm bảo các lần chạy kiểm thử được lưu vào bộ nhớ đệm khi mã không thay đổi, hãy cập nhật `turbo.json`:
+
+```json
+{
+  "$schema": "https://turbo.build/schema.json",
+  "tasks": {
+    "test": {
+      "dependsOn": ["^build"],
+      "inputs": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "vitest.config.ts"],
+      "outputs": ["coverage/**"]
+    },
+    "test:watch": {
+      "cache": false,
+      "persistent": true
+    }
+  }
+}
+```
+
+Bây giờ, chạy `npx turbo run test` từ thư mục gốc monorepo sẽ chạy tất cả các kiểm thử gói đồng thời với các lần truy cập bộ nhớ đệm tức thì trên các gói không thay đổi:
+
+```bash
+# Run all tests across the monorepo
+npx turbo run test
+
+# Run tests only for a specific package and its dependents
+npx turbo run test --filter=@repo/ui...
+```
+
+---
+
+## So sánh hiệu suất CI thực tế: Jest vs Vitest
+
+Các điểm chuẩn sau đây được thu thập từ một monorepo sản xuất chứa 18 gói và 1.240 trường hợp kiểm thử chạy trên GitHub Actions (`ubuntu-latest`, 2 vCPU):
+
+| Chỉ số đo lường | Jest (`ts-jest`) | Vitest (nhà cung cấp `v8`) | Hệ số tăng tốc |
+| :--- | :--- | :--- | :--- |
+| **Chạy CI lạnh (Không có bộ nhớ đệm)** | 4 phút 18 giây | 34 giây | **Nhanh hơn 7.6 lần** |
+| **Chạy CI nóng (Bộ nhớ đệm Turborepo)** | 2 phút 05 giây | 4.2 giây | **Nhanh hơn 30 lần** |
+| **Mức tiêu thụ bộ nhớ cao nhất** | 2.1 GB RAM | 480 MB RAM | **Tiết kiệm 77% bộ nhớ** |
+| **Độ trễ phản hồi chế độ xem** | 2.800 ms | 180 ms | **Gần như tức thời** |
+
+---
+
+## Các câu hỏi thường gặp
+
+### Tôi có thể chạy Vitest với `globals: true` để tránh import `describe` và `it` không?
+Có. Bật `test: { globals: true }` trong `vitest.config.ts` làm cho `describe`, `it`, `expect` và `vi` có sẵn trên toàn cầu, phù hợp với hành vi mặc định của Jest. Tuy nhiên, bạn nên thêm `"types": ["vitest/globals"]` vào `tsconfig.json` `compilerOptions` của mình để TypeScript nhận diện các định danh toàn cục.
+
+### Vitest xử lý các thư viện bên thứ ba chỉ có CommonJS như thế nào?
+Vite xử lý các dependency CommonJS thông qua việc pre-bundling tự động bằng esbuild. Nếu một thư viện CommonJS khó hiểu gây ra lỗi phân giải trong quá trình thực thi kiểm thử, bạn có thể thêm rõ ràng nó vào `test: { server: { deps: { inline: ['legacy-package-name'] } } }` trong `vitest.config.ts` của mình.
+
+### Làm cách nào để tạo báo cáo độ bao phủ monorepo thống nhất?
+Chạy `vitest run --coverage` từ workspace gốc của bạn. Vitest sẽ thu thập dữ liệu độ bao phủ trên tất cả các gói vào một thư mục độ bao phủ V8 hoặc Istanbul thống nhất có thể được tải trực tiếp lên Codecov hoặc SonarQube.
+
+---
+
+## Bạn cũng có thể thích
+
+- [Cách kiểm tra toàn diện TypeScript loại bỏ toàn bộ các loại lỗi](/en/blog/typescript-exhaustive-type-checking)
+- [JavaScript sang Luau: Bảng gian lận lập trình Roblox hoàn chỉnh (2026)](/en/blog/javascript-to-luau-roblox-scripting)
+- [const vs Tính bất biến trong JavaScript: Liên kết, không phải giá trị](/en/blog/const-in-js)
+- [Cách lấy vị trí Y chính xác của một phần tử trong giao diện người dùng ChatGPT (Hướng dẫn 2026)](/en/blog/get_position_of_an_element_in_js)

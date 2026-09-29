@@ -1,0 +1,313 @@
+---
+title: "GitOps với Flux: Hạ tầng khai báo và CD cho Kubernetes"
+date: "2026-08-07"
+summary: "GitOps sản xuất với Flux v2: Nguồn GitRepository, vòng lặp đối chiếu Kustomize/Helm, giải mã bí mật SOPS và cập nhật hình ảnh container tự động."
+tags: ["kubernetes", "devops", "gitops", "flux", "cloud-native"]
+draft: false
+images: ['/static/images/devops-2026-08-07.png']
+---
+
+GitOps là mô hình vận hành trong đó **Git là nguồn đáng tin cậy duy nhất** cho trạng thái mong muốn của hạ tầng và ứng dụng của bạn, và các bộ điều khiển tự động bên trong cụm Kubernetes liên tục điều chỉnh trạng thái thực tế để khớp với Git.
+
+Trong khi ArgoCD cung cấp một giao diện Web tập trung phổ biến, **Flux (v2)** được xây dựng trên **GitOps Toolkit (GOTK)**: một bộ các Định nghĩa Tài nguyên Tùy chỉnh (CRD) của Kubernetes và các bộ điều khiển chuyên biệt chạy nguyên bản trong cụm. Flux nổi trội trong các môi trường đa người thuê, cập nhật hình ảnh tự động và yêu cầu tài nguyên tối thiểu.
+
+Hướng dẫn này sẽ trình bày cách thiết lập GitOps cấp độ sản xuất với Flux v2, bao gồm điều chỉnh Kustomize, phát hành Helm, mã hóa bí mật SOPS và các PR hình ảnh container tự động.
+
+---
+
+<AudioPlayer src="/static/audio/devops-2026-08-07.mp3" title="Tóm tắt âm thanh dành cho Giám đốc điều hành" />
+
+## 1. Kiến trúc Flux: Bộ công cụ GitOps
+
+Flux chia GitOps thành các bộ điều khiển chuyên biệt, mỗi bộ điều khiển có một trách nhiệm duy nhất:
+
+```
+                  Git Repository (GitHub / GitLab)
+                                │
+                                ▼ (Pulls Git commit / tag / branch)
+                     [ source-controller ]
+                                │
+         ┌──────────────────────┴──────────────────────┐
+         ▼ (Raw manifests & Kustomize)                 ▼ (Helm Charts)
+[ kustomize-controller ]                      [ helm-controller ]
+         │                                             │
+         ▼ (Applies with Prune & Health Checks)        ▼ (Executes Helm engine)
+   Kubernetes API                                Kubernetes API
+         ▲                                             ▲
+         └──────────────────────┬──────────────────────┘
+                                │ (Watches OCI Registry & commits new tags to Git)
+                 [ image-automation-controller ]
+```
+
+* **`source-controller`:** Lấy các kho Git, biểu đồ Helm, tạo phẩm OCI và nhóm S3 vào bộ nhớ cụm.
+* **`kustomize-controller`:** Chạy các lớp phủ Kustomize, giải mã các bí mật SOPS, áp dụng các manifest cho máy chủ API và tự động loại bỏ các tài nguyên đã bị xóa.
+* **`helm-controller`:** Quản lý vòng đời của các bản phát hành biểu đồ Helm một cách khai báo.
+* **`notification-controller`:** Phát ra các sự kiện đến Slack, Discord hoặc webhook, và nhận các webhook đến từ các registry Git/OCI để kích hoạt điều chỉnh tức thì.
+* **`image-automation-controller`:** Phát hiện các thẻ container mới trong các registry Docker và tự động commit các thẻ hình ảnh đã cập nhật trở lại kho Git của bạn.
+
+---
+
+## 2. Cấu trúc kho lưu trữ Monorepo sản xuất
+
+Một bố cục kho lưu trữ đa môi trường linh hoạt sẽ tách biệt rõ ràng hạ tầng cơ bản khỏi các ứng dụng của người thuê:
+
+```
+fleet-infra/
+├── clusters/
+│   ├── staging/
+│   │   ├── flux-system/        # Bootstrap manifests
+│   │   ├── infrastructure.yaml # Reconciles /infrastructure/staging
+│   │   └── apps.yaml           # Reconciles /apps/staging
+│   └── production/
+│       ├── flux-system/
+│       ├── infrastructure.yaml
+│       └── apps.yaml
+├── infrastructure/
+│   ├── base/
+│   │   ├── ingress-nginx/
+│   │   └── cert-manager/
+│   └── staging/
+│       └── kustomization.yaml
+└── apps/
+    ├── base/
+    │   └── payments-api/
+    └── staging/
+        ├── kustomization.yaml
+        └── patch-replicas.yaml
+```
+
+---
+
+## 3. Manifest cốt lõi: GitRepository & Kustomization
+
+### Định nghĩa nguồn: `GitRepository`
+
+```yaml
+# clusters/staging/fleet-source.yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: fleet-infra
+  namespace: flux-system
+spec:
+  interval: 1m
+  url: https://github.com/my-org/fleet-infra.git
+  ref:
+    branch: main
+  secretRef:
+    name: github-deploy-token
+  ignore: |
+    # Exclude non-manifest directories from checksums
+    /*
+    !/apps
+    !/infrastructure
+```
+
+### Điều chỉnh với kiểm tra sức khỏe và loại bỏ: `Kustomization`
+
+```yaml
+# clusters/staging/apps.yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: staging-apps
+  namespace: flux-system
+spec:
+  interval: 5m
+  path: ./apps/staging
+  prune: true               # Automatically deletes removed k8s resources
+  wait: true                # Blocks until all Pods pass readiness probes
+  timeout: 3m
+  sourceRef:
+    kind: GitRepository
+    name: fleet-infra
+  dependsOn:
+    - name: staging-infrastructure  # Ensures ingress/CRDs exist before apps deploy
+  postBuild:
+    substitute:
+      ENVIRONMENT: "staging"
+      CLUSTER_DOMAIN: "stage.internal.net"
+```
+
+---
+
+## 4. Quản lý bản phát hành Helm với phát hiện sai lệch
+
+Flux quản lý các biểu đồ Helm một cách nguyên bản mà không cần cài đặt Helm CLI cục bộ:
+
+```yaml
+# infrastructure/base/ingress-nginx/helm-release.yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: ingress-nginx
+  namespace: flux-system
+spec:
+  interval: 2h
+  url: https://kubernetes.github.io/ingress-nginx
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: ingress-nginx
+  namespace: ingress-nginx
+spec:
+  interval: 15m
+  chart:
+    spec:
+      chart: ingress-nginx
+      version: "4.11.x"
+      sourceRef:
+        kind: HelmRepository
+        name: ingress-nginx
+        namespace: flux-system
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+  driftDetection:
+    mode: enabled          # Automatically reverts manual edits back to chart values
+  values:
+    controller:
+      replicaCount: 3
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+```
+
+---
+
+## 5. Quản lý bí mật: Mã hóa trong Git với SOPS và Age
+
+Không bao giờ lưu trữ bí mật dạng văn bản thuần túy trong Git. Flux giải mã nguyên bản YAML được mã hóa [SOPS](https://github.com/getsops/sops) trước khi áp dụng nó vào cụm:
+
+### Bước 1: Mã hóa bí mật với `age`
+```bash
+# Generate age private key for the cluster
+age-keygen -o age.agekey
+
+# Create in-cluster secret with the private key
+kubectl create secret generic sops-age \
+  --namespace=flux-system \
+  --from-file=age.agekey
+
+# Encrypt local Kubernetes secret
+sops --encrypt --age $(cat age.agekey | grep public | cut -d: -f2 | xargs) \
+  --encrypted-regex '^(data|stringData)$' \
+  secret.yaml > apps/staging/secret.enc.yaml
+```
+
+### Bước 2: Cấu hình Flux để giải mã khi chạy
+
+```yaml
+# In apps/staging/kustomization.yaml or root Kustomization CRD
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: staging-secrets
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./apps/staging
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: fleet-infra
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age        # Matches private key stored in flux-system
+```
+
+---
+
+## 6. Cập nhật hình ảnh tự động (Triển khai liên tục)
+
+Flux có thể giám sát registry container của bạn và tự động commit các thẻ hình ảnh mới trực tiếp vào Git:
+
+```yaml
+# apps/base/payments-api/image-policy.yaml
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImageRepository
+metadata:
+  name: payments-api
+  namespace: flux-system
+spec:
+  image: ghcr.io/my-org/payments-api
+  interval: 1m
+---
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImagePolicy
+metadata:
+  name: payments-api
+  namespace: flux-system
+spec:
+  imageRepositoryRef:
+    name: payments-api
+  policy:
+    semver:
+      range: '^1.x'        # Auto-promotes minor and patch versions
+---
+apiVersion: image.toolkit.fluxcd.io/v1beta1
+kind: ImageUpdateAutomation
+metadata:
+  name: flux-system
+  namespace: flux-system
+spec:
+  interval: 1m
+  sourceRef:
+    kind: GitRepository
+    name: fleet-infra
+  git:
+    checkout:
+      ref:
+        branch: main
+    commit:
+      author:
+        email: fluxcdbot@users.noreply.github.com
+        name: fluxcdbot
+      messageTemplate: 'chore(cd): update payments-api to {{range .Updated.Images}}{{println .}}{{end}}'
+    push:
+      branch: main
+  update:
+    path: ./apps/staging
+    strategy: Setters
+```
+
+Trong YAML triển khai của bạn, hãy thêm một bộ thiết lập nhận xét:
+
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/my-org/payments-api:1.4.2 # {"$imagepolicy": "flux-system:payments-api"}
+```
+
+Khi CI đẩy `ghcr.io/my-org/payments-api:1.4.3`, Flux phát hiện thẻ, cập nhật chính xác dòng này trong Git, commit với `chore(cd)...`, đẩy đến `main` và điều chỉnh Pod mới trong môi trường staging.
+
+---
+
+## Flux v2 so với ArgoCD: Đánh đổi trong sản xuất
+
+| Tính năng | Flux v2 | ArgoCD |
+|---|---|---|
+| **Kiến trúc** | Bộ điều khiển Kubernetes gốc (GOTK) | CRD ứng dụng + Máy chủ Web tập trung |
+| **Giao diện Web** | Tối thiểu / Weave GitOps (tùy chọn) | Bảng điều khiển tương tác phong phú được tích hợp sẵn |
+| **Giải mã bí mật** | SOPS & Age / KMS gốc trong bộ điều khiển | Yêu cầu plugin ArgoCD / toán tử bên ngoài |
+| **Đa cụm** | Kéo tác nhân nhẹ trên mỗi cụm | Kéo tập trung hoặc đẩy đến các cụm từ xa |
+| **Sửa lỗi sai lệch** | Tự phục hồi liên tục trong nền | Đồng bộ hóa liên tục hoặc nút đồng bộ hóa thủ công |
+| **Tự động hóa hình ảnh** | Bộ điều khiển tự động commit trong kho lưu trữ gốc | Yêu cầu ArgoCD Image Updater (riêng biệt) |
+
+---
+
+## Bạn cũng có thể thích
+
+- [Mô hình triển khai đa cụm ArgoCD GitOps](/en/blog/argocd-gitops-multi-cluster-deployments)
+- [CI/CD nâng cao: Triển khai Blue-Green và Phát hành Canary](/en/blog/devops-2026-08-11)
+- [Toán tử Kubernetes và Tài nguyên tùy chỉnh: Tự động hóa mọi thứ](/en/blog/kubernetes-operators)
+- [Khả năng quan sát hiệu suất cao với eBPF trong Kubernetes](/en/blog/ebpf-kubernetes-observability)

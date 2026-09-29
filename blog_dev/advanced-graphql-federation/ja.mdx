@@ -1,0 +1,410 @@
+---
+title: "高度なGraphQLフェデレーション: 分散型スーパーグラフの構築"
+date: "2026-09-06"
+lastmod: "2026-09-22"
+summary: "Apollo Federation v2を用いたエンタープライズ向け分散型GraphQL APIの構築方法を学び、サブグラフのentity resolution、スキーマ構成、@keyディレクティブ、キャッシング戦略、パフォーマンス最適化を伴うゲートウェイルーティングを習得しましょう。"
+tags: ["graphql", "federation", "api", "architecture", "typescript"]
+images: ["/static/images/advanced-graphql-federation.png"]
+draft: false
+---
+
+GraphQL Federation（GraphQLフェデレーション）は、単一のモノリシックなGraphQLスキーマでは対応しきれなくなった組織にとって、当然の進化です。エンジニアリングチームの規模が拡大するにつれて、統合されたスキーマの維持は組織のボトルネックとなります。新しいフィールドを追加するたびにスキーマの所有者との調整が必要になり、破壊的な変更はすべてのコンシューマーに波及します。
+
+フェデレーションは、この問題を**分散型スーパーグラフ**で解決します。複数のチームが独立したGraphQLの**サブグラフ**を管理し、それらが**ゲートウェイ**によって単一の統合APIにまとめられます。クライアントは1つのエンドポイントにクエリを発行し、一貫性のあるスキーマを見ます。舞台裏では、ゲートウェイがクエリのフラグメントを適切なサブグラフにルーティングし、結果を結合します。
+
+このガイドでは、Apollo Federation v2（現在の標準）、サブグラフの設計パターン、エンティティ解決、DataLoaderによるN+1問題の軽減、キャッシング、および本番環境でのパフォーマンスに関する考慮事項について説明します。
+
+<AudioPlayer src="/static/audio/advanced-graphql-federation.mp3" title="Executive Audio Briefing" />
+
+## スーパーグラフアーキテクチャ
+
+```
+                    ┌─────────────────────────────────┐
+Client ────────────▶│        Apollo Router (Gateway)   │
+                    └─────┬─────────┬────────┬─────────┘
+                          │         │        │
+                    ┌─────▼──┐ ┌────▼──┐ ┌──▼──────┐
+                    │ Users  │ │Orders │ │ Products │
+                    │Subgraph│ │Subgraph│ │ Subgraph │
+                    └────────┘ └────────┘ └──────────┘
+                          │         │        │
+                    Postgres    MongoDB    Postgres
+```
+
+クライアントは単一のクエリを発行します。
+```graphql
+query GetOrderWithDetails {
+  order(id: "ord_123") {
+    id
+    total
+    user {
+      name
+      email
+    }
+    items {
+      product {
+        name
+        price
+      }
+      quantity
+    }
+  }
+}
+```
+
+ルーターの**クエリプランナー**はこれをサブオペレーションに分割し、可能であればOrders、Users、Productsの各サブグラフからデータを並行してフェッチし、結果をマージします。クライアントは基盤となる分散について何も知ることなく、1つのレスポンスを受け取ります。
+
+## サブグラフスキーマの定義
+
+各サブグラフは、Federation固有のディレクティブを使用して、自身が何を所有し、他のサブグラフに何を貢献できるかを宣言します。
+
+### `@key`ディレクティブ：エンティティ宣言
+
+`@key`ディレクティブはエンティティを宣言します。これは、サブグラフ間で参照および拡張できる型です。キーは、インスタンスを一意に識別するフィールドを指定します。
+
+**Usersサブグラフ:**
+```graphql
+# users-subgraph/schema.graphql
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key", "@shareable"])
+
+type User @key(fields: "id") {
+  id: ID!
+  name: String!
+  email: String!
+  createdAt: String!
+}
+
+type Query {
+  user(id: ID!): User
+  me: User
+}
+```
+
+**Ordersサブグラフ:**
+```graphql
+# orders-subgraph/schema.graphql
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key", "@external", "@requires"])
+
+# Reference the User entity defined in the Users subgraph
+type User @key(fields: "id") {
+  id: ID!
+  orders: [Order!]!
+}
+
+type Order @key(fields: "id") {
+  id: ID!
+  total: Float!
+  status: OrderStatus!
+  userId: ID!
+  user: User!
+  items: [OrderItem!]!
+}
+
+enum OrderStatus { PENDING, FULFILLED, CANCELLED }
+
+type OrderItem {
+  productId: ID!
+  quantity: Int!
+  unitPrice: Float!
+}
+
+type Query {
+  order(id: ID!): Order
+  orders(userId: ID!): [Order!]!
+}
+```
+
+Ordersサブグラフが`User @key(fields: "id")`を`id`フィールドのみで宣言していることに注目してください。これはUserエンティティを所有せずに**参照**しています。ゲートウェイは、`order.user.name`を解決するために、まずOrdersから`userId`をフェッチし、次に`{ _entities(representations: [{__typename: "User", id: $userId}]) }`を使用してUsersにクエリを発行する必要があることを知っています。
+
+## エンティティ解決：`__resolveReference`関数
+
+すべてのエンティティは`__resolveReference`リゾルバーを実装する必要があります。ゲートウェイは、サブグラフ間の参照を解決する必要があるときにこれを呼び出します。
+
+```typescript
+// users-subgraph/resolvers.ts
+import { UserService } from "./services/UserService";
+
+const resolvers = {
+  User: {
+    // Called by the gateway with the entity "representation" (partial object containing @key fields)
+    __resolveReference: async (reference: { id: string }, context: Context) => {
+      return context.dataSources.userService.findById(reference.id);
+    },
+  },
+  Query: {
+    user: (_: unknown, { id }: { id: string }, context: Context) => {
+      return context.dataSources.userService.findById(id);
+    },
+    me: (_: unknown, __: unknown, context: Context) => {
+      return context.dataSources.userService.findById(context.userId);
+    },
+  },
+};
+```
+
+ゲートウェイは、単一のリクエストで（`_entities`クエリを介して）表現の**バッチ**とともに`__resolveReference`を呼び出すことがあります。ここで、注意しないとN+1問題が発生します。
+
+## フェデレーションにおけるN+1問題
+
+`user`フィールドを持つ50件の注文を返す注文リストクエリを考えてみましょう。最適化なしでは、ゲートウェイは次のようになります。
+
+1. Ordersサブグラフから50件の注文をフェッチ（1クエリ）
+2. 各注文のユーザーに対して、Usersサブグラフに`_entities`を50回呼び出す（50クエリ）
+
+合計：1ページを表示するために**51回のサブグラフ呼び出し**。
+
+### 解決策：`__resolveReference`におけるDataLoader
+
+Apollo Routerはエンティティ解決リクエストを自動的に**バッチ処理**します。オペレーションからすべての`User`参照を収集し、単一の`_entities`クエリで送信します。しかし、あなたの`__resolveReference`はこれを効率的に処理する必要があります。
+
+```typescript
+import DataLoader from "dataloader";
+
+// Create a DataLoader per request (in context factory)
+export function createUserLoader(db: Database): DataLoader<string, User> {
+  return new DataLoader(
+    async (userIds: readonly string[]) => {
+      // Single DB query fetches all users at once
+      const users = await db.query(
+        "SELECT * FROM users WHERE id = ANY($1)",
+        [userIds]
+      );
+      
+      // DataLoader requires results in the same order as input keys
+      const userMap = new Map(users.map((u) => [u.id, u]));
+      return userIds.map((id) => userMap.get(id) ?? new Error(`User ${id} not found`));
+    },
+    { cache: true }   // cache within request — same user requested twice = one DB hit
+  );
+}
+
+// In context factory:
+const context = {
+  loaders: { user: createUserLoader(db) }
+};
+
+// In resolver:
+const resolvers = {
+  User: {
+    __resolveReference: async (reference: { id: string }, context: Context) => {
+      return context.loaders.user.load(reference.id);
+    },
+  },
+};
+```
+
+このパターンでは：50件の注文 → Usersサブグラフへの1回のバッチ呼び出し → 1回のSQLクエリ。合計：**2回のサブグラフ呼び出し**。
+
+## `@requires`ディレクティブ：計算フィールド
+
+サブグラフが自身のフィールドを計算するために、他のサブグラフのフィールドを必要とすることがあります。`@requires`ディレクティブは、この依存関係を宣言します。
+
+```graphql
+# shipping-subgraph/schema.graphql
+type User @key(fields: "id") {
+  id: ID!
+  address: String! @external       # owned by Users subgraph
+  shippingZone: ShippingZone!      # computed from address by Shipping subgraph
+    @requires(fields: "address")
+}
+```
+
+```typescript
+const resolvers = {
+  User: {
+    __resolveReference: async (reference: { id: string; address: string }) => {
+      // `address` is provided by the gateway from the Users subgraph
+      return {
+        id: reference.id,
+        shippingZone: computeShippingZone(reference.address),
+      };
+    },
+  },
+};
+```
+
+ゲートウェイのクエリプランナーは、Shippingサブグラフを呼び出す前に、Usersから`address`を自動的にフェッチします。あなたが依存関係を宣言すれば、ルーターが実行順序を決定します。
+
+## Rover CLIによるスキーマ構成
+
+Apollo Roverは、スーパーグラフスキーマを管理するためのCLIです。
+
+```bash
+# Install Rover
+curl -sSL https://rover.apollo.dev/nix/latest | sh
+
+# Check subgraph schema for Federation compatibility
+rover subgraph check my-graph@production \
+  --schema ./users-subgraph/schema.graphql \
+  --name users
+
+# Publish subgraph schema to Apollo Studio
+rover subgraph publish my-graph@production \
+  --schema ./users-subgraph/schema.graphql \
+  --name users \
+  --routing-url https://users.internal.example.com/graphql
+
+# Compose supergraph schema locally (for CI validation)
+rover supergraph compose --config ./supergraph.yaml > supergraph-schema.graphql
+```
+
+**`supergraph.yaml`:**
+```yaml
+federation_version: =2.3.5
+subgraphs:
+  users:
+    routing_url: https://users.internal.example.com/graphql
+    schema:
+      file: ./users-subgraph/schema.graphql
+  orders:
+    routing_url: https://orders.internal.example.com/graphql
+    schema:
+      file: ./orders-subgraph/schema.graphql
+  products:
+    routing_url: https://products.internal.example.com/graphql
+    schema:
+      file: ./products-subgraph/schema.graphql
+```
+
+サブグラフスキーマの変更をデプロイする前に、**必ずCIで`rover supergraph compose`を実行してください**。構成エラー（競合する型定義や無効な`@requires`チェーンなど）は、実行時ではなく、ここで早期に失敗します。
+
+## キャッシング戦略
+
+フェデレーションは複数のキャッシュ境界を導入します。適切に設計されたキャッシング戦略は、パフォーマンスにとって不可欠です。
+
+### 1. サブグラフレベルのレスポンスキャッシング
+
+`@cacheControl`ディレクティブを使用して、フィールドごとのTTLをアノテーションします。
+
+```graphql
+type Product @key(fields: "id") @cacheControl(maxAge: 300) {
+  id: ID!
+  name: String! @cacheControl(maxAge: 3600)    # rarely changes
+  price: Float! @cacheControl(maxAge: 60)       # changes more often
+  stockCount: Int! @cacheControl(maxAge: 0)     # never cache
+}
+```
+
+Apollo Routerはサブグラフからの`Cache-Control`ヘッダーを尊重し、パブリック/認証済みクエリに対してキャッシュされたスーパーグラフレスポンスを個別に提供できます。
+
+### 2. DataLoaderキャッシング（リクエストスコープ）
+
+上記のように、DataLoaderは単一のリクエスト内でキャッシュします。DataLoaderインスタンスをリクエスト間で再利用しないでください。古いデータを提供することになります。
+
+### 3. ホットエンティティのためのRedis
+
+頻繁に読み取られるエンティティ（例：めったに変更されない製品カタログ）の場合：
+
+```typescript
+async function findProductById(id: string): Promise<Product> {
+  const cached = await redis.get(`product:${id}`);
+  if (cached) return JSON.parse(cached);
+  
+  const product = await db.products.findById(id);
+  await redis.setex(`product:${id}`, 300, JSON.stringify(product)); // 5-min TTL
+  return product;
+}
+```
+
+## Apollo Routerのデプロイ
+
+Apollo Routerは、Node.jsのApollo Gatewayに代わる、Rustで書かれた本番グレードのゲートウェイです。
+
+```yaml
+# router.yaml
+supergraph:
+  path: /graphql
+
+cors:
+  origins:
+    - https://app.example.com
+  
+headers:
+  all:
+    request:
+      - propagate:
+          matching: ^x-.*   # forward all x-* headers to subgraphs
+
+traffic_shaping:
+  all:
+    deduplicate_variables: true
+  router:
+    timeout: 30s
+  subgraphs:
+    users:
+      timeout: 5s
+    orders:
+      timeout: 10s
+
+telemetry:
+  exporters:
+    tracing:
+      otlp:
+        endpoint: http://otel-collector:4317
+```
+
+実行方法：
+```bash
+docker run -p 4000:4000 \
+  -v $(pwd)/supergraph-schema.graphql:/app/supergraph.graphql \
+  -v $(pwd)/router.yaml:/app/router.yaml \
+  ghcr.io/apollographql/router:v1.46.0 \
+  --supergraph /app/supergraph.graphql \
+  --config /app/router.yaml
+```
+
+Apollo Routerは、単純なクエリの場合、シングルコアで約800万リクエスト/秒を処理します。これはNode.jsゲートウェイよりも桁違いに高速です。
+
+## クエリプランニングとパフォーマンス
+
+Apollo Routerのクエリプランナーは、受信するすべてのオペレーションに対して**実行計画**を生成します。計画は次で検査できます。
+
+```bash
+curl -X POST http://localhost:4000/graphql \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ order(id: \"123\") { user { name } items { product { name } } } }"}' \
+  -H "Apollo-Query-Plan-Experimental: true"
+```
+
+クエリプランを最適化するには：
+- **エンティティジャンプの削減**: 一般的なクエリでサブグラフ間のホップが少なくなるようにスキーマを設計する
+- **頻繁に結合されるデータの併置**: `order.user`が常に一緒にフェッチされる場合、代わりにOrdersサブグラフに直接`User`フィールドを追加することを検討する
+- **`@interfaceObject`の使用**: サブグラフにまたがるポリモーフィックな型の場合 (Federation v2.3+)
+
+## 大規模なスキーマガバナンス
+
+複数のチームがサブグラフを所有する場合、スキーマガバナンスはドリフトや破壊的な変更を防ぎます。
+
+1.  **破壊的変更の検出** — Apollo Studioのスキーマチェックは、既存のオペレーションを破壊するデプロイをブロックします。
+2.  **スキーマ提案** — 大規模な変更のチーム間RFCスタイルのレビューには、Apollo Schema Proposalsを使用します。
+3.  **需要駆動型スキーマ** — 各チームは自身のサービスドメインに一致する型を所有します。チーム間のミューテーションはありません。
+4.  **コントラクト** — Apollo Contractsを使用して、クライアント（モバイル、ウェブ、パートナーAPI）ごとにフィルタリングされたスキーマビューを定義します。
+
+## よくある質問
+
+**Federation v1 vs v2 — 移行すべきですか？**
+可能であれば、はい。Federation v2は、`@interfaceObject`、`@authenticated`、`@requiresScopes`、段階的な移行のための改善された`@override`、およびより良い構成エラーメッセージを追加します。Apollo Gateway（v1ランタイム）はメンテナンスモードであり、Apollo Routerが現在の標準です。
+
+**Apollo StudioなしでFederationを使用できますか？**
+はい。Rover CLIはローカルでスキーマを構成します。Apollo RouterはApollo Studioへの接続なしで実行されます。Studioはマネージドフェデレーション（サブグラフスキーマのプッシュ、ルーターの自動更新）を追加し、これは大規模では非常に有用ですが、必須ではありません。
+
+**サブグラフ間の認証はどのように処理しますか？**
+ルーターからすべてのサブグラフに`Authorization`ヘッダーを伝播させます（`headers.all.request.propagate`を設定）。各サブグラフはトークンを独立して検証するか、共有認証ライブラリを使用できます。リクエストボディの`userId`クレームは決して信用せず、常にJWTを検証してください。
+
+**フェデレーションとモノリスのパフォーマンスオーバーヘッドはどれくらいですか？**
+単純なクエリの場合、サブグラフホップごとに5〜15msの追加レイテンシ（クラスター内のネットワークRTT）を予想してください。複雑なマルチサブグラフクエリの場合、並列実行がこれを最小限に抑えます。Apollo RouterのRustクエリプランナーは1ms未満のオーバーヘッドを追加します。大規模では、組織的なメリット（チームの自律性、独立したデプロイ）がレイテンシコストをはるかに上回ります。
+
+## まとめ
+
+GraphQL Federationは単なる技術的なパターンではなく、組織のスケーリング戦略です。これを習得したチームは、サブグラフの変更を独立してデプロイし、調整のオーバーヘッドなしにスキーマを反復し、自身のAPI部分を独自のペースで進化させることができます。
+
+主要な原則は、エンティティをきれいに所有し、DataLoaderで`__resolveReference`を実装し、`@requires`の依存関係を明示的に宣言し、ルーターに結合を任せることです。CIでの構成検証は、最も一般的なチーム間の破損を防ぎます。
+
+## こちらもどうぞ
+
+- [Advanced TypeScript Patterns for Enterprise Applications](/en/blog/ts-advanced-patterns)
+- [TypeScript Generics: Advanced Patterns for Type-Safe APIs](/en/blog/typescript-generics-advanced-patterns)
+- [Building a Modern TypeScript Monorepo](/en/blog/typescript-monorepo-guide)
+- [Vitest Monorepo Unit Testing Performance Optimization](/en/blog/vitest-monorepo-unit-testing-performance)

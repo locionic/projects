@@ -1,0 +1,357 @@
+---
+draft: false
+images: ['https://imgbed.locionic.com/file/1784441606582_why-pipes-sometimes-get-stuck-buffering.jpg']
+title: "パイプが「詰まる」理由：バッファリング"
+date: '2024-11-29'
+lastUpdated: '2026-09-22'
+tags: ["terminal", "linux"]
+category: Tech
+summary: "パイプライン実行中にターミナルがフリーズした時、私は1時間も間違ったデバッグをしていました。この記事では、実際に何が起こっていたのか、そして数秒で修正する方法を説明します。"
+---
+
+ライブサーバーのログを監視するために、いくつかのUnixコマンドを連結します。構文は完璧です。
+
+```bash
+tail -f access.log | grep --color=never "POST /api/checkout" | awk '{print $1, $4, $7}'
+```
+
+Enterキーを押すと、一瞬だけ期待できそうな雰囲気になります。しかし、その後は完全な沈黙。カーソルが点滅したままです。監視ダッシュボードが点灯しているので、リクエストがサーバーに到達していることは分かります。しかし、ターミナルは一行も出力しません。
+
+5分後、`Ctrl+C`を押します。突然、50行もの大量のテキストが一度に画面に溢れ出し、ターミナルはプロンプトに戻ります。
+
+あなたはまさに**I/Oバッファリング**の餌食になったのです。
+
+<AudioPlayer src="/static/audio/why-pipes-sometimes-get-stuck-buffering.mp3" title="Executive Audio Briefing" />
+
+<Callout type="danger" title="パイプバッファリングのパラドックス">
+インタラクティブなターミナル使用では、プログラムは改行（`\n`）ごとにその出力をフラッシュします。しかし、プログラムの標準出力をUnixパイプ（`|`）に接続した瞬間、C標準ライブラリ（`libc`）は自動的に**行バッファリング**から**フルブロックバッファリング**（通常4,096または8,192バイト）に切り替わります。この4KB～8KBのバッファが完全に満たされるまで、下流のツールには何も到達しません。
+</Callout>
+
+このガイドでは、Unixの抽象化レイヤーを剥がし、標準I/Oが内部でどのように動作するかを調べ、カーネルとユーザーランドのバッファリング層を検証し、パイプラインをリアルタイムでストリーミングし続けるために必要なすべてのツールとフラグを探ります。
+
+---
+
+## 二重のバッファリング層：ユーザーランド vs カーネル
+
+パイプラインのレイテンシをトラブルシューティングする際、開発者はしばしば**ユーザーランドストリームバッファリング**と**カーネルパイプ容量**を混同します。どちらも存在しますが、オペレーティングシステムのまったく異なる層で動作します。
+
+```
+Process A (User Space)         Kernel Space                   Process B (User Space)
+┌───────────────────────┐      ┌─────────────────────────┐    ┌───────────────────────┐
+│ Application Code      │      │                         │    │ Application Code      │
+│  └─ printf("hello\n") │      │                         │    │  └─ fgets(...)        │
+│          │            │      │                         │    │          ▲            │
+│ ┌────────▼──────────┐ │      │                         │    │ ┌────────┴──────────┐ │
+│ │ libc stdio buffer │ │      │                         │    │ │ libc stdio buffer │ │
+│ │ (4KB - 8KB)       │ │      │                         │    │ │ (4KB - 8KB)       │ │
+│ └────────┬──────────┘ │      │                         │    │ └────────▲──────────┘ │
+└──────────┼────────────┘      │                         │    └──────────┼────────────┘
+           │ write(fd, buf)    │                         │               │ read(fd, buf)
+           ▼                   │                         │               │
+┌──────────────────────────────┴─────────────────────────┴───────────────┴────────────┐
+│ Linux Kernel Pipe Ring Buffer (Default: 65,536 bytes / 16 memory pages)             │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1. ユーザーランド標準I/Oバッファリング（libcの`FILE*`）
+標準Cライブラリ（`glibc`、`musl`）は、生のカーネルファイルディスクリプタを高レベルの`FILE*`ストリーム（`stdin`、`stdout`、`stderr`）でラップします。システムコール（`write(2)`および`read(2)`）は、CPUをユーザーモードとカーネルモードの間で切り替える必要があるため、計算コストが高いです。
+
+スループットを最適化するために、`libc`は`<stdio.h>`で定義された3つのバッファリング規律を提供します。
+
+- **非バッファリング（`_IONBF`）**: 文字は書き込まれるとすぐに`write()`を介してカーネルに送信されます。`stderr`は、プロセスが直後にクラッシュしてもエラーメッセージが表示されるように、デフォルトでこれを使用します。
+- **行バッファリング（`_IOLBF`）**: 改行（`\n`）が検出されるまで文字が蓄積され、その時点で`libc`は単一の`write()`呼び出しでバッファをカーネルにフラッシュします。
+- **フルバッファリング / ブロックバッファリング（`_IOFBF`）**: 固定サイズのバッファ（`BUFSIZ`で定義され、通常4,096または8,192バイト）が満たされるまで文字が蓄積されます。改行は通常の文字として扱われ、フラッシュをトリガーしません。
+
+### `libc`が決定する方法：`isatty(3)`システムコール
+プログラムが起動すると、`libc`は`isatty(fileno(stdout))`を呼び出して、標準出力がどこを指しているかを調べます。
+
+```c
+// Simplified pseudo-code inside libc initialization:
+if (isatty(STDOUT_FILENO)) {
+    // Standard output is connected to an interactive terminal (PTY/TTY)
+    setvbuf(stdout, NULL, _IOLBF, BUFSIZ); // Line buffering
+} else {
+    // Standard output is redirected to a file or a PIPE (|)
+    setvbuf(stdout, NULL, _IOFBF, BUFSIZ); // Full block buffering!
+}
+```
+
+これで謎が解けました。**まったく同じバイナリが、単独で実行される場合とパイプの前に配置される場合とで異なる動作をするのです！**
+
+`tail -f file | grep "pattern"`を実行すると、`grep`の出力はTTYではありません。匿名パイプを介して`awk`に接続されています。したがって、`grep`の`libc`は自動的にブロックバッファリングに切り替わり、一致した各行を4,096バイトが蓄積されるまで保持してから、`awk`に渡します。
+
+---
+
+## おなじみの容疑者：コマンドラインフラグ
+
+ほとんどの標準的なUnixユーティリティは、非バッファリングまたは行バッファリング出力を強制するためのフラグを提供しています。このチートシートを手元に置いておきましょう。
+
+| コマンド | フラグ / オプション | 説明 |
+|---|---|---|
+| **`grep`** | `--line-buffered` | 一致した改行ごとにアウトプットをフラッシュします。 |
+| **`sed`** | `-u` または `--unbuffered` | 各行を処理した後にアウトプットをフラッシュします。 |
+| **`awk`** | `fflush()` | print文内で標準出力を明示的にフラッシュします。 |
+| **`jq`** | `--unbuffered` | 出力されたアイテムごとにJSON出力をフラッシュします。 |
+| **`tcpdump`** | `-l` | stdoutを行バッファリングにし、パイプ内でパケットがすぐに表示されるようにします。 |
+| **`tr`** | `-u` (BSD/macOS上) | 非バッファリング変換。 |
+| **`cut`** | *ネイティブフラグなし* | `stdbuf`または`awk`による書き換えが必要です。 |
+| **`sort`** | *ストリームでは不可能* | ソートする前に`EOF`を消費する必要があります。無制限のパイプをストリーミングすることはできません。 |
+
+### ログ監視パイプラインの修正
+
+導入部で詰まったパイプラインをもう一度見てみましょう。
+
+```bash
+# ❌ FROZEN PIPELINE: grep and awk will block-buffer
+tail -f access.log | grep "POST /api/checkout" | awk '{print $1, $4, $7}'
+
+# ✅ REAL-TIME PIPELINE: Instant streaming
+tail -f access.log | grep --line-buffered "POST /api/checkout" | awk '{print $1, $4, $7; fflush()}'
+```
+
+パイプライン内の**すべての中間段階**が非バッファリングでなければならないことに注意してください。もし`grep`が行ごとにフラッシュしても`awk`がブロックバッファリングするなら、パイプラインは`awk`でやはりフリーズしてしまいます。
+
+---
+
+## コードを制御できる場合：言語固有の修正
+
+パイプラインに参加するヘルパースクリプトを作成する場合、stdoutのバッファリングを明示的に設定します。
+
+<Stepper>
+  <Step title="Python">
+    Pythonの標準ライブラリは、stdoutがリダイレクトされるとデフォルトでブロックバッファリングを行います。行バッファリングを強制するには、主に3つの方法があります。
+    
+    1. `-u`フラグを渡す: `python3 -u script.py | consumer`
+    2. 環境変数`export PYTHONUNBUFFERED=1`を設定する
+    3. コード内でstdoutをプログラム的に再設定する:
+    ```python
+    import sys
+    # Python 3.7+ idiomatic configuration
+    sys.stdout.reconfigure(line_buffering=True)
+    
+    # Or explicitly flush on individual print statements:
+    print("Event processed", flush=True)
+    ```
+  </Step>
+  <Step title="C & C++">
+    C言語では、`main()`の冒頭で`setvbuf()`を呼び出します。
+    ```c
+    #include <stdio.h>
+
+    int main(void) {
+        // Force line buffering even when redirected to a pipe
+        setvbuf(stdout, NULL, _IOLBF, 0);
+
+        // Or disable buffering entirely:
+        // setvbuf(stdout, NULL, _IONBF, 0);
+
+        printf("Immediate output\n");
+        return 0;
+    }
+    ```
+    C++では、`std::endl`は自動的に改行を挿入し、ストリームをフラッシュします（`std::cout << "msg" << std::endl;`）。あるいは、`std::unitbuf`を有効にします。
+    ```cpp
+    #include <iostream>
+
+    int main() {
+        std::ios_base::sync_with_stdio(false);
+        std::cout << std::unitbuf; // Flushes after every insertion
+        return 0;
+    }
+    ```
+  </Step>
+  <Step title="Node.js & Go">
+    Node.jsでは、パイプへの書き込み時にPOSIXストリームで`process.stdout.write()`は非同期ですが、Nodeは行バッファリングを実行しません。
+    ```javascript
+    // In Node.js, process.stdout handles buffering internally.
+    // If you need immediate transmission:
+    process.stdout.write(data + '\n');
+    ```
+    Goでは、標準の`fmt.Println`は基になるファイルディスクリプタ（`os.Stdout`）に直接書き込み、デフォルトではバッファリングされません。ただし、stdoutを`bufio.Writer`でラップする場合は、必ずフラッシュしてください。
+    ```go
+    writer := bufio.NewWriter(os.Stdout)
+    writer.WriteString("streaming message\n")
+    writer.Flush() // Essential!
+    ```
+  </Step>
+  <Step title="Ruby & Perl">
+    Rubyの場合:
+    ```ruby
+    $stdout.sync = true # Disables full buffering globally
+    ```
+    Perlの場合:
+    ```perl
+    $| = 1; # Autoflush the currently selected output handle
+    ```
+  </Step>
+</Stepper>
+
+---
+
+## フラグが存在しない場合：`stdbuf`と`unbuffer`
+
+古いバイナリ、プロプライエタリなクローズドソースCLI、または`cut`のような行バッファリングフラグを持たないツールを使用している場合はどうなるでしょうか？
+
+2つの強力なシステムユーティリティがあります。
+
+<ConceptCompare
+  conceptA="stdbuf (GNU Coreutils)"
+  conceptB="unbuffer (Expect)"
+  descriptionA="LD_PRELOADを介して共有ライブラリを注入し、main()が実行される前にsetvbuf()を呼び出します。軽量で、PTYのオーバーヘッドはありません。"
+  descriptionB="擬似端末（PTY）内でターゲットコマンドを起動します。isatty()をだましてtrueを返させます。わずかに重いです。"
+/>
+
+### 1. `stdbuf` (エレガントな解決策)
+`stdbuf`はGNU Coreutilsの一部であり、事実上すべてのLinuxディストリビューションで利用可能です。ソースコードに触れることなくストリームバッファリングを変更します。
+
+- `-i`: 標準入力モード（非バッファリングの場合は`0`、行バッファリングの場合は`L`、または`1M`のようなサイズ）
+- `-o`: 標準出力モード（`0`、`L`、またはサイズ）
+- `-e`: 標準エラーモード（`0`、`L`、またはサイズ）
+
+```bash
+# Force cut and tr to be line-buffered in a live pipeline
+tail -f access.log | stdbuf -oL cut -d' ' -f1,4,7 | stdbuf -oL tr '[:lower:]' '[:upper:]'
+```
+
+**`stdbuf`の内部動作:**
+`stdbuf -oL cmd`を実行すると、環境変数`LD_PRELOAD=/usr/lib/coreutils/libstdbuf.so`を設定し、`_STDBUF_O=L`を渡します。`cmd`の`main()`関数が呼び出される前に、`libstdbuf.so`のコンストラクタが実行され、環境変数を解析して`setvbuf(stdout, NULL, _IOLBF, 0)`を呼び出します。これはターゲットアプリケーションにとって完全に透過的です。
+
+### 2. `unbuffer` (普遍的なPTYハック)
+プログラムが`libc`を静的にリンクしている場合（例：Goまたはmuslでコンパイルされた場合）、または内部で独自のバッファリングを意図的にリセットしている場合、`LD_PRELOAD`は機能しません。
+
+`unbuffer`（`expect`パッケージにバンドルされています）は、擬似端末（PTY）デバイスを作成し、その中でプログラムを実行します。
+
+```bash
+# Install expect package if not present:
+# sudo apt-get install expect
+
+unbuffer some_stubborn_cli | grep "ERROR"
+```
+
+プロセスが擬似端末に接続されているため、`isatty(STDOUT_FILENO)`は`1`（true）を返します。プログラムは、対話型の人間の端末にレンダリングしていると本当に信じ、自然に行バッファリングを有効にします。
+
+---
+
+## `strace`と`/proc`で詰まったパイプを検査する
+
+本番環境でパイプラインがハングしているように見える場合、それが入力待ち状態なのか、バッファに詰まっているのかをどのように確認しますか？
+
+### 1. `strace`でシステムコールをトレースする
+実行中のプロセスPIDに`strace`をアタッチして、どのシステムコールが発火しているかを検査します。
+
+```bash
+# Find the PID of grep in your pipeline
+pgrep -f "grep --color=never"
+
+# Trace read and write system calls
+strace -p <PID> -e trace=read,write
+```
+
+- `read(0, ...)`が継続的にデータを返しているのに、**`write(1, ...)`呼び出しがゼロ**の場合、プロセスはデータを受信してユーザーランドの`libc`バッファ内に蓄積しています！
+- `write(1, "...", 4096) = 4096`が大きなブロックで断続的に発火している場合、ブロックバッファリングが確認されます。
+- `write(1, "...", 80) = 80`が各行で発火している場合、パイプラインは正常に行バッファリングされています。
+
+### 2. `/proc`でカーネルパイプバッファを検査する
+Linuxは、すべてのパイプに対してカーネル内の循環バッファを割り当てます。その容量と現在の充填レベルは、`/proc`を介して直接検査できます。
+
+```bash
+# Look up open file descriptors for the process
+ls -l /proc/<PID>/fd/
+
+# fd 0 -> pipe:[1492023]
+# fd 1 -> pipe:[1492024]
+
+# View pipe metadata and capacity (Linux 2.6.35+)
+cat /proc/<PID>/fdinfo/1
+```
+
+出力:
+```
+pos:    0
+flags:  01
+mnt_id: 15
+ino:    1492024
+size:   0
+```
+
+デフォルトでは、Linuxカーネルパイプは**65,536バイト**（4,096バイトの16ページ）を保持します。`fcntl`システムコールと`F_SETPIPE_SZ`を使用して、カーネルパイプの容量をプログラムで変更できます。
+
+```c
+// Expand pipe capacity to 1MB to prevent upstream producers from blocking
+fcntl(pipe_fd[1], F_SETPIPE_SZ, 1048576);
+```
+
+---
+
+## バッファリングが存在する理由：スループットのトレードオフ
+
+バッファリングがパイプラインの遅延を引き起こすのであれば、なぜオペレーティングシステムはデフォルトですべての場所でバッファリングを無効にしないのでしょうか？
+
+その答えは**スループット**です。
+
+すべてのシステムコールはCPUのコンテキストスイッチのオーバーヘッドを伴います。ユーザーレジスタの保存、カーネルリング0への切り替え、メモリポインタの検証、スケジューラ状態の更新、ユーザーレジスタの復元などです。
+
+5000万行を含む10GBのApacheアクセスログを処理することを考えてみましょう。
+- **行バッファリング（非バッファリング）の場合**: 50,000,000回の`write()`システムコールと50,000,000回の`read()`システムコール。CPUは実行サイクルの70%以上をカーネルコンテキストスイッチに費やします。合計時間: 約45秒。
+- **64KBブロックバッファリングの場合**: 約160,000回の`write()`システムコールのみ。システムコールのオーバーヘッドはほぼゼロになり、ディスクとCPUキャッシュが最大のメモリ帯域幅で動作できるようになります。合計時間: 約3.2秒。
+
+<Callout type="info" title="バッファリングの黄金律">
+ライブストリーミング、ログのテール、インタラクティブなパイプライン、レイテンシが重要な監視アラートには**行バッファリング**を使用します。バッチ処理、ログローテーション、バックアップ、スループットが重要な大容量データ変換には**ブロックバッファリング**を使用します。
+</Callout>
+
+---
+
+## パイプラインバッファリングの意思決定ツリー
+
+```
+Are you processing live/streaming data (e.g. tail -f, tcpdump)?
+│
+├── NO (Batch data, large file) ──► Keep default block buffering (Fastest throughput)
+│
+└── YES (Real-time stream)
+     │
+     ├── Does the tool have a line-buffering flag?
+     │    ├── YES ──► Use grep --line-buffered, sed -u, jq --unbuffered
+     │    └── NO
+     │         ├── Can you edit the source code?
+     │         │    ├── YES ──► Add setvbuf(stdout, NULL, _IOLBF, 0) or flush=True
+     │         │    └── NO
+     │         │         ├── Is dynamically linked glibc?
+     │         │         │    ├── YES ──► Wrap with: stdbuf -oL <cmd>
+     │         │         │    └── NO  ──► Wrap with: unbuffer <cmd>
+```
+
+---
+
+## インタラクティブな知識チェック
+
+<Quiz
+  question="grepがawkにパイプされると、なぜ行バッファリングからブロックバッファリングに切り替わるのですか？"
+  options={[
+    "grepはawkが高速なコンパイル済みバイナリであることを検出するから。",
+    "awkが8KBチャンクを要求するためにSIGPIPEシグナルを送信するから。",
+    "標準Cライブラリがisatty(1)を呼び出し、stdoutが端末ではなくパイプであることを検出して_IOFBFに切り替わるから。",
+    "Linuxカーネルが、親がbashであるすべてのプロセスに対してフルバッファリングを強制するから。"
+  ]}
+  correctIndex={2}
+  explanation="Cプログラムが初期化される際、libcはisatty(fileno(stdout))を問い合わせます。stdoutが端末（TTY）を指している場合、行バッファリング（_IOLBF）が選択されます。パイプやファイルにリダイレクトされた場合、libcはスループットを最適化するためにフルブロックバッファリング（_IOFBF）を選択します。"
+/>
+
+---
+
+## まとめ
+
+次に、ライブファイルをテールしているときにターミナルパイプラインがフリーズした場合は、別の言語でパイプラインを書き直す必要はありません。
+
+2つの基本的なレイヤーを思い出してください。
+1. 標準ユーティリティは、`isatty(3)`がfalseであるためブロックバッファリングを行います。
+2. `--line-buffered`、`stdbuf -oL`、または言語固有のフラッシュ呼び出しで修正します。
+
+ストリームバッファリングを習得することで、曖昧なパイプラインの停止が、瞬時に観測可能なデータストリームに変わります。
+
+## こちらもおすすめ
+
+- [ターミナルプログラムの暗黙のルール](/en/blog/unwritten-rules-of-terminal-programs)
+- [GoでIPアドレスを検索する際にメモリ使用量を削減する方法](/en/blog/using-less-memory-to-look-up-ip-addresse)
+- [SSHとSCP：すべての開発者が本当に理解すべき2つのツール](/en/blog/ssh-scp)
+- [Dockerローカル開発：不足しているマニュアル](/en/blog/docker-compose-local-development)
