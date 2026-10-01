@@ -1,0 +1,502 @@
+---
+title: 'ConnectRPC vs gRPC in 2026: End-to-End Type Safety for Web Browsers & Go Microservices'
+images: ['/static/images/grpc-vs-connectrpc-typescript-golang-2026.png']
+date: '2026-10-01'
+lastUpdated: '2026-10-01'
+tags: ["grpc", "backend", "architecture", "microservices"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: 'Comprehensive guide covering connectrpc vs grpc in 2026: end-to-end type safety for web browsers & go microservices with production-grade architecture and code examples.'
+---
+
+The proliferation of microservices and rich client applications necessitates robust, performant, and type-safe communication protocols. While gRPC has been a cornerstone for inter-service communication, its browser compatibility has historically been a significant hurdle, often requiring proxies like Envoy or specialized gRPC-Web implementations. ConnectRPC, developed by Buf, addresses these limitations by offering a protocol that is gRPC-compatible, browser-native, and designed for ubiquitous adoption. This guide dissects ConnectRPC and traditional gRPC, demonstrating how to build a dual-stack Go microservice with end-to-end type safety for web browsers without complex proxying.
+
+## The gRPC Browser Conundrum
+
+Traditional gRPC relies on HTTP/2's advanced features (e.g., multiplexing, server push, binary framing) and trailers for metadata. Browsers, however, primarily expose `XMLHttpRequest` and `fetch` APIs, which are HTTP/1.1-centric and lack direct control over HTTP/2 frames or trailer access. This fundamental mismatch necessitates a translation layer for browser-based gRPC clients.
+
+Common solutions include:
+1.  **gRPC-Web:** A protocol layer that translates gRPC calls into a browser-compatible format (typically HTTP/1.1 with base64-encoded Protobuf messages and specific headers). This requires a proxy (e.g., Envoy, Nginx with `grpc_web_module`) to translate gRPC-Web back to gRPC for the backend.
+2.  **HTTP/JSON Gateways:** Generating RESTful JSON APIs from Protobuf definitions, often using `grpc-gateway`. This loses the benefits of Protobuf's binary serialization and gRPC's streaming capabilities, and requires maintaining two distinct API surfaces.
+
+Both approaches introduce operational overhead, increased latency, or compromise on the core benefits of gRPC.
+
+## ConnectRPC: A Pragmatic Evolution
+
+ConnectRPC (formerly `connect-go`) is an open-source RPC framework built on Protobuf. Its key innovation lies in its wire protocol, which supports three distinct modes:
+
+1.  **Connect (Unary & Streaming):** A simple, HTTP/1.1-friendly protocol using POST requests, `Content-Type: application/proto` (or `application/json`), and `Connect-Protocol-Version: 1` header. It uses HTTP trailers for metadata, but also supports a "trailer-encoded" mode where trailers are sent in the response body for browser compatibility.
+2.  **gRPC:** The standard gRPC protocol over HTTP/2.
+3.  **gRPC-Web:** The standard gRPC-Web protocol over HTTP/1.1.
+
+This multi-protocol support allows a single ConnectRPC server to serve clients using any of these protocols, including native gRPC clients, gRPC-Web clients, and Connect clients (which are browser-native without proxies). This flexibility is critical for progressive adoption and broad client compatibility.
+
+## Building a Dual-Stack Go Microservice with ConnectRPC
+
+We will demonstrate a simple `Greeter` service.
+
+### 1. Define the Protobuf Schema
+
+`proto/greeter/v1/greeter.proto`:
+
+```protobuf
+syntax = "proto3";
+
+package greeter.v1;
+
+option go_package = "github.com/locionic/connectrpc-demo/gen/greeter/v1;greeter_v1";
+
+service GreeterService {
+  rpc SayHello(SayHelloRequest) returns (SayHelloResponse) {}
+  rpc SayHelloStream(SayHelloRequest) returns (stream SayHelloResponse) {}
+}
+
+message SayHelloRequest {
+  string name = 1;
+}
+
+message SayHelloResponse {
+  string message = 1;
+}
+```
+
+### 2. Generate Go Server and Client Stubs
+
+We use `buf` for Protobuf compilation and code generation.
+
+`buf.gen.yaml`:
+
+```yaml
+version: v1
+plugins:
+  - plugin: buf.build/connectrpc/go:v1.16.2
+    out: gen
+    opt: paths=source_relative
+  - plugin: buf.build/grpc/go:v1.3.0
+    out: gen
+    opt: paths=source_relative
+  - plugin: buf.build/protocolbuffers/go:v1.31.0
+    out: gen
+    opt: paths=source_relative
+  - plugin: buf.build/connectrpc/web:v0.13.0
+    out: web/src/gen
+    opt:
+      - target=ts
+      - es_modules=true
+      - keep_empty_files=true
+```
+
+Run `buf generate` to produce the Go and TypeScript stubs.
+
+```bash
+buf generate
+```
+
+This will create:
+- `gen/greeter/v1/greeter_v1.pb.go`: Standard Protobuf Go types.
+- `gen/greeter/v1/greeter_v1connect.pb.go`: ConnectRPC Go server and client stubs.
+- `web/src/gen/greeter/v1/greeter_v1_connect.ts`: ConnectRPC TypeScript client stubs.
+- `web/src/gen/greeter/v1/greeter_v1.ts`: Protobuf TypeScript types.
+
+### 3. Implement the Go Microservice
+
+The ConnectRPC Go library (`connect-go`) provides a `NewServeMux` that can register services and handle all three protocols (Connect, gRPC, gRPC-Web) automatically.
+
+`main.go`:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c" // h2c for HTTP/2 Cleartext
+	"golang.org/x/sync/errgroup"
+
+	"github.com/bufbuild/connect-go"
+	greeter_v1 "github.com/locionic/connectrpc-demo/gen/greeter/v1"
+	"github.com/locionic/connectrpc-demo/gen/greeter/v1/greeter_v1connect"
+)
+
+// greeterService implements greeter_v1connect.GreeterServiceHandler.
+type greeterService struct{}
+
+// SayHello implements greeter_v1connect.GreeterServiceHandler.
+func (s *greeterService) SayHello(
+	ctx context.Context,
+	req *connect.Request[greeter_v1.SayHelloRequest],
+) (*connect.Response[greeter_v1.SayHelloResponse], error) {
+	log.Printf("Received SayHello request from %s", req.Peer().Addr)
+	log.Printf("Request headers: %v", req.Header())
+
+	response := &greeter_v1.SayHelloResponse{
+		Message: fmt.Sprintf("Hello, %s!", req.Msg.Name),
+	}
+	return connect.NewResponse(response), nil
+}
+
+// SayHelloStream implements greeter_v1connect.GreeterServiceHandler for server streaming.
+func (s *greeterService) SayHelloStream(
+	ctx context.Context,
+	req *connect.Request[greeter_v1.SayHelloRequest],
+	stream *connect.ServerStream[greeter_v1.SayHelloResponse],
+) error {
+	log.Printf("Received SayHelloStream request from %s", req.Peer().Addr)
+	log.Printf("Request headers: %v", req.Header())
+
+	for i := 0; i < 3; i++ {
+		msg := fmt.Sprintf("Stream message %d for %s", i+1, req.Msg.Name)
+		if err := stream.Send(&greeter_v1.SayHelloResponse{Message: msg}); err != nil {
+			return err
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return nil
+}
+
+func main() {
+	// Create a new ConnectRPC mux.
+	// This mux handles routing for Connect, gRPC, and gRPC-Web protocols.
+	mux := http.NewServeMux()
+	path, handler := greeter_v1connect.NewGreeterServiceHandler(&greeterService{})
+	mux.Handle(path, handler)
+
+	// Configure CORS for browser clients.
+	// In a production environment, this should be more restrictive.
+	corsHandler := func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*") // Allow all origins for demo
+			w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Connect-Protocol-Version, Connect-Accept-Encoding, Connect-Content-Encoding, Grpc-Web, X-Grpc-Web")
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			h.ServeHTTP(w, r)
+		})
+	}
+
+	// Create an HTTP server.
+	// h2c.NewHandler enables HTTP/2 Cleartext, allowing clients to speak HTTP/2 without TLS.
+	// This is suitable for local development or internal networks where TLS is handled by a proxy.
+	// For production internet-facing services, always use TLS (http.Server with TLS config).
+	server := &http.Server{
+		Addr: ":8080",
+		Handler: h2c.NewHandler(corsHandler(mux), &http2.Server{
+			// Optional: Configure HTTP/2 server settings
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	// Graceful shutdown.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var g errgroup.Group
+	g.Go(func() error {
+		log.Printf("Server listening on %s", server.Addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			return fmt.Errorf("server error: %w", err)
+		}
+		return nil
+	})
+
+	// Wait for interrupt signal.
+	<-ctx.Done()
+	log.Println("Shutting down server...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("Server shutdown failed: %v", err)
+	}
+	log.Println("Server gracefully stopped.")
+
+	if err := g.Wait(); err != nil {
+		log.Fatalf("Server encountered an error during shutdown: %v", err)
+	}
+}
+```
+
+### 4. Implement the TypeScript Web Client
+
+The generated ConnectRPC TypeScript client (`@bufbuild/connect-web`) provides a clean API for interacting with the service. It automatically handles the Connect protocol, making it browser-native.
+
+`web/src/client.ts`:
+
+```typescript
+import { createConnectTransport } from "@bufbuild/connect-web";
+import { GreeterService } from "./gen/greeter/v1/greeter_v1_connect";
+import { SayHelloRequest } from "./gen/greeter/v1/greeter_v1";
+
+// Configure the Connect transport.
+// By default, it uses the Connect protocol.
+// For gRPC-Web, you would use `createGrpcWebTransport`.
+const transport = createConnectTransport({
+  baseUrl: "http://localhost:8080",
+});
+
+// Create a client for the GreeterService.
+const client = new GreeterService(transport);
+
+async function callSayHello() {
+  try {
+    const request = new SayHelloRequest({ name: "ConnectRPC Web" });
+    const response = await client.sayHello(request);
+    console.log("SayHello Response:", response.message);
+  } catch (error) {
+    console.error("SayHello Error:", error);
+  }
+}
+
+async function callSayHelloStream() {
+  try {
+    const request = new SayHelloRequest({ name: "ConnectRPC Stream Client" });
+    const stream = client.sayHelloStream(request);
+
+    console.log("Starting SayHelloStream...");
+    for await (const response of stream) {
+      console.log("SayHelloStream Response:", response.message);
+    }
+    console.log("SayHelloStream finished.");
+  } catch (error) {
+    console.error("SayHelloStream Error:", error);
+  }
+}
+
+// Call the RPCs
+callSayHello();
+callSayHelloStream();
+```
+
+To run the web client, you'll need a basic HTML file and a bundler (e.g., Webpack, Vite, Parcel).
+
+`web/index.html`:
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ConnectRPC Web Client</title>
+</head>
+<body>
+    <h1>ConnectRPC Web Client Demo</h1>
+    <p>Check the browser console for RPC responses.</p>
+    <script type="module" src="./src/client.ts"></script>
+</body>
+</html>
+```
+
+`web/package.json`:
+
+```json
+{
+  "name": "connectrpc-web-client",
+  "version": "1.0.0",
+  "description": "ConnectRPC web client demo",
+  "main": "index.js",
+  "scripts": {
+    "start": "vite",
+    "build": "tsc && vite build"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "typescript": "^5.0.2",
+    "vite": "^5.0.8"
+  },
+  "dependencies": {
+    "@bufbuild/connect-web": "^0.13.0",
+    "@bufbuild/protobuf": "^1.6.0"
+  }
+}
+```
+
+Install dependencies and start the web client:
+
+```bash
+cd web
+npm install
+npm start
+```
+
+Navigate to `http://localhost:5173` (or whatever port Vite assigns) and observe the console output.
+
+## Architectural Comparison and Tradeoffs
+
+| Feature/Aspect        | Traditional gRPC (HTTP/2)                                | ConnectRPC (Connect Protocol)                                  | gRPC-Web (via ConnectRPC server)                               | REST/JSON (e.g., `grpc-gateway`)                               |
+| :-------------------- | :------------------------------------------------------- | :------------------------------------------------------------- | :------------------------------------------------------------- | :------------------------------------------------------------- |
+| **Protocol**          | HTTP/2                                                   | HTTP/1.1 or HTTP/2                                             | HTTP/1.1                                                       | HTTP/1.1 (typically)                                           |
+| **Browser Native**    | No (requires proxy/gRPC-Web)                             | Yes (via `fetch` or `XHR`)                                     | No (requires proxy or server-side gRPC-Web support)            | Yes                                                            |
+| **Proxy Required**    | Yes (for browser clients, e.g., Envoy)                   | No (for browser clients)                                       | No (if server supports gRPC-Web directly, like ConnectRPC)     | No                                                             |
+| **Serialization**     | Protobuf (binary)                                        | Protobuf (binary) or JSON                                      | Protobuf (binary, base64-encoded)                              | JSON (text)                                                    |
+| **Streaming**         | Bidirectional, Server, Client                            | Server, Client (unary-like for client stream), Bidirectional   | Server, Client (unary-like for client stream)                  | No native streaming (can simulate with SSE/WebSockets)         |
+| **Wire Efficiency**   | High (binary, HTTP/2 frames)                             | High (binary Protobuf), Moderate (JSON)                        | Moderate (base64 overhead)                                     | Low (text-based, verbose)                                      |
+| **Type Safety**       | Excellent (Protobuf)                                     | Excellent (Protobuf)                                           | Excellent (Protobuf)                                           | Moderate (schema definitions like OpenAPI, but runtime checks) |
+| **Tooling**           | Mature (protoc, various language plugins)                | Excellent (buf, connect-go, connect-web, etc.)                 | Good (grpc-web client, Envoy config)                           | Good (OpenAPI generators, `grpc-gateway`)                      |
+| **Complexity**        | Moderate (HTTP/2, TLS, proxy for web)                    | Low (HTTP/1.1 friendly, no proxy for web)                      | Moderate (gRPC-Web protocol details, server-side support)      | Moderate (mapping Protobuf to HTTP verbs/paths)                |
+| **Latency**           | Low                                                      | Low (Protobuf), Moderate (JSON)                                | Moderate (base64 encoding/decoding)                            | Moderate (JSON parsing/serialization)                          |
+| **Bundle Size (TS)**  | `grpc-web` client + Protobuf runtime                     | `@bufbuild/connect-web` + `@bufbuild/protobuf`                 | `grpc-web` client + Protobuf runtime                           | N/A (custom fetch calls or OpenAPI client)                     |
+| **Use Cases**         | Inter-service, mobile, high-perf desktop apps            | Web browsers, inter-service, mobile, flexible deployments      | Web browsers (legacy, or when server only supports gRPC-Web)   | Public APIs, simple CRUD, broad client compatibility           |
+
+## Serialization Latency and Bundle Size
+
+### Serialization Latency
+
+Protobuf's binary serialization is inherently more efficient than JSON. While ConnectRPC supports JSON, its primary benefit comes from Protobuf.
+
+**Benchmark (Conceptual, based on common knowledge):**
+For a typical message payload (e.g., 1KB):
+- **Protobuf (binary):** ~10-100 microseconds (encode/decode)
+- **JSON:** ~100-1000 microseconds (encode/decode)
+
+This difference becomes significant at high throughput or for large payloads. ConnectRPC leverages Protobuf's efficiency directly.
+
+### Bundle Size (TypeScript Client)
+
+The client-side JavaScript bundle size is a critical factor for web performance.
+
+-   **`@bufbuild/connect-web` + `@bufbuild/protobuf`**:
+    -   `@bufbuild/protobuf`: ~15KB (minified + gzipped) - provides core Protobuf runtime.
+    -   `@bufbuild/connect-web`: ~10KB (minified + gzipped) - provides ConnectRPC transport.
+    -   **Total: ~25KB** + generated client stubs (negligible for small schemas).
+
+-   **`grpc-web` client + `google-protobuf`**:
+    -   `google-protobuf`: ~20KB (minified + gzipped) - provides core Protobuf runtime.
+    -   `grpc-web`: ~15KB (minified + gzipped) - provides gRPC-Web transport.
+    -   **Total: ~35KB** + generated client stubs.
+
+ConnectRPC offers a slightly smaller footprint due to its optimized runtime and simpler protocol handling for browser clients. Compared to a custom `fetch` implementation for REST, the Protobuf runtime adds overhead, but the benefits of type safety and serialization efficiency often outweigh this for complex applications.
+
+## Production Gotchas & Troubleshooting
+
+1.  **CORS Issues:**
+    *   **Symptom:** Browser clients fail with "Access to fetch has been blocked by CORS policy" errors.
+    *   **Cause:** The server is not sending appropriate `Access-Control-Allow-Origin`, `Access-Control-Allow-Methods`, and `Access-Control-Allow-Headers` headers. ConnectRPC and gRPC-Web use custom headers (`Connect-Protocol-Version`, `Grpc-Web`, `X-Grpc-Web`).
+    *   **Fix:** Implement a robust CORS middleware on your Go server. Ensure `OPTIONS` preflight requests are handled correctly. For production, restrict `Access-Control-Allow-Origin` to your client domains.
+
+    ```go
+    // Example CORS middleware (more robust than the simple one in main.go)
+    func NewCORSHandler(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            // Allow specific origins in production
+            w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173") // Or read from config
+            w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+            w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Connect-Protocol-Version, Connect-Accept-Encoding, Connect-Content-Encoding, Grpc-Web, X-Grpc-Web, X-User-ID, X-Request-ID") // Add any custom headers
+            w.Header().Set("Access-Control-Expose-Headers", "Connect-Protocol-Version, Connect-Accept-Encoding, Connect-Content-Encoding, Grpc-Web, X-Grpc-Web") // Expose headers client needs to read
+
+            if r.Method == http.MethodOptions {
+                w.WriteHeader(http.StatusOK)
+                return
+            }
+            next.ServeHTTP(w, r)
+        })
+    }
+    // In main: server.Handler = h2c.NewHandler(NewCORSHandler(mux), &http2.Server{})
+    ```
+
+2.  **HTTP/2 Cleartext (h2c) in Production:**
+    *   **Symptom:** Connection resets, cryptic errors when deploying `h2c` directly to an internet-facing endpoint.
+    *   **Cause:** `h2c` is for HTTP/2 without TLS. Public internet traffic *must* use TLS (HTTPS). Browsers and many proxies expect HTTP/2 over TLS (h2).
+    *   **Fix:** For production, configure `http.Server` with `TLSConfig` or deploy behind a reverse proxy (e.g., Nginx, Caddy, Envoy) that handles TLS termination and forwards HTTP/2 (or HTTP/1.1 for Connect/gRPC-Web) to your Go service. The Go server should then listen on plain HTTP/2 or HTTP/1.1.
+
+    ```go
+    // Production server with TLS (example)
+    // server := &http.Server{
+    //     Addr: ":8443",
+    //     Handler: corsHandler(mux), // No h2c.NewHandler needed if TLS is configured
+    //     TLSConfig: &tls.Config{
+    //         MinVersion: tls.VersionTLS12,
+    //         // ... other TLS settings
+    //     },
+    // }
+    // log.Fatal(server.ListenAndServeTLS("server.crt", "server.key"))
+    ```
+
+3.  **Streaming Issues with Proxies:**
+    *   **Symptom:** Server-side streaming or bidirectional streaming fails or hangs when a proxy is involved.
+    *   **Cause:** Some proxies (especially older ones or misconfigured ones) may buffer responses, terminate connections prematurely, or not correctly handle HTTP/2 stream semantics.
+    *   **Fix:** Ensure your proxy is configured for HTTP/2 passthrough or is explicitly aware of gRPC/ConnectRPC. For Nginx, use `grpc_pass` and ensure `proxy_buffering off;` for streaming endpoints. For ConnectRPC's Connect protocol, ensure the proxy doesn't buffer the response body, especially for trailer-encoded responses.
+
+4.  **Protobuf Version Mismatch:**
+    *   **Symptom:** Deserialization errors, unexpected field values, or `unknown field` warnings.
+    *   **Cause:** Client and server are using different versions of the Protobuf schema or generated code. This can happen during rolling deployments or if client and server are deployed from different codebases.
+    *   **Fix:** Implement strict schema versioning. Use `buf` breaking change detection. Ensure atomic deployments or backward/forward compatibility for a short period. Log unknown fields on the server for debugging.
+
+5.  **`Connect-Accept-Encoding` Header:**
+    *   **Symptom:** Client receives uncompressed responses when expecting compression, or vice-versa.
+    *   **Cause:** The `Connect-Accept-Encoding` header (or `grpc-accept-encoding` for gRPC) indicates supported compression algorithms. If the server doesn't support the client's preferred encoding or vice-versa, it falls back to uncompressed.
+    *   **Fix:** Ensure both client and server are configured to support common compression algorithms (e.g., `gzip`, `zstd`). ConnectRPC clients and servers handle this automatically, but custom interceptors or proxy configurations could interfere.
+
+## Frequently Asked Questions
+
+1.  **Can ConnectRPC replace REST entirely for web applications?**
+    Yes, for applications where end-to-end type safety, performance, and streaming capabilities are paramount, ConnectRPC is a superior alternative to REST. It provides a unified API surface, eliminating the need to maintain separate REST and gRPC APIs. For simple CRUD operations or public APIs where broad compatibility and human-readable JSON are priorities, REST might still be considered.
+
+2.  **How does ConnectRPC handle authentication and authorization?**
+    ConnectRPC integrates seamlessly with standard HTTP authentication mechanisms. You can use HTTP headers (e.g., `Authorization: Bearer <token>`) for JWTs or API keys. On the server side, ConnectRPC handlers can be wrapped with middleware to perform authentication and authorization checks, similar to how you would with any `http.Handler` in Go. The `connect-go` library provides `connect.WithInterceptor` for this purpose.
+
+    ```go
+    // Example ConnectRPC interceptor for authentication
+    func AuthInterceptor() connect.Interceptor {
+        return connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
+            return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+                authHeader := req.Header().Get("Authorization")
+                if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+                    return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("missing or invalid authorization header"))
+                }
+                token := strings.TrimPrefix(authHeader, "Bearer ")
+                // Validate token, extract user info, and add to context
+                // For demo:
+                if token != "valid-token" {
+                    return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("invalid token"))
+                }
+                ctx = context.WithValue(ctx, "userID", "user123") // Store user ID in context
+                return next(ctx, req)
+            }
+        })
+    }
+    // In main: path, handler := greeter_v1connect.NewGreeterServiceHandler(&greeterService{}, connect.WithInterceptors(AuthInterceptor()))
+    ```
+
+3.  **What about observability (logging, tracing, metrics)?**
+    ConnectRPC, being built on standard HTTP, integrates well with existing observability tools.
+    *   **Logging:** Server-side handlers can log requests and responses. Client-side, you can wrap the transport.
+    *   **Tracing:** `connect-go` and `connect-web` support OpenTelemetry. You can configure `connect.WithTracing()` on the server and `createConnectTransport` with `trace` options on the client to get distributed tracing out of the box.
+    *   **Metrics:** Standard HTTP metrics (request count, latency, error rates) can be collected by middleware. ConnectRPC also exposes specific metrics for RPC calls.
+
+4.  **Can I use ConnectRPC with existing gRPC services?**
+    Yes. A ConnectRPC server can act as a gRPC server, meaning existing gRPC clients (e.g., `grpc-go`, `grpc-java`) can communicate with it directly over HTTP/2. Conversely, a ConnectRPC client can be configured to speak the gRPC protocol to an existing gRPC server. This interoperability is a major strength, allowing for gradual migration or mixed environments.
+
+    ```typescript
+    // Example: ConnectRPC client talking to a traditional gRPC server
+    import { createGrpcTransport } from "@bufbuild/connect-web"; // Note: createGrpcTransport, not createConnectTransport
+
+    const grpcTransport = createGrpcTransport({
+      baseUrl: "http://localhost:8080", // Assuming gRPC server on 8080
+      // For gRPC-Web, you'd use createGrpcWebTransport
+    });
+    const grpcClient = new GreeterService(grpcTransport);
+    ```
+
+## Conclusion
+
+ConnectRPC represents a significant advancement in RPC frameworks, particularly for polyglot environments involving web browsers and Go microservices. By offering native browser compatibility without proxies, while maintaining gRPC interoperability and Protobuf's efficiency, it simplifies architecture, reduces operational overhead, and delivers end-to-end type safety. For new projects or migrations aiming for a unified, performant, and maintainable API layer, ConnectRPC in 2026 is a compelling choice.

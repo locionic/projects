@@ -1,0 +1,526 @@
+---
+title: 'TanStack Query v5 with Next.js 15: Optimistic Updates, Cache Sync & Server Actions'
+images: ['/static/images/tanstack-query-v5-server-actions-nextjs.png']
+date: '2026-10-01'
+lastUpdated: '2026-10-01'
+tags: ["nextjs", "react", "frontend", "performance"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Intermediate"
+programmingLanguage: "TypeScript"
+summary: 'Comprehensive guide covering tanstack query v5 with next.js 15: optimistic updates, cache sync & server actions with production-grade architecture and code examples.'
+---
+
+This guide details the integration of TanStack Query v5 with Next.js 15 App Router and Server Actions, focusing on advanced patterns for optimistic UI, cache synchronization, and efficient data fetching. We will cover resilient optimistic updates with automatic rollback, server-side state dehydration/hydration, and robust infinite scrolling implementations.
+
+## Architectural Overview
+
+Next.js 15's App Router and Server Actions introduce a paradigm shift in data fetching and mutation. Server Actions enable direct server-side function calls from client components, simplifying data mutations. TanStack Query, conversely, manages client-side data fetching, caching, and synchronization. The challenge lies in orchestrating these two systems to provide a consistent, performant user experience, especially when dealing with mutations that affect shared data.
+
+The core principle is to leverage Server Actions for mutations and `revalidatePath`/`revalidateTag` for server-side cache invalidation, while using TanStack Query for client-side data management, including optimistic updates and local cache invalidation.
+
+```mermaid
+graph TD
+    A[Client Component] --> B{User Action: Mutate Data};
+    B --> C[TanStack Query `useMutation`];
+    C --> D[Optimistic Update (Client Cache)];
+    C --> E[Server Action Call];
+    E --> F[Server-side Logic (DB Update)];
+    F --> G[Next.js `revalidatePath`/`revalidateTag`];
+    G --> H[Next.js Data Cache Invalidated];
+    F --> I[Return Response];
+    I --> J[TanStack Query `onSuccess`/`onError`];
+    J --> K[Client Cache Invalidation/Refetch];
+    D -- Rollback on Error --> K;
+    H -- Subsequent Request --> L[Fresh Data from Server];
+    K -- Subsequent Client Render --> M[Updated UI];
+```
+
+## Initial Setup and Dehydration
+
+To ensure a seamless user experience, especially on initial page loads, we dehydrate the TanStack Query cache on the server and rehydrate it on the client. This prevents a loading spinner on the first render for data that could have been fetched during SSR/SSG.
+
+First, set up the `QueryClientProvider` and `HydrationBoundary`.
+
+```tsx filename="app/providers.tsx"
+'use client';
+
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { HydrationBoundary, dehydrate } from '@tanstack/react-query';
+import React from 'react';
+
+// Create a client
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      // Aggressively refetch on mount to ensure data freshness,
+      // especially after server-side revalidation.
+      staleTime: 5 * 1000, // 5 seconds
+      refetchOnWindowFocus: true,
+      refetchOnMount: true,
+      refetchOnReconnect: true,
+    },
+  },
+});
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <HydrationBoundary state={dehydrate(queryClient)}>
+        {children}
+      </HydrationBoundary>
+    </QueryClientProvider>
+  );
+}
+```
+
+Then, in your root layout or a specific page, prefetch data and dehydrate the state.
+
+```tsx filename="app/layout.tsx"
+import { QueryClient, HydrationBoundary, dehydrate } from '@tanstack/react-query';
+import { Providers } from './providers';
+import { getPosts } from '@/lib/data'; // Example data fetching function
+
+export default async function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const queryClient = new QueryClient();
+
+  // Prefetch data on the server
+  await queryClient.prefetchQuery({
+    queryKey: ['posts'],
+    queryFn: getPosts,
+  });
+
+  return (
+    <html lang="en">
+      <body>
+        <Providers>
+          <HydrationBoundary state={dehydrate(queryClient)}>
+            {children}
+          </HydrationBoundary>
+        </Providers>
+      </body>
+    </html>
+  );
+}
+```
+
+Note the nested `HydrationBoundary`. The outer one in `layout.tsx` hydrates data prefetched during SSR for the initial page load. The inner one in `providers.tsx` is technically redundant for the initial load but ensures that any subsequent client-side navigation or component mounts within the `Providers` context can still leverage hydration if `dehydrate(queryClient)` were to be called again in a different context (e.g., a nested layout). For a typical setup, the outer `HydrationBoundary` is sufficient.
+
+## Optimistic Updates with Server Actions
+
+Optimistic updates provide immediate UI feedback, enhancing perceived performance. When a user performs an action (e.g., adding a post), the UI updates instantly, assuming the action will succeed. If the server action fails, the UI rolls back to its previous state.
+
+Consider a scenario where users can add new posts.
+
+```tsx filename="app/actions.ts"
+'use server';
+
+import { revalidatePath, revalidateTag } from 'next/cache';
+import { Post } from '@/lib/types'; // Assume Post type is defined
+
+let posts: Post[] = [
+  { id: '1', title: 'Initial Post', content: 'This is the first post.' },
+];
+let nextId = 2;
+
+export async function addPostAction(title: string, content: string): Promise<Post> {
+  // Simulate network delay
+  await new Promise((resolve) => setTimeout(resolve, Math.random() * 1000 + 500));
+
+  // Simulate an error 20% of the time
+  if (Math.random() < 0.2) {
+    throw new Error('Failed to add post: Network error or server issue.');
+  }
+
+  const newPost: Post = { id: String(nextId++), title, content };
+  posts.unshift(newPost); // Add to the beginning for easier optimistic update
+  console.log('Server: Added post', newPost);
+
+  // Invalidate Next.js cache for the path where posts are displayed
+  revalidatePath('/posts');
+  revalidateTag('posts'); // Invalidate a specific tag if used
+
+  return newPost;
+}
+
+export async function getPosts(): Promise<Post[]> {
+  // Simulate network delay
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  return posts;
+}
+```
+
+Now, the client component:
+
+```tsx filename="app/posts/page.tsx"
+'use client';
+
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { addPostAction, getPosts } from '@/app/actions';
+import { Post } from '@/lib/types'; // Assume Post type is defined
+import { useState } from 'react';
+
+export default function PostsPage() {
+  const queryClient = useQueryClient();
+  const [title, setTitle] = useState('');
+  const [content, setContent] = useState('');
+
+  const { data: posts, isLoading, isError, error } = useQuery<Post[]>({
+    queryKey: ['posts'],
+    queryFn: getPosts,
+  });
+
+  const addPostMutation = useMutation({
+    mutationFn: async ({ title, content }: { title: string; content: string }) => {
+      return addPostAction(title, content);
+    },
+    onMutate: async (newPostData) => {
+      // Cancel any outgoing refetches (so they don't overwrite our optimistic update)
+      await queryClient.cancelQueries({ queryKey: ['posts'] });
+
+      // Snapshot the previous value
+      const previousPosts = queryClient.getQueryData<Post[]>(['posts']);
+
+      // Optimistically update to the new value
+      queryClient.setQueryData<Post[]>(['posts'], (old) => {
+        const tempId = `optimistic-${Date.now()}`; // Temporary ID for optimistic item
+        const optimisticPost: Post = { ...newPostData, id: tempId };
+        return old ? [optimisticPost, ...old] : [optimisticPost];
+      });
+
+      // Return a context object with the snapshotted value
+      return { previousPosts };
+    },
+    onError: (err, newPostData, context) => {
+      // If the mutation fails, use the context for an immediate rollback
+      console.error('Optimistic update failed:', err);
+      queryClient.setQueryData(['posts'], context?.previousPosts);
+      // Optionally, show a toast notification
+      alert(`Failed to add post: ${err.message}`);
+    },
+    onSettled: () => {
+      // Always refetch after error or success:
+      // This ensures our client-side cache is eventually consistent with the server.
+      // It also handles cases where the server-side revalidation might not immediately
+      // propagate to the client's data fetching mechanism (e.g., if the client
+      // is still using stale data from its own cache).
+      queryClient.invalidateQueries({ queryKey: ['posts'] });
+    },
+    onSuccess: (data) => {
+      // Optionally, if the server returns the full updated list or a specific ID,
+      // you could update the optimistic item with the real ID.
+      // For simplicity, `onSettled`'s `invalidateQueries` handles this.
+      console.log('Post added successfully:', data);
+      setTitle('');
+      setContent('');
+    },
+  });
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!title || !content) return;
+    addPostMutation.mutate({ title, content });
+  };
+
+  if (isLoading) return <div>Loading posts...</div>;
+  if (isError) return <div>Error: {error?.message}</div>;
+
+  return (
+    <div className="max-w-2xl mx-auto p-4">
+      <h1 className="text-2xl font-bold mb-4">Posts</h1>
+
+      <form onSubmit={handleSubmit} className="mb-8 p-4 border rounded-lg shadow-sm">
+        <h2 className="text-xl font-semibold mb-3">Add New Post</h2>
+        <div className="mb-3">
+          <label htmlFor="title" className="block text-sm font-medium text-gray-700">Title</label>
+          <input
+            type="text"
+            id="title"
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2"
+            disabled={addPostMutation.isPending}
+          />
+        </div>
+        <div className="mb-3">
+          <label htmlFor="content" className="block text-sm font-medium text-gray-700">Content</label>
+          <textarea
+            id="content"
+            value={content}
+            onChange={(e) => setContent(e.target.value)}
+            rows={3}
+            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2"
+            disabled={addPostMutation.isPending}
+          ></textarea>
+        </div>
+        <button
+          type="submit"
+          className="inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+          disabled={addPostMutation.isPending}
+        >
+          {addPostMutation.isPending ? 'Adding...' : 'Add Post'}
+        </button>
+        {addPostMutation.isError && (
+          <p className="text-red-500 text-sm mt-2">Error: {addPostMutation.error?.message}</p>
+        )}
+      </form>
+
+      <div className="space-y-4">
+        {posts?.map((post) => (
+          <div key={post.id} className="p-4 border rounded-lg shadow-sm bg-white">
+            <h3 className="text-lg font-semibold">{post.title}</h3>
+            <p className="text-gray-600">{post.content}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+### Key aspects of the optimistic update:
+
+1.  **`onMutate`**:
+    *   `queryClient.cancelQueries`: Prevents any ongoing background refetches from overwriting our optimistic update.
+    *   `queryClient.getQueryData`: Snapshots the current data before modification. This is crucial for rollback.
+    *   `queryClient.setQueryData`: Immediately updates the client-side cache with the new, optimistically added item. A temporary ID (`optimistic-${Date.now()}`) is used to distinguish it from server-confirmed items.
+    *   Returns `previousPosts` in a context object, which is passed to `onError`.
+
+2.  **`onError`**:
+    *   If the `addPostAction` fails, `onError` is called.
+    *   `queryClient.setQueryData` is used with `context.previousPosts` to revert the client-side cache to its state before the optimistic update.
+
+3.  **`onSettled`**:
+    *   This callback runs regardless of success or failure.
+    *   `queryClient.invalidateQueries({ queryKey: ['posts'] })`: Marks the `['posts']` query as stale. This triggers a background refetch, ensuring the client-side cache eventually reflects the true server state. This is critical for synchronizing with `revalidatePath`/`revalidateTag` on the server. Even if the server successfully revalidated its cache, the client needs to refetch to get the latest data.
+
+## Infinite Scrolling with `useInfiniteQuery`
+
+Implementing infinite scrolling requires careful handling of data aggregation and preventing hydration mismatches. `useInfiniteQuery` from TanStack Query is ideal for this.
+
+```tsx filename="app/actions.ts"
+// ... (previous actions)
+
+export async function getPaginatedPosts(pageParam: number, limit: number = 5): Promise<{ posts: Post[]; nextPage: number | undefined }> {
+  await new Promise((resolve) => setTimeout(resolve, 500)); // Simulate network delay
+
+  const startIndex = (pageParam - 1) * limit;
+  const endIndex = startIndex + limit;
+  const paginatedPosts = posts.slice(startIndex, endIndex);
+
+  const nextPage = endIndex < posts.length ? pageParam + 1 : undefined;
+
+  return { posts: paginatedPosts, nextPage };
+}
+```
+
+```tsx filename="app/infinite-posts/page.tsx"
+'use client';
+
+import { useInfiniteQuery } from '@tanstack/react-query';
+import { getPaginatedPosts } from '@/app/actions';
+import { Post } from '@/lib/types';
+import { useEffect, useRef } from 'react';
+
+export default function InfinitePostsPage() {
+  const {
+    data,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    isLoading,
+    isError,
+    error,
+  } = useInfiniteQuery({
+    queryKey: ['infinitePosts'],
+    queryFn: ({ pageParam }) => getPaginatedPosts(pageParam as number),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => lastPage.nextPage,
+    staleTime: 1000 * 60 * 5, // 5 minutes
+    gcTime: 1000 * 60 * 60, // 1 hour
+  });
+
+  const observerTarget = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!observerTarget.current) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && hasNextPage && !isFetchingNextPage) {
+          fetchNextPage();
+        }
+      },
+      { threshold: 1 }
+    );
+
+    observer.observe(observerTarget.current);
+
+    return () => {
+      if (observerTarget.current) {
+        observer.unobserve(observerTarget.current);
+      }
+    };
+  }, [fetchNextPage, hasNextPage, isFetchingNextPage]);
+
+  if (isLoading) return <div>Loading infinite posts...</div>;
+  if (isError) return <div>Error: {error?.message}</div>;
+
+  const allPosts = data?.pages.flatMap((page) => page.posts) || [];
+
+  return (
+    <div className="max-w-2xl mx-auto p-4">
+      <h1 className="text-2xl font-bold mb-4">Infinite Posts</h1>
+      <div className="space-y-4">
+        {allPosts.map((post) => (
+          <div key={post.id} className="p-4 border rounded-lg shadow-sm bg-white">
+            <h3 className="text-lg font-semibold">{post.title}</h3>
+            <p className="text-gray-600">{post.content}</p>
+          </div>
+        ))}
+      </div>
+      <div ref={observerTarget} className="h-1 bg-transparent my-4" />
+      {isFetchingNextPage && <div className="text-center py-2">Loading more...</div>}
+      {!hasNextPage && allPosts.length > 0 && (
+        <div className="text-center py-2 text-gray-500">No more posts to load.</div>
+      )}
+    </div>
+  );
+}
+```
+
+### Hydration Mismatch Considerations for Infinite Scrolling
+
+When using `useInfiniteQuery` with server-side rendering (SSR) or static site generation (SSG), a common pitfall is hydration mismatch. If you prefetch only the first page on the server, but the client-side `useInfiniteQuery` attempts to render more pages (e.g., due to a fast connection or pre-rendering logic), the server-rendered HTML will differ from the client-rendered HTML.
+
+**Strategy to avoid hydration mismatches:**
+
+1.  **Prefetch only the first page on the server.** This is the most common and safest approach. The client will then fetch subsequent pages.
+    ```tsx filename="app/infinite-posts/layout.tsx"
+    import { QueryClient, HydrationBoundary, dehydrate } from '@tanstack/react-query';
+    import { getPaginatedPosts } from '@/app/actions';
+    import { Providers } from '@/app/providers'; // Your existing providers
+
+    export default async function InfinitePostsLayout({
+      children,
+    }: {
+      children: React.ReactNode;
+    }) {
+      const queryClient = new QueryClient();
+
+      // Prefetch only the first page
+      await queryClient.prefetchInfiniteQuery({
+        queryKey: ['infinitePosts'],
+        queryFn: ({ pageParam }) => getPaginatedPosts(pageParam as number),
+        initialPageParam: 1,
+      });
+
+      return (
+        <Providers>
+          <HydrationBoundary state={dehydrate(queryClient)}>
+            {children}
+          </HydrationBoundary>
+        </Providers>
+      );
+    }
+    ```
+    This ensures the initial render is consistent. Subsequent pages are fetched client-side.
+
+2.  **Avoid prefetching multiple pages on the server unless absolutely necessary and you can guarantee consistent rendering.** If you prefetch multiple pages, ensure your client-side rendering logic for `useInfiniteQuery` can correctly reconstruct the same HTML structure based on the dehydrated state. This is complex and often leads to issues.
+
+## Cache Synchronization: `revalidatePath` vs. `revalidateTag`
+
+Next.js 15 offers two primary methods for invalidating its data cache:
+
+*   **`revalidatePath(path: string)`**: Invalidates the cache for a specific path. When the path is next requested, it will be re-rendered. Useful for pages that display data from a single source.
+*   **`revalidateTag(tag: string)`**: Invalidates the cache for all data fetched with a specific tag. This is more granular and powerful, allowing invalidation of data across multiple paths that share a common data source (e.g., all posts, all products).
+
+**When to use which:**
+
+| Feature          | `revalidatePath`                                  | `revalidateTag`                                    |
+| :--------------- | :------------------------------------------------ | :------------------------------------------------- |
+| **Granularity**  | Page-level                                        | Data-level (across pages)                          |
+| **Use Case**     | Update a specific page (e.g., `/blog/post-123`)   | Update all pages showing 'posts' or 'products'     |
+| **Setup**        | Automatic for `fetch` calls within a path         | Requires tagging `fetch` calls                     |
+| **Complexity**   | Simpler for isolated pages                        | More setup, but more flexible for shared data      |
+| **Impact**       | Re-renders the specified path on next request     | Re-renders all paths using the invalidated tag     |
+
+**Example with `revalidateTag`:**
+
+To use `revalidateTag`, you must tag your `fetch` requests. If you're using a custom data fetching layer (like our `getPosts` example), you'd typically wrap `fetch` or use a library that supports tagging. For Server Actions, `revalidateTag` works directly.
+
+```tsx filename="app/actions.ts"
+// ... (previous actions)
+
+// Example of how you might tag a fetch request if you were fetching directly
+// async function getPostsFromAPI(): Promise<Post[]> {
+//   const res = await fetch('https://api.example.com/posts', { next: { tags: ['posts'] } });
+//   if (!res.ok) throw new Error('Failed to fetch posts');
+//   return res.json();
+// }
+
+// Our current `getPosts` is a direct function call, so `revalidateTag`
+// in `addPostAction` directly invalidates the tag, assuming Next.js
+// tracks this for Server Actions. For `fetch` calls, explicit tagging is needed.
+// For simplicity in this example, `revalidateTag('posts')` is called,
+// implying that any data fetching mechanism that Next.js tracks under 'posts'
+// will be invalidated. In a real app, ensure your data fetching is tagged.
+```
+
+In our `addPostAction`, we use both `revalidatePath('/posts')` and `revalidateTag('posts')`. This provides a robust invalidation strategy:
+*   `revalidatePath('/posts')` ensures that the specific `/posts` page is re-rendered on the next request.
+*   `revalidateTag('posts')` would invalidate any other pages or components that might be fetching data tagged as 'posts'.
+
+On the client side, TanStack Query's `queryClient.invalidateQueries({ queryKey: ['posts'] })` ensures that the client's cache for `['posts']` is marked as stale, triggering a refetch. This refetch will then hit the Next.js server, which, due to `revalidatePath`/`revalidateTag`, will serve fresh data.
+
+## Production Gotchas & Troubleshooting
+
+1.  **Stale Data After Server Action:**
+    *   **Symptom:** User performs an action, optimistic update works, but after the server action completes, the data reverts or doesn't update correctly.
+    *   **Cause:** Missing or incorrect `revalidatePath`/`revalidateTag` on the server, or missing `queryClient.invalidateQueries` on the client.
+    *   **Fix:** Ensure your Server Action explicitly calls `revalidatePath` for the affected page(s) and/or `revalidateTag` for relevant data tags. On the client, always call `queryClient.invalidateQueries` in `onSettled` or `onSuccess` of your `useMutation` to force a refetch.
+
+2.  **Hydration Mismatches (`Warning: Prop `className` did not match. Server: "..." Client: "..."`)**:
+    *   **Symptom:** Errors in the console related to `hydration` or `did not match`. Often occurs with infinite scrolling or dynamic content.
+    *   **Cause:** The HTML rendered on the server differs from what React renders on the client. This can happen if client-side effects (e.g., `useEffect` that modifies DOM, `Date.now()`, `Math.random()`) run before hydration, or if `useInfiniteQuery` prefetches different amounts of data on server vs. client.
+    *   **Fix:**
+        *   For infinite scrolling, only prefetch the *first* page on the server. Let the client fetch subsequent pages.
+        *   Ensure any client-only components that might cause mismatches are wrapped in `<ClientOnly>` or dynamically imported with `ssr: false`.
+        *   Avoid client-side specific logic (like `Date.now()`) in components rendered on the server.
+
+3.  **Over-fetching/Under-fetching on Initial Load:**
+    *   **Symptom:** Page loads with a spinner for data that should be available, or fetches too much data.
+    *   **Cause:** Incorrect `prefetchQuery` or `HydrationBoundary` setup.
+    *   **Fix:** Verify `queryClient.prefetchQuery` is called *before* `dehydrate(queryClient)`. Ensure `HydrationBoundary` wraps the components that consume the prefetched data. For infinite queries, only prefetch the first page.
+
+4.  **Optimistic Update Rollback Issues:**
+    *   **Symptom:** Optimistic update fails, but the UI doesn't revert, or reverts incorrectly.
+    *   **Cause:** Incorrect `onMutate` snapshotting or `onError` rollback logic.
+    *   **Fix:** Double-check that `onMutate` correctly captures `previousPosts` and that `onError` uses this snapshot to `setQueryData` back to the original state. Ensure `queryClient.cancelQueries` is called to prevent race conditions.
+
+5.  **Server Action Errors Not Propagating:**
+    *   **Symptom:** Server Action fails, but `useMutation`'s `onError` isn't triggered, or the error message is generic.
+    *   **Cause:** Server Action not explicitly throwing an `Error` object, or the error is caught and not re-thrown.
+    *   **Fix:** Ensure your Server Actions `throw new Error('...')` for failures. Next.js will then correctly propagate this error to the client-side `useMutation`'s `onError` callback.
+
+## Frequently Asked Questions
+
+1.  **When should I use `revalidatePath` versus `revalidateTag`?**
+    Use `revalidatePath` when a mutation primarily affects the data displayed on a single, specific page. Use `revalidateTag` when a mutation affects data that might be displayed across multiple pages or components, allowing for more granular and efficient invalidation of shared data. For maximum robustness, you can use both if applicable, as shown in the example.
+
+2.  **How do I handle authentication and authorization with Server Actions and TanStack Query?**
+    Server Actions run on the server, so you can directly access server-side authentication contexts (e.g., from NextAuth.js, Clerk, or custom session management). Perform authorization checks *within* your Server Actions. If unauthorized, throw an error. TanStack Query's `useMutation` will catch this error in `onError`, allowing you to display appropriate UI feedback. For data fetching, `useQuery` can also call Server Actions, which can perform auth checks.
+
+3.  **Can I use TanStack Query for all data fetching, even for initial page loads on the server?**
+    Yes, absolutely. By using `queryClient.prefetchQuery` within your Next.js Server Components or `layout.tsx`/`page.tsx` files, and then dehydrating the state with `HydrationBoundary`, you can leverage TanStack Query's caching and data management for both server-side and client-side rendering, providing a unified data layer.
+
+4.  **What is the role of `staleTime` and `gcTime` in TanStack Query with Next.js?**
+    `staleTime` defines how long data is considered "fresh." While fresh, `useQuery` will not refetch on re-renders or component mounts. Once stale, it will refetch in the background. `gcTime` (garbage collection time) defines how long inactive queries remain in the cache before being garbage collected. In a Next.js app, `staleTime` helps reduce unnecessary network requests on client-side navigation, while `gcTime` manages memory usage. Adjust these based on your data's volatility and application's memory constraints.
+
+5.  **How do I manage complex form states with optimistic updates?**
+    For complex forms, consider using a form library like React Hook Form. When submitting, use `useMutation` as described. The form library manages the input state, and `useMutation` handles the submission, optimistic update, and error rollback. Clear the form fields in `onSuccess` of `useMutation`.

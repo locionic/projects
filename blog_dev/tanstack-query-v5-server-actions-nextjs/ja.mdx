@@ -1,0 +1,526 @@
+---
+title: "TanStack Query v5とNext.js 15: Optimistic Updates、Cache Sync、Server Actions"
+images: ['/static/images/tanstack-query-v5-server-actions-nextjs.png']
+date: '2026-10-01'
+lastUpdated: '2026-10-01'
+tags: ["nextjs", "react", "frontend", "performance"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Intermediate"
+programmingLanguage: "TypeScript"
+summary: "TanStack Query v5とNext.js 15を組み合わせたOptimistic Updates、Cache Sync、Server Actionsの実装を、本番環境レベルのアーキテクチャとコード例で解説する包括的なガイドです。"
+---
+
+このガイドでは、TanStack Query v5とNext.js 15 App RouterおよびServer Actionsの統合について、楽観的UI、キャッシュ同期、効率的なデータフェッチングのための高度なパターンに焦点を当てて詳しく説明します。自動ロールバックによる回復力のある楽観的更新、サーバーサイドの状態のデハイドレーション/ハイドレーション、堅牢な無限スクロールの実装について解説します。
+
+## アーキテクチャの概要
+
+Next.js 15のApp RouterとServer Actionsは、データフェッチングとミューテーションにパラダイムシフトをもたらします。Server Actionsは、クライアントコンポーネントからサーバーサイド関数を直接呼び出すことを可能にし、データミューテーションを簡素化します。一方、TanStack Queryは、クライアントサイドのデータフェッチング、キャッシング、同期を管理します。課題は、これら2つのシステムを連携させ、特に共有データに影響を与えるミューテーションを扱う際に、一貫性のある高性能なユーザーエクスペリエンスを提供することにあります。
+
+核となる原則は、ミューテーションにはServer Actionsを、サーバーサイドのキャッシュ無効化には`revalidatePath`/`revalidateTag`を活用し、楽観的更新やローカルキャッシュ無効化を含むクライアントサイドのデータ管理にはTanStack Queryを使用することです。
+
+```mermaid
+graph TD
+    A[Client Component] --> B{User Action: Mutate Data};
+    B --> C[TanStack Query `useMutation`];
+    C --> D[Optimistic Update (Client Cache)];
+    C --> E[Server Action Call];
+    E --> F[Server-side Logic (DB Update)];
+    F --> G[Next.js `revalidatePath`/`revalidateTag`];
+    G --> H[Next.js Data Cache Invalidated];
+    F --> I[Return Response];
+    I --> J[TanStack Query `onSuccess`/`onError`];
+    J --> K[Client Cache Invalidation/Refetch];
+    D -- Rollback on Error --> K;
+    H -- Subsequent Request --> L[Fresh Data from Server];
+    K -- Subsequent Client Render --> M[Updated UI];
+```
+
+## 初期設定とデハイドレーション
+
+特に初期ページロード時にシームレスなユーザーエクスペリエンスを確保するため、TanStack Queryのキャッシュをサーバーでデハイドレートし、クライアントでハイドレートします。これにより、SSR/SSG中にフェッチできたデータに対して、最初のレンダリング時にローディングスピナーが表示されるのを防ぎます。
+
+まず、`QueryClientProvider`と`HydrationBoundary`を設定します。
+
+```tsx filename="app/providers.tsx"
+'use client';
+
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { HydrationBoundary, dehydrate } from '@tanstack/react-query';
+import React from 'react';
+
+// Create a client
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      // Aggressively refetch on mount to ensure data freshness,
+      // especially after server-side revalidation.
+      staleTime: 5 * 1000, // 5 seconds
+      refetchOnWindowFocus: true,
+      refetchOnMount: true,
+      refetchOnReconnect: true,
+    },
+  },
+});
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <HydrationBoundary state={dehydrate(queryClient)}>
+        {children}
+      </HydrationBoundary>
+    </QueryClientProvider>
+  );
+}
+```
+
+次に、ルートレイアウトまたは特定のページでデータをプリフェッチし、状態をデハイドレートします。
+
+```tsx filename="app/layout.tsx"
+import { QueryClient, HydrationBoundary, dehydrate } from '@tanstack/react-query';
+import { Providers } from './providers';
+import { getPosts } from '@/lib/data'; // Example data fetching function
+
+export default async function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const queryClient = new QueryClient();
+
+  // Prefetch data on the server
+  await queryClient.prefetchQuery({
+    queryKey: ['posts'],
+    queryFn: getPosts,
+  });
+
+  return (
+    <html lang="en">
+      <body>
+        <Providers>
+          <HydrationBoundary state={dehydrate(queryClient)}>
+            {children}
+          </HydrationBoundary>
+        </Providers>
+      </body>
+    </html>
+  );
+}
+```
+
+ネストされた`HydrationBoundary`に注目してください。外側の`layout.tsx`は、初期ページロードのためにSSR中にプリフェッチされたデータをハイドレートします。内側の`providers.tsx`は、初期ロードでは技術的に冗長ですが、`Providers`コンテキスト内のその後のクライアントサイドナビゲーションやコンポーネントマウントが、異なるコンテキスト（例：ネストされたレイアウト）で`dehydrate(queryClient)`が再度呼び出された場合でもハイドレーションを活用できるようにします。一般的な設定では、外側の`HydrationBoundary`で十分です。
+
+## Server Actionsによる楽観的更新
+
+楽観的更新は、即座のUIフィードバックを提供し、知覚されるパフォーマンスを向上させます。ユーザーがアクション（例：投稿の追加）を実行すると、アクションが成功すると仮定してUIが即座に更新されます。サーバーアクションが失敗した場合、UIは以前の状態にロールバックします。
+
+ユーザーが新しい投稿を追加できるシナリオを考えてみましょう。
+
+```tsx filename="app/actions.ts"
+'use server';
+
+import { revalidatePath, revalidateTag } from 'next/cache';
+import { Post } from '@/lib/types'; // Assume Post type is defined
+
+let posts: Post[] = [
+  { id: '1', title: 'Initial Post', content: 'This is the first post.' },
+];
+let nextId = 2;
+
+export async function addPostAction(title: string, content: string): Promise<Post> {
+  // Simulate network delay
+  await new Promise((resolve) => setTimeout(resolve, Math.random() * 1000 + 500));
+
+  // Simulate an error 20% of the time
+  if (Math.random() < 0.2) {
+    throw new Error('Failed to add post: Network error or server issue.');
+  }
+
+  const newPost: Post = { id: String(nextId++), title, content };
+  posts.unshift(newPost); // Add to the beginning for easier optimistic update
+  console.log('Server: Added post', newPost);
+
+  // Invalidate Next.js cache for the path where posts are displayed
+  revalidatePath('/posts');
+  revalidateTag('posts'); // Invalidate a specific tag if used
+
+  return newPost;
+}
+
+export async function getPosts(): Promise<Post[]> {
+  // Simulate network delay
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  return posts;
+}
+```
+
+次に、クライアントコンポーネントです。
+
+```tsx filename="app/posts/page.tsx"
+'use client';
+
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { addPostAction, getPosts } from '@/app/actions';
+import { Post } from '@/lib/types'; // Assume Post type is defined
+import { useState } from 'react';
+
+export default function PostsPage() {
+  const queryClient = useQueryClient();
+  const [title, setTitle] = useState('');
+  const [content, setContent] = useState('');
+
+  const { data: posts, isLoading, isError, error } = useQuery<Post[]>({
+    queryKey: ['posts'],
+    queryFn: getPosts,
+  });
+
+  const addPostMutation = useMutation({
+    mutationFn: async ({ title, content }: { title: string; content: string }) => {
+      return addPostAction(title, content);
+    },
+    onMutate: async (newPostData) => {
+      // Cancel any outgoing refetches (so they don't overwrite our optimistic update)
+      await queryClient.cancelQueries({ queryKey: ['posts'] });
+
+      // Snapshot the previous value
+      const previousPosts = queryClient.getQueryData<Post[]>(['posts']);
+
+      // Optimistically update to the new value
+      queryClient.setQueryData<Post[]>(['posts'], (old) => {
+        const tempId = `optimistic-${Date.now()}`; // Temporary ID for optimistic item
+        const optimisticPost: Post = { ...newPostData, id: tempId };
+        return old ? [optimisticPost, ...old] : [optimisticPost];
+      });
+
+      // Return a context object with the snapshotted value
+      return { previousPosts };
+    },
+    onError: (err, newPostData, context) => {
+      // If the mutation fails, use the context for an immediate rollback
+      console.error('Optimistic update failed:', err);
+      queryClient.setQueryData(['posts'], context?.previousPosts);
+      // Optionally, show a toast notification
+      alert(`Failed to add post: ${err.message}`);
+    },
+    onSettled: () => {
+      // Always refetch after error or success:
+      // This ensures our client-side cache is eventually consistent with the server.
+      // It also handles cases where the server-side revalidation might not immediately
+      // propagate to the client's data fetching mechanism (e.g., if the client
+      // is still using stale data from its own cache).
+      queryClient.invalidateQueries({ queryKey: ['posts'] });
+    },
+    onSuccess: (data) => {
+      // Optionally, if the server returns the full updated list or a specific ID,
+      // you could update the optimistic item with the real ID.
+      // For simplicity, `onSettled`'s `invalidateQueries` handles this.
+      console.log('Post added successfully:', data);
+      setTitle('');
+      setContent('');
+    },
+  });
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!title || !content) return;
+    addPostMutation.mutate({ title, content });
+  };
+
+  if (isLoading) return <div>Loading posts...</div>;
+  if (isError) return <div>Error: {error?.message}</div>;
+
+  return (
+    <div className="max-w-2xl mx-auto p-4">
+      <h1 className="text-2xl font-bold mb-4">Posts</h1>
+
+      <form onSubmit={handleSubmit} className="mb-8 p-4 border rounded-lg shadow-sm">
+        <h2 className="text-xl font-semibold mb-3">Add New Post</h2>
+        <div className="mb-3">
+          <label htmlFor="title" className="block text-sm font-medium text-gray-700">Title</label>
+          <input
+            type="text"
+            id="title"
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2"
+            disabled={addPostMutation.isPending}
+          />
+        </div>
+        <div className="mb-3">
+          <label htmlFor="content" className="block text-sm font-medium text-gray-700">Content</label>
+          <textarea
+            id="content"
+            value={content}
+            onChange={(e) => setContent(e.target.value)}
+            rows={3}
+            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2"
+            disabled={addPostMutation.isPending}
+          ></textarea>
+        </div>
+        <button
+          type="submit"
+          className="inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+          disabled={addPostMutation.isPending}
+        >
+          {addPostMutation.isPending ? 'Adding...' : 'Add Post'}
+        </button>
+        {addPostMutation.isError && (
+          <p className="text-red-500 text-sm mt-2">Error: {addPostMutation.error?.message}</p>
+        )}
+      </form>
+
+      <div className="space-y-4">
+        {posts?.map((post) => (
+          <div key={post.id} className="p-4 border rounded-lg shadow-sm bg-white">
+            <h3 className="text-lg font-semibold">{post.title}</h3>
+            <p className="text-gray-600">{post.content}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+### 楽観的更新の主要な側面：
+
+1.  **`onMutate`**:
+    *   `queryClient.cancelQueries`: 進行中のバックグラウンドリフェッチが楽観的更新を上書きするのを防ぎます。
+    *   `queryClient.getQueryData`: 変更前の現在のデータをスナップショットします。これはロールバックに不可欠です。
+    *   `queryClient.setQueryData`: 新しく楽観的に追加されたアイテムでクライアントサイドキャッシュを即座に更新します。一時的なID（`optimistic-${Date.now()}`）は、サーバーで確認されたアイテムと区別するために使用されます。
+    *   コンテキストオブジェクトに`previousPosts`を返します。これは`onError`に渡されます。
+
+2.  **`onError`**:
+    *   `addPostAction`が失敗した場合、`onError`が呼び出されます。
+    *   `queryClient.setQueryData`は`context.previousPosts`とともに使用され、クライアントサイドキャッシュを楽観的更新前の状態に戻します。
+
+3.  **`onSettled`**:
+    *   このコールバックは、成功または失敗に関わらず実行されます。
+    *   `queryClient.invalidateQueries({ queryKey: ['posts'] })`: `['posts']`クエリをstaleとしてマークします。これにより、バックグラウンドリフェッチがトリガーされ、クライアントサイドキャッシュが最終的に真のサーバー状態を反映するようにします。これは、サーバー上の`revalidatePath`/`revalidateTag`との同期に不可欠です。サーバーがキャッシュを正常に再検証した場合でも、クライアントは最新のデータを取得するためにリフェッチする必要があります。
+
+## `useInfiniteQuery`による無限スクロール
+
+無限スクロールの実装には、データの集約とハイドレーションの不一致の防止を慎重に扱う必要があります。TanStack Queryの`useInfiniteQuery`はこれに最適です。
+
+```tsx filename="app/actions.ts"
+// ... (previous actions)
+
+export async function getPaginatedPosts(pageParam: number, limit: number = 5): Promise<{ posts: Post[]; nextPage: number | undefined }> {
+  await new Promise((resolve) => setTimeout(resolve, 500)); // Simulate network delay
+
+  const startIndex = (pageParam - 1) * limit;
+  const endIndex = startIndex + limit;
+  const paginatedPosts = posts.slice(startIndex, endIndex);
+
+  const nextPage = endIndex < posts.length ? pageParam + 1 : undefined;
+
+  return { posts: paginatedPosts, nextPage };
+}
+```
+
+```tsx filename="app/infinite-posts/page.tsx"
+'use client';
+
+import { useInfiniteQuery } from '@tanstack/react-query';
+import { getPaginatedPosts } from '@/app/actions';
+import { Post } from '@/lib/types';
+import { useEffect, useRef } from 'react';
+
+export default function InfinitePostsPage() {
+  const {
+    data,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    isLoading,
+    isError,
+    error,
+  } = useInfiniteQuery({
+    queryKey: ['infinitePosts'],
+    queryFn: ({ pageParam }) => getPaginatedPosts(pageParam as number),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => lastPage.nextPage,
+    staleTime: 1000 * 60 * 5, // 5 minutes
+    gcTime: 1000 * 60 * 60, // 1 hour
+  });
+
+  const observerTarget = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!observerTarget.current) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && hasNextPage && !isFetchingNextPage) {
+          fetchNextPage();
+        }
+      },
+      { threshold: 1 }
+    );
+
+    observer.observe(observerTarget.current);
+
+    return () => {
+      if (observerTarget.current) {
+        observer.unobserve(observerTarget.current);
+      }
+    };
+  }, [fetchNextPage, hasNextPage, isFetchingNextPage]);
+
+  if (isLoading) return <div>Loading infinite posts...</div>;
+  if (isError) return <div>Error: {error?.message}</div>;
+
+  const allPosts = data?.pages.flatMap((page) => page.posts) || [];
+
+  return (
+    <div className="max-w-2xl mx-auto p-4">
+      <h1 className="text-2xl font-bold mb-4">Infinite Posts</h1>
+      <div className="space-y-4">
+        {allPosts.map((post) => (
+          <div key={post.id} className="p-4 border rounded-lg shadow-sm bg-white">
+            <h3 className="text-lg font-semibold">{post.title}</h3>
+            <p className="text-gray-600">{post.content}</p>
+          </div>
+        ))}
+      </div>
+      <div ref={observerTarget} className="h-1 bg-transparent my-4" />
+      {isFetchingNextPage && <div className="text-center py-2">Loading more...</div>}
+      {!hasNextPage && allPosts.length > 0 && (
+        <div className="text-center py-2 text-gray-500">No more posts to load.</div>
+      )}
+    </div>
+  );
+}
+```
+
+### 無限スクロールにおけるハイドレーションの不一致に関する考慮事項
+
+サーバーサイドレンダリング（SSR）または静的サイト生成（SSG）で`useInfiniteQuery`を使用する場合、一般的な落とし穴はハイドレーションの不一致です。サーバーで最初のページのみをプリフェッチし、クライアントサイドの`useInfiniteQuery`がより多くのページをレンダリングしようとする場合（例：高速な接続やプリレンダリングロジックのため）、サーバーでレンダリングされたHTMLはクライアントでレンダリングされたHTMLと異なります。
+
+**ハイドレーションの不一致を避けるための戦略：**
+
+1.  **サーバーでは最初のページのみをプリフェッチします。** これが最も一般的で安全なアプローチです。クライアントはその後、後続のページをフェッチします。
+    ```tsx filename="app/infinite-posts/layout.tsx"
+    import { QueryClient, HydrationBoundary, dehydrate } from '@tanstack/react-query';
+    import { getPaginatedPosts } from '@/app/actions';
+    import { Providers } from '@/app/providers'; // Your existing providers
+
+    export default async function InfinitePostsLayout({
+      children,
+    }: {
+      children: React.ReactNode;
+    }) {
+      const queryClient = new QueryClient();
+
+      // Prefetch only the first page
+      await queryClient.prefetchInfiniteQuery({
+        queryKey: ['infinitePosts'],
+        queryFn: ({ pageParam }) => getPaginatedPosts(pageParam as number),
+        initialPageParam: 1,
+      });
+
+      return (
+        <Providers>
+          <HydrationBoundary state={dehydrate(queryClient)}>
+            {children}
+          </HydrationBoundary>
+        </Providers>
+      );
+    }
+    ```
+    これにより、初期レンダリングの一貫性が保証されます。後続のページはクライアントサイドでフェッチされます。
+
+2.  **絶対に必要で、一貫したレンダリングを保証できる場合を除き、サーバーで複数のページをプリフェッチすることは避けてください。** 複数のページをプリフェッチする場合、`useInfiniteQuery`のクライアントサイドレンダリングロジックが、デハイドレートされた状態に基づいて同じHTML構造を正しく再構築できることを確認してください。これは複雑であり、しばしば問題を引き起こします。
+
+## キャッシュ同期：`revalidatePath` vs. `revalidateTag`
+
+Next.js 15は、データキャッシュを無効化するための2つの主要な方法を提供します。
+
+*   **`revalidatePath(path: string)`**: 特定のパスのキャッシュを無効化します。次にそのパスがリクエストされたときに、再レンダリングされます。単一のソースからのデータを表示するページに役立ちます。
+*   **`revalidateTag(tag: string)`**: 特定のタグでフェッチされたすべてのデータのキャッシュを無効化します。これはより粒度が高く強力で、共通のデータソースを共有する複数のパス（例：すべての投稿、すべての製品）にわたるデータの無効化を可能にします。
+
+**どちらをいつ使用するか：**
+
+| 機能           | `revalidatePath`                                  | `revalidateTag`                                    |
+| :--------------- | :------------------------------------------------ | :------------------------------------------------- |
+| **粒度**         | ページレベル                                        | データレベル（ページをまたぐ）                          |
+| **ユースケース**     | 特定のページを更新する（例：`/blog/post-123`）   | 「投稿」または「製品」を表示するすべてのページを更新する     |
+| **設定**         | パス内の`fetch`呼び出しに対して自動         | `fetch`呼び出しのタグ付けが必要                     |
+| **複雑さ**       | 独立したページではよりシンプル                        | 設定は多いが、共有データに対してより柔軟      |
+| **影響**         | 次のリクエストで指定されたパスを再レンダリングする     | 無効化されたタグを使用するすべてのパスを再レンダリングする     |
+
+**`revalidateTag`の例：**
+
+`revalidateTag`を使用するには、`fetch`リクエストにタグを付ける必要があります。カスタムのデータフェッチングレイヤー（私たちの`getPosts`の例など）を使用している場合、通常は`fetch`をラップするか、タグ付けをサポートするライブラリを使用します。Server Actionsの場合、`revalidateTag`は直接機能します。
+
+```tsx filename="app/actions.ts"
+// ... (previous actions)
+
+// Example of how you might tag a fetch request if you were fetching directly
+// async function getPostsFromAPI(): Promise<Post[]> {
+//   const res = await fetch('https://api.example.com/posts', { next: { tags: ['posts'] } });
+//   if (!res.ok) throw new Error('Failed to fetch posts');
+//   return res.json();
+// }
+
+// Our current `getPosts` is a direct function call, so `revalidateTag`
+// in `addPostAction` directly invalidates the tag, assuming Next.js
+// tracks this for Server Actions. For `fetch` calls, explicit tagging is needed.
+// For simplicity in this example, `revalidateTag('posts')` is called,
+// implying that any data fetching mechanism that Next.js tracks under 'posts'
+// will be invalidated. In a real app, ensure your data fetching is tagged.
+```
+
+私たちの`addPostAction`では、`revalidatePath('/posts')`と`revalidateTag('posts')`の両方を使用しています。これにより、堅牢な無効化戦略が提供されます。
+*   `revalidatePath('/posts')`は、特定の`/posts`ページが次のリクエストで再レンダリングされることを保証します。
+*   `revalidateTag('posts')`は、「投稿」としてタグ付けされたデータをフェッチする可能性のある他のページやコンポーネントを無効化します。
+
+クライアントサイドでは、TanStack Queryの`queryClient.invalidateQueries({ queryKey: ['posts'] })`により、`['posts']`のクライアントキャッシュがstaleとしてマークされ、リフェッチがトリガーされます。このリフェッチはNext.jsサーバーにヒットし、`revalidatePath`/`revalidateTag`により、新しいデータが提供されます。
+
+## 本番環境での落とし穴とトラブルシューティング
+
+1.  **Server Action後の古いデータ：**
+    *   **症状：** ユーザーがアクションを実行し、楽観的更新は機能するが、Server Action完了後にデータが元に戻るか、正しく更新されない。
+    *   **原因：** サーバーでの`revalidatePath`/`revalidateTag`の欠落または誤り、またはクライアントでの`queryClient.invalidateQueries`の欠落。
+    *   **修正：** Server Actionが影響を受けるページに対して明示的に`revalidatePath`を呼び出すか、関連するデータタグに対して`revalidateTag`を呼び出すことを確認してください。クライアントでは、常に`queryClient.invalidateQueries`の`onSettled`または`onSuccess`で`useMutation`を呼び出して、リフェッチを強制してください。
+
+2.  **ハイドレーションの不一致（`Warning: Prop `className` did not match. Server: "..." Client: "..."`）：**
+    *   **症状：** コンソールに`hydration`または`did not match`に関連するエラーが表示される。無限スクロールや動的コンテンツでよく発生する。
+    *   **原因：** サーバーでレンダリングされたHTMLが、ReactがクライアントでレンダリングするHTMLと異なる。これは、クライアントサイドのエフェクト（例：DOMを変更する`useEffect`、`Date.now()`、`Math.random()`）がハイドレーション前に実行される場合、または`useInfiniteQuery`がサーバーとクライアントで異なる量のデータをプリフェッチする場合に発生する可能性があります。
+    *   **修正：**
+        *   無限スクロールの場合、サーバーでは*最初の*ページのみをプリフェッチします。クライアントに後続のページをフェッチさせます。
+        *   不一致を引き起こす可能性のあるクライアント専用コンポーネントは、`<ClientOnly>`でラップするか、`ssr: false`で動的にインポートされていることを確認してください。
+        *   サーバーでレンダリングされるコンポーネントで、クライアントサイド固有のロジック（`Date.now()`など）を避けてください。
+
+3.  **初期ロード時の過剰フェッチ/不足フェッチ：**
+    *   **症状：** 利用可能であるべきデータに対してページがスピナーを表示してロードされるか、または過剰なデータをフェッチする。
+    *   **原因：** `prefetchQuery`または`HydrationBoundary`の設定が誤っている。
+    *   **修正：** `queryClient.prefetchQuery`が`dehydrate(queryClient)`の*前に*呼び出されていることを確認してください。`HydrationBoundary`がプリフェッチされたデータを消費するコンポーネントをラップしていることを確認してください。無限クエリの場合、最初のページのみをプリフェッチします。
+
+4.  **楽観的更新のロールバックの問題：**
+    *   **症状：** 楽観的更新が失敗するが、UIが元に戻らないか、誤って元に戻る。
+    *   **原因：** `onMutate`のスナップショット作成または`onError`のロールバックロジックが誤っている。
+    *   **修正：** `onMutate`が`previousPosts`を正しくキャプチャし、`onError`がこのスナップショットを使用して元の状態に`setQueryData`していることを再確認してください。競合状態を防ぐために`queryClient.cancelQueries`が呼び出されていることを確認してください。
+
+5.  **Server Actionのエラーが伝播しない：**
+    *   **症状：** Server Actionが失敗するが、`useMutation`の`onError`がトリガーされないか、エラーメッセージが一般的である。
+    *   **原因：** Server Actionが明示的に`Error`オブジェクトをスローしていないか、エラーがキャッチされて再スローされていない。
+    *   **修正：** Server Actionsが失敗時に`throw new Error('...')`していることを確認してください。Next.jsはその後、このエラーをクライアントサイドの`useMutation`の`onError`コールバックに正しく伝播します。
+
+## よくある質問
+
+1.  **`revalidatePath`と`revalidateTag`はいつ使い分けるべきですか？**
+    ミューテーションが主に単一の特定のページに表示されるデータに影響を与える場合は、`revalidatePath`を使用します。ミューテーションが複数のページやコンポーネントに表示される可能性のあるデータに影響を与える場合は、`revalidateTag`を使用し、より粒度の高い効率的な共有データの無効化を可能にします。最大限の堅牢性を得るために、例に示すように、該当する場合は両方を使用できます。
+
+2.  **Server ActionsとTanStack Queryで認証と認可をどのように処理しますか？**
+    Server Actionsはサーバーで実行されるため、サーバーサイドの認証コンテキスト（例：NextAuth.js、Clerk、またはカスタムセッション管理）に直接アクセスできます。Server Actions*内で*認可チェックを実行します。未承認の場合はエラーをスローします。TanStack Queryの`useMutation`は、`onError`でこのエラーをキャッチし、適切なUIフィードバックを表示できるようにします。データフェッチングの場合、`useQuery`もServer Actionsを呼び出すことができ、認証チェックを実行できます。
+
+3.  **初期ページロード時でも、すべてのデータフェッチングにTanStack Queryを使用できますか？**
+    はい、もちろんです。Next.jsのServer Componentsまたは`layout.tsx`/`page.tsx`ファイル内で`queryClient.prefetchQuery`を使用し、その後`HydrationBoundary`で状態をデハイドレートすることで、サーバーサイドとクライアントサイドの両方のレンダリングにTanStack Queryのキャッシングとデータ管理を活用でき、統一されたデータレイヤーを提供できます。
+
+4.  **Next.jsでTanStack Queryを使用する場合、`staleTime`と`gcTime`の役割は何ですか？**
+    `staleTime`は、データが「新鮮」であると見なされる期間を定義します。新鮮な間は、`useQuery`は再レンダリングやコンポーネントマウント時にリフェッチしません。staleになると、バックグラウンドでリフェッチします。`gcTime`（ガベージコレクション時間）は、非アクティブなクエリがガベージコレクションされるまでにキャッシュに残る期間を定義します。Next.jsアプリでは、`staleTime`はクライアントサイドナビゲーションでの不要なネットワークリクエストを減らすのに役立ち、`gcTime`はメモリ使用量を管理します。データの揮発性とアプリケーションのメモリ制約に基づいてこれらを調整してください。
+
+5.  **楽観的更新で複雑なフォームの状態をどのように管理しますか？**
+    複雑なフォームの場合、React Hook Formのようなフォームライブラリの使用を検討してください。送信時には、説明されているように`useMutation`を使用します。フォームライブラリが入力状態を管理し、`useMutation`が送信、楽観的更新、エラーロールバックを処理します。`useMutation`の`onSuccess`でフォームフィールドをクリアします。

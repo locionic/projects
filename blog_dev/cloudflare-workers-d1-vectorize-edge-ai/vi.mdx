@@ -1,0 +1,541 @@
+---
+title: "AI biên không máy chủ với Cloudflare Workers: Hướng dẫn D1, Vectorize & Streaming RAG (2026)"
+images: ['/static/images/cloudflare-workers-d1-vectorize-edge-ai.png']
+date: '2026-10-01'
+lastUpdated: '2026-10-01'
+tags: ["ai", "cloudflare", "vectorize", "architecture"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về AI biên không máy chủ với Cloudflare Workers: D1, Vectorize & Streaming RAG (2026) với kiến trúc cấp độ sản xuất và ví dụ mã."
+---
+
+Hướng dẫn này trình bày chi tiết cách xây dựng các ứng dụng AI Serverless Edge không có thời gian khởi động lạnh (zero-cold-start) bằng cách tận dụng Cloudflare Workers, D1 và Vectorize. Chúng ta sẽ triển khai một hệ thống Tạo sinh tăng cường truy xuất (RAG) theo thời gian thực, truyền trực tiếp phản hồi đến trình duyệt của khách hàng với độ trễ dưới 50ms, sử dụng Workers AI và Gemini. Trọng tâm là kiến trúc cấp độ sản xuất, di chuyển lược đồ và các cân nhắc về hiệu suất.
+
+## Tổng quan kiến trúc
+
+Kiến trúc được đề xuất tích hợp mạng lưới toàn cầu của Cloudflare để suy luận AI và truy cập dữ liệu với độ trễ thấp.
+
+1.  **Yêu cầu từ Client**: Người dùng khởi tạo một truy vấn từ trình duyệt của họ.
+2.  **Cloudflare Worker**: Yêu cầu đến một Cloudflare Worker tại biên.
+3.  **Tạo Embedding**: Worker sử dụng Workers AI để tạo embedding cho truy vấn của người dùng.
+4.  **Tìm kiếm Vector (Vectorize)**: Embedding của truy vấn được sử dụng để tìm kiếm các đoạn tài liệu có ý nghĩa tương tự trong Cloudflare Vectorize.
+5.  **Truy xuất Metadata (D1)**: Metadata liên quan (ví dụ: ID tài liệu, văn bản đoạn, quyền truy cập) cho các ID vector đã truy xuất được lấy từ Cloudflare D1.
+6.  **Tập hợp ngữ cảnh**: Worker tập hợp một lời nhắc (prompt) bằng cách sử dụng truy vấn gốc và ngữ cảnh đã truy xuất.
+7.  **Suy luận LLM (Workers AI / Gemini)**: Lời nhắc được gửi đến Workers AI (hoặc trực tiếp đến Google Gemini thông qua Workers) để tạo câu trả lời theo thời gian thực.
+8.  **Phản hồi Streaming**: Phản hồi của LLM được truyền trở lại trình duyệt của client, giảm thiểu độ trễ cảm nhận.
+
+Thiết kế này đảm bảo tính cục bộ của dữ liệu, giảm thiểu số lần nhảy mạng và tận dụng các dịch vụ serverless của Cloudflare để có khả năng mở rộng và hiệu quả chi phí.
+
+## Thiết lập môi trường Cloudflare của bạn
+
+Đảm bảo bạn đã cài đặt và cấu hình `wrangler`.
+
+```bash
+npm install -g wrangler
+wrangler login
+```
+
+### Thiết lập cơ sở dữ liệu D1
+
+Tạo cơ sở dữ liệu D1 để lưu trữ metadata tài liệu.
+
+```bash
+wrangler d1 create my-rag-metadata
+# Output will include a binding name, e.g., D1_BINDING_NAME
+```
+
+Thêm ràng buộc D1 vào `wrangler.toml` của bạn:
+
+```toml
+# wrangler.toml
+name = "edge-rag-worker"
+main = "src/index.ts"
+compatibility_date = "2024-10-27"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB" # This is the binding name you'll use in your Worker
+database_name = "my-rag-metadata"
+database_id = "<YOUR_D1_DATABASE_ID>" # From `wrangler d1 create` output
+```
+
+### Di chuyển lược đồ D1
+
+Chúng ta sẽ sử dụng một lược đồ đơn giản cho các đoạn tài liệu.
+
+```sql
+-- migrations/0001_initial_schema.sql
+CREATE TABLE IF NOT EXISTS document_chunks (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    chunk_text TEXT NOT NULL,
+    metadata JSON,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_id ON document_chunks (document_id);
+```
+
+Áp dụng di chuyển:
+
+```bash
+wrangler d1 migrations apply my-rag-metadata --local --env production
+```
+
+### Thiết lập chỉ mục Vectorize
+
+Tạo một chỉ mục Vectorize để lưu trữ các embedding.
+
+```bash
+wrangler vectorize create my-rag-vectors --dimensions=768 --metric=cosine
+# Output will include a binding name, e.g., VECTORIZE_BINDING_NAME
+```
+
+Thêm ràng buộc Vectorize vào `wrangler.toml` của bạn:
+
+```toml
+# wrangler.toml (continued)
+[[vectorize]]
+binding = "VECTORIZE_INDEX" # This is the binding name you'll use in your Worker
+index_name = "my-rag-vectors"
+```
+
+## Triển khai Worker: Pipeline nhập liệu
+
+Đầu tiên, hãy định nghĩa logic nhập liệu để thêm tài liệu và các embedding của chúng. Điều này thường là một endpoint nội bộ hoặc một Worker riêng biệt.
+
+```typescript
+// src/ingest.ts
+import { Hono } from 'hono';
+import { env } from 'hono/adapter';
+import { Bindings } from './types'; // Define your Bindings interface
+
+const ingestApp = new Hono();
+
+// Helper to chunk text (simplified for brevity)
+function chunkText(text: string, chunkSize: number = 512, overlap: number = 50): string[] {
+  const chunks: string[] = [];
+  let i = 0;
+  while (i < text.length) {
+    const end = Math.min(i + chunkSize, text.length);
+    chunks.push(text.substring(i, end));
+    i += chunkSize - overlap;
+    if (i < 0) i = 0; // Prevent negative index if overlap > chunkSize
+  }
+  return chunks;
+}
+
+ingestApp.post('/ingest', async (c) => {
+  const { DB, VECTORIZE_INDEX, AI } = env<Bindings>(c);
+  const { documentId, text, metadata } = await c.req.json();
+
+  if (!documentId || !text) {
+    return c.json({ error: 'documentId and text are required' }, 400);
+  }
+
+  const chunks = chunkText(text);
+  const vectorsToInsert: { id: string; values: number[]; metadata: Record<string, any> }[] = [];
+  const dbInserts: { id: string; document_id: string; chunk_text: string; metadata: string }[] = [];
+
+  for (const chunk of chunks) {
+    // Generate embedding using Workers AI
+    const { data } = await AI.run('@cf/baai/bge-small-en-v1.5', { text: chunk });
+    const embedding = data[0];
+
+    const chunkId = crypto.randomUUID(); // Unique ID for each chunk
+    vectorsToInsert.push({
+      id: chunkId,
+      values: embedding,
+      metadata: { documentId, ...metadata }, // Store relevant metadata with vector
+    });
+    dbInserts.push({
+      id: chunkId,
+      document_id: documentId,
+      chunk_text: chunk,
+      metadata: JSON.stringify({ documentId, ...metadata }),
+    });
+  }
+
+  // Insert into Vectorize
+  const vectorizeResult = await VECTORIZE_INDEX.upsert(vectorsToInsert);
+
+  // Insert into D1
+  const stmt = DB.prepare(
+    'INSERT INTO document_chunks (id, document_id, chunk_text, metadata) VALUES (?, ?, ?, ?)'
+  );
+  const dbResult = await DB.batch(dbInserts.map((d) => stmt.bind(d.id, d.document_id, d.chunk_text, d.metadata)));
+
+  return c.json({
+    message: `Ingested ${chunks.length} chunks for document ${documentId}`,
+    vectorizeResult,
+    dbResult,
+  });
+});
+
+export default ingestApp;
+```
+
+## Triển khai Worker: Pipeline truy vấn RAG
+
+Đây là Worker RAG cốt lõi xử lý các yêu cầu từ client.
+
+```typescript
+// src/index.ts
+import { Hono } from 'hono';
+import { streamText, streamSSE } from 'hono/streaming';
+import { env } from 'hono/adapter';
+import { Bindings } from './types'; // Define your Bindings interface
+
+const app = new Hono();
+
+// Define the Bindings interface for better type safety
+export interface Bindings {
+  DB: D1Database;
+  VECTORIZE_INDEX: VectorizeIndex;
+  AI: Ai;
+  GOOGLE_GEMINI_API_KEY?: string; // Optional for Gemini direct access
+}
+
+app.get('/', (c) => c.text('Edge RAG Worker is running!'));
+
+app.post('/ask', async (c) => {
+  const { DB, VECTORIZE_INDEX, AI, GOOGLE_GEMINI_API_KEY } = env<Bindings>(c);
+  const { query } = await c.req.json();
+
+  if (!query) {
+    return c.json({ error: 'Query is required' }, 400);
+  }
+
+  return streamSSE(c, async (stream) => {
+    try {
+      await stream.writeSSE({ event: 'status', data: 'Generating query embedding...' });
+      // 1. Generate embedding for the query
+      const { data: queryEmbedding } = await AI.run('@cf/baai/bge-small-en-v1.5', { text: query });
+      const embedding = queryEmbedding[0];
+
+      await stream.writeSSE({ event: 'status', data: 'Searching Vectorize...' });
+      // 2. Search Vectorize for similar document chunks
+      const searchResults = await VECTORIZE_INDEX.query(embedding, { topK: 5, returnMetadata: true });
+
+      if (!searchResults.matches || searchResults.matches.length === 0) {
+        await stream.writeSSE({ event: 'error', data: 'No relevant documents found.' });
+        await stream.close();
+        return;
+      }
+
+      await stream.writeSSE({ event: 'status', data: 'Retrieving context from D1...' });
+      // 3. Retrieve full chunk text from D1 using the IDs
+      const chunkIds = searchResults.matches.map((match) => match.id);
+      const { results: dbResults } = await DB.prepare(
+        `SELECT chunk_text FROM document_chunks WHERE id IN (${chunkIds.map(() => '?').join(',')})`
+      )
+        .bind(...chunkIds)
+        .all<{ chunk_text: string }>();
+
+      const context = dbResults.map((row) => row.chunk_text).join('\n\n');
+
+      await stream.writeSSE({ event: 'status', data: 'Generating answer with LLM...' });
+      // 4. Assemble prompt for LLM
+      const prompt = `You are a helpful AI assistant. Use the following context to answer the question. If you don't know the answer, state that you don't know.
+
+      Context:
+      ${context}
+
+      Question: ${query}
+
+      Answer:`;
+
+      // 5. Stream LLM response
+      // Option A: Workers AI (recommended for simplicity and edge performance)
+      const response = await AI.run('@cf/mistral/mistral-7b-instruct-v0.1', {
+        prompt,
+        stream: true,
+      });
+
+      // Option B: Google Gemini (requires API key and direct fetch)
+      // if (GOOGLE_GEMINI_API_KEY) {
+      //   const geminiResponse = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:streamGenerateContent', {
+      //     method: 'POST',
+      //     headers: {
+      //       'Content-Type': 'application/json',
+      //       'x-goog-api-key': GOOGLE_GEMINI_API_KEY,
+      //     },
+      //     body: JSON.stringify({
+      //       contents: [{ parts: [{ text: prompt }] }],
+      //       generationConfig: {
+      //         stream: true,
+      //       },
+      //     }),
+      //   });
+
+      //   if (!geminiResponse.ok) {
+      //     throw new Error(`Gemini API error: ${geminiResponse.statusText}`);
+      //   }
+
+      //   // Parse and stream Gemini's SSE-like response
+      //   const reader = geminiResponse.body?.getReader();
+      //   if (!reader) throw new Error('Failed to get reader from Gemini response');
+
+      //   const decoder = new TextDecoder();
+      //   while (true) {
+      //     const { done, value } = await reader.read();
+      //     if (done) break;
+      //     const chunk = decoder.decode(value, { stream: true });
+      //     // Gemini's streaming format is complex, often JSON objects per line.
+      //     // This is a simplified parse. Production code needs robust parsing.
+      //     const lines = chunk.split('\n').filter(Boolean);
+      //     for (const line of lines) {
+      //       try {
+      //         const json = JSON.parse(line);
+      //         if (json.candidates && json.candidates[0] && json.candidates[0].content && json.candidates[0].content.parts) {
+      //           const textPart = json.candidates[0].content.parts[0].text;
+      //           await stream.writeSSE({ event: 'data', data: textPart });
+      //         }
+      //       } catch (e) {
+      //         console.error('Failed to parse Gemini stream chunk:', e, chunk);
+      //       }
+      //     }
+      //   }
+      //   await stream.writeSSE({ event: 'status', data: 'Stream complete.' });
+      //   await stream.close();
+      //   return;
+      // }
+
+      // Workers AI streaming
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('Failed to get reader from AI response');
+
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        await stream.writeSSE({ event: 'data', data: chunk });
+      }
+
+      await stream.writeSSE({ event: 'status', data: 'Stream complete.' });
+      await stream.close();
+    } catch (error: any) {
+      console.error('RAG stream error:', error);
+      await stream.writeSSE({ event: 'error', data: `An error occurred: ${error.message}` });
+      await stream.close();
+    }
+  });
+});
+
+export default app;
+```
+
+Để sử dụng `ingestApp` và `app` trong một worker duy nhất, bạn có thể kết hợp chúng bằng cách sử dụng `Hono`'s `app.route()` hoặc xuất chúng dưới dạng các worker riêng biệt. Để đơn giản, hãy giả sử `src/index.ts` chứa logic truy vấn RAG và `src/ingest.ts` là một worker riêng biệt hoặc một endpoint nội bộ.
+
+Đối với worker `src/index.ts`, đảm bảo bạn có ràng buộc `AI` trong `wrangler.toml`:
+
+```toml
+# wrangler.toml (continued)
+[ai]
+binding = "AI" # This is the binding name you'll use in your Worker
+```
+
+Và nếu sử dụng Gemini trực tiếp:
+
+```toml
+# wrangler.toml (continued)
+[vars]
+GOOGLE_GEMINI_API_KEY = "<YOUR_GEMINI_API_KEY>" # Set this in production via `wrangler secret put`
+```
+
+## Tiêu thụ phía Client
+
+Trên client, sử dụng `EventSource` để tiêu thụ luồng SSE.
+
+```html
+<!-- public/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Edge RAG Chat</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; }
+        #chat-container { max-width: 800px; margin: auto; border: 1px solid #ccc; padding: 15px; border-radius: 8px; }
+        #messages { height: 400px; overflow-y: scroll; border: 1px solid #eee; padding: 10px; margin-bottom: 10px; background-color: #f9f9f9; }
+        .message { margin-bottom: 8px; }
+        .user-message { text-align: right; color: blue; }
+        .ai-message { text-align: left; color: green; }
+        #query-input { width: calc(100% - 80px); padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+        #send-button { width: 70px; padding: 8px; margin-left: 5px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        #send-button:disabled { background-color: #cccccc; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+    <div id="chat-container">
+        <h1>Edge RAG Chat</h1>
+        <div id="messages"></div>
+        <input type="text" id="query-input" placeholder="Ask me anything...">
+        <button id="send-button">Send</button>
+    </div>
+
+    <script>
+        const queryInput = document.getElementById('query-input');
+        const sendButton = document.getElementById('send-button');
+        const messagesDiv = document.getElementById('messages');
+
+        async function sendMessage() {
+            const query = queryInput.value.trim();
+            if (!query) return;
+
+            appendMessage('user', query);
+            queryInput.value = '';
+            sendButton.disabled = true;
+
+            const aiMessageDiv = appendMessage('ai', 'Thinking...');
+            let fullResponse = '';
+
+            try {
+                const eventSource = new EventSource('/ask'); // Adjust endpoint if needed
+                eventSource.onopen = () => {
+                    console.log('SSE connection opened.');
+                    // Send the query immediately after connection opens
+                    fetch('/ask', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ query }),
+                    }).catch(error => {
+                        console.error('Error sending query:', error);
+                        eventSource.close();
+                        aiMessageDiv.textContent = `Error: ${error.message}`;
+                        sendButton.disabled = false;
+                    });
+                };
+
+                eventSource.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    if (data.event === 'data') {
+                        fullResponse += data.data;
+                        aiMessageDiv.textContent = fullResponse;
+                        messagesDiv.scrollTop = messagesDiv.scrollHeight; // Scroll to bottom
+                    } else if (data.event === 'status') {
+                        console.log('Status:', data.data);
+                        // Optionally update a status indicator
+                    } else if (data.event === 'error') {
+                        console.error('Worker Error:', data.data);
+                        aiMessageDiv.textContent = `Error: ${data.data}`;
+                        eventSource.close();
+                    } else if (data.event === 'stream_complete') {
+                        console.log('Stream complete.');
+                        eventSource.close();
+                    }
+                };
+
+                eventSource.onerror = (error) => {
+                    console.error('SSE Error:', error);
+                    eventSource.close();
+                    if (aiMessageDiv.textContent === 'Thinking...') {
+                        aiMessageDiv.textContent = 'Error: Failed to connect or stream.';
+                    }
+                    sendButton.disabled = false;
+                };
+
+                // Note: EventSource doesn't support POST directly.
+                // The above `fetch` call is a workaround to send the initial POST data.
+                // For a true SSE POST, you'd need a custom fetch-based streaming solution
+                // or pass the query in the URL for GET (less secure/flexible).
+                // Cloudflare Workers can handle the POST and then initiate SSE.
+                // The current setup assumes the Worker will process the POST and then
+                // use the established SSE connection for streaming. This is a common pattern.
+
+            } catch (error) {
+                console.error('Fetch error:', error);
+                aiMessageDiv.textContent = `Error: ${error.message}`;
+            } finally {
+                sendButton.disabled = false;
+            }
+        }
+
+        function appendMessage(sender, text) {
+            const messageDiv = document.createElement('div');
+            messageDiv.classList.add('message', `${sender}-message`);
+            messageDiv.textContent = text;
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            return messageDiv; // Return the div to update it later
+        }
+
+        sendButton.addEventListener('click', sendMessage);
+        queryInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+    </script>
+</body>
+</html>
+```
+
+**Lưu ý quan trọng về SSE phía Client với POST:** API `EventSource` vốn dĩ sử dụng các yêu cầu GET. Để gửi yêu cầu POST với truy vấn và sau đó nhận SSE, mã phía client ở trên sử dụng một cách giải quyết phổ biến: nó khởi tạo một `EventSource` (thực hiện GET) và sau đó ngay lập tức gửi một yêu cầu POST `fetch` với truy vấn. Cloudflare Worker phải được thiết kế để xử lý điều này: nó nhận POST, xử lý truy vấn và sau đó sử dụng kết nối `EventSource` *hiện có* (được xác định bởi kết nối của client) để truyền dữ liệu trở lại. Điều này đòi hỏi quản lý trạng thái cẩn thận ở phía Worker hoặc một thư viện streaming nâng cao hơn.
+
+Một cách tiếp cận đơn giản hơn, mạnh mẽ hơn cho `EventSource` là truyền truy vấn dưới dạng tham số URL cho các yêu cầu GET, hoặc sử dụng một `ReadableStream` trực tiếp với `fetch` để kiểm soát hoàn toàn POST và streaming. Đối với hướng dẫn này, chúng ta sẽ giả định Worker có thể tương quan POST với kết nối SSE.
+
+## Điểm chuẩn hiệu suất
+
+So sánh Vectorize và D1 gốc của Cloudflare với các giải pháp lưu trữ tại nguồn truyền thống.
+
+| Tính năng / Chỉ số         | Cloudflare Vectorize + D1 (Edge)                               | Faiss/PgVector tự lưu trữ + PostgreSQL (Origin)                               | DB Vector được quản lý (ví dụ: Pinecone) + SQL được quản lý (Origin)                      |
+| :----------------------- | :------------------------------------------------------------- | :----------------------------------------------------------------------------- | :----------------------------------------------------------------------------- |
+| **Mô hình triển khai**     | Serverless, Edge-native                                        | Tự quản lý, Lưu trữ tại nguồn                                                    | Dịch vụ được quản lý, Lưu trữ tại nguồn                                                 |
+| **Độ trễ khởi động lạnh**   | **~0ms** (Workers)                                             | 100ms - 500ms (Khởi động container, kết nối DB)                               | 50ms - 200ms (Cổng API, kết nối DB)                                      |
+| **Độ trễ truy vấn (P95)**  | **< 50ms** (Trung bình toàn cầu, bao gồm suy luận LLM)           | 150ms - 500ms (Mạng đến nguồn, truy vấn DB, suy luận LLM)                     | 100ms - 400ms (Mạng đến nguồn, gọi API, suy luận LLM)                     |
+| **Tính cục bộ của dữ liệu**        | Phân phối toàn cầu, dữ liệu được phục vụ từ PoP gần nhất              | Một khu vực (trừ khi thiết lập đa khu vực)                                      | Một khu vực (trừ khi thiết lập đa khu vực)                                      |
+| **Khả năng mở rộng**          | Tự động, linh hoạt                                             | Mở rộng thủ công, phức tạp                                                        | Tự động, nhưng thường theo cấp/tốn kém                                             |
+| **Mô hình chi phí**           | Dựa trên sử dụng (yêu cầu, lưu trữ dữ liệu)                           | Cơ sở hạ tầng cố định + sử dụng                                               | Dựa trên sử dụng (vector, truy vấn, pod)                                           |
+| **Trải nghiệm nhà phát triển** | Tích hợp với Workers, `wrangler` CLI                        | Thiết lập thủ công, quản lý cơ sở hạ tầng                                        | Dựa trên API, quản lý dịch vụ riêng biệt                                        |
+| **Tính nhất quán của dữ liệu**     | Nhất quán cuối cùng (Vectorize), Mạnh (D1)                 | Mạnh                                                                         | Mạnh (thường)                                                             |
+| **Kích thước Vector**    | Lên đến 768 (giới hạn hiện tại cho `@cf/baai/bge-small-en-v1.5`)     | Linh hoạt                                                                       | Linh hoạt                                                                       |
+| **Số lượng Vector tối đa**          | Hàng tỷ (có thể mở rộng)                                            | Giới hạn bởi kích thước instance                                          | Hàng tỷ (có thể mở rộng, nhưng chi phí tăng)                                        |
+
+## Những vấn đề và cách khắc phục trong sản xuất
+
+1.  **Lỗi không khớp lược đồ D1**:
+    *   **Triệu chứng**: `Error: D1_ERROR: no such column: ...` hoặc `D1_ERROR: table document_chunks has no column named ...`
+    *   **Nguyên nhân**: Mã Worker của bạn mong đợi một cột không tồn tại trong lược đồ D1 đã triển khai, hoặc ngược lại. Điều này thường xảy ra sau khi phát triển cục bộ mà không áp dụng các di chuyển vào sản xuất.
+    *   **Cách khắc phục**: Đảm bảo tất cả các di chuyển D1 được áp dụng cho cơ sở dữ liệu sản xuất của bạn. Sử dụng `wrangler d1 migrations apply <DB_NAME> --env production`. Đối với phát triển cục bộ, sử dụng `--local`. Nếu bạn đã thực hiện các thay đổi thủ công, hãy cân nhắc `wrangler d1 reset` (NGUY HIỂM: xóa tất cả dữ liệu) và áp dụng lại.
+2.  **Không tìm thấy chỉ mục Vectorize / Quyền**:
+    *   **Triệu chứng**: `Error: Vectorize index 'my-rag-vectors' not found` hoặc `Unauthorized to access Vectorize index`.
+    *   **Nguyên nhân**: `index_name` trong `wrangler.toml` không khớp với tên chỉ mục thực tế, hoặc token Worker thiếu quyền.
+    *   **Cách khắc phục**: Kiểm tra lại `wrangler.toml` và đầu ra của `wrangler vectorize list`. Đảm bảo token API Cloudflare của bạn (được sử dụng bởi `wrangler`) có quyền "Workers KV Storage Write" và "Workers AI", bao gồm cả Vectorize.
+3.  **Giới hạn tốc độ Workers AI / Không tìm thấy mô hình**:
+    *   **Triệu chứng**: `Error: Workers AI: Rate limit exceeded` hoặc `Error: Workers AI: Model '@cf/baai/bge-small-en-v1.5' not found`.
+    *   **Nguyên nhân**: Yêu cầu quá mức đến Workers AI, hoặc sử dụng một mô hình đã lỗi thời hoặc không có sẵn trong khu vực/gói của bạn.
+    *   **Cách khắc phục**: Triển khai giới hạn tốc độ phía client hoặc backoff. Kiểm tra tài liệu Workers AI của Cloudflare để biết các mô hình có sẵn và bất kỳ hạn chế khu vực nào. Đối với sản xuất, hãy cân nhắc nâng cấp gói Cloudflare của bạn nếu giới hạn tốc độ là một vấn đề dai dẳng.
+4.  **Sự cố Streaming (Client-side `EventSource` so với Worker `streamSSE`)**:
+    *   **Triệu chứng**: Client nhận dữ liệu không đầy đủ, kết nối bị ngắt, hoặc `EventSource` không kích hoạt `onmessage`.
+    *   **Nguyên nhân**: `EventSource` chỉ hỗ trợ các yêu cầu GET. Nếu Worker của bạn mong đợi một POST cho truy vấn ban đầu, kết nối `EventSource` có thể không được liên kết chính xác với dữ liệu POST. Ngoài ra, các tiêu đề `Content-Type` hoặc `Transfer-Encoding` không đúng từ Worker có thể làm hỏng SSE.
+    *   **Cách khắc phục**:
+        *   **Đối với `EventSource`**: Thiết kế Worker của bạn để chấp nhận truy vấn thông qua các tham số URL cho các yêu cầu GET (ví dụ: `/ask?query=...`). Đây là cách mạnh mẽ nhất để sử dụng `EventSource`.
+        *   **Đối với POST với streaming**: Sử dụng `fetch` với `ReadableStream` trên client. Worker sau đó sẽ trả về một `Response` với `new ReadableStream()`. Điều này mang lại toàn quyền kiểm soát nhưng yêu cầu nhiều mã phía client hơn.
+        *   Đảm bảo Worker đặt `Content-Type: text/event-stream` và `Cache-Control: no-cache`. `hono/streaming` xử lý điều này một cách chính xác.
+5.  **Hiệu suất truy vấn D1**:
+    *   **Triệu chứng**: Các truy vấn D1 chậm, đặc biệt là `SELECT ... WHERE id IN (...)`.
+    *   **Nguyên nhân**: Quá nhiều ID trong mệnh đề `IN`, hoặc thiếu chỉ mục.
+    *   **Cách khắc phục**: Đảm bảo các chỉ mục thích hợp được tạo (ví dụ: `CREATE INDEX IF NOT EXISTS idx_document_id ON document_chunks (document_id);`). Đối với các mệnh đề `IN` rất lớn, hãy cân nhắc phân lô các tìm kiếm D1 hoặc tối ưu hóa tìm kiếm vector để trả về ít kết quả hơn, phù hợp hơn.
+
+## Các câu hỏi thường gặp
+
+1.  **Cloudflare Vectorize so với các cơ sở dữ liệu vector chuyên dụng như Pinecone hoặc Weaviate như thế nào?**
+    Vectorize là một cơ sở dữ liệu vector serverless, gốc biên được tích hợp trực tiếp vào mạng lưới Cloudflare. Ưu điểm chính của nó là độ trễ khởi động lạnh bằng không và tính cục bộ của dữ liệu, phục vụ các truy vấn từ PoP gần nhất. Các dịch vụ chuyên dụng thường cung cấp các tính năng nâng cao hơn (ví dụ: lọc, thuật toán lập chỉ mục phức tạp, tìm kiếm lai) và kích thước/quy mô cao hơn cho các tập dữ liệu cực lớn, nhưng thường gây ra độ trễ cao hơn do lưu trữ tại nguồn và các lần nhảy mạng. Đối với hầu hết các ứng dụng RAG, hiệu suất và tích hợp của Vectorize với Workers AI là rất hấp dẫn.
+
+2.  **Tôi có thể sử dụng một mô hình embedding khác ngoài `@cf/baai/bge-small-en-v1.5` với Workers AI không?**
+    Có, Workers AI hỗ trợ một danh sách ngày càng tăng các mô hình embedding. Bạn có thể kiểm tra [tài liệu Cloudflare Workers AI](https://developers.cloudflare.com/workers-ai/models/) để biết các mô hình có sẵn mới nhất và kích thước của chúng. Đảm bảo chỉ mục Vectorize của bạn được tạo với `dimensions` chính xác khớp với mô hình embedding bạn đã chọn.
+
+3.  **Những hạn chế của Cloudflare D1 để lưu trữ ngữ cảnh RAG là gì?**
+    D1 là một cơ sở dữ liệu SQLite serverless. Mặc dù nó cung cấp tính nhất quán mạnh mẽ và rất tốt cho metadata có cấu trúc, nhưng nó có những hạn chế so với các cơ sở dữ liệu quan hệ truyền thống. Nó không được thiết kế cho các phép nối cực lớn, phức tạp hoặc các truy vấn phân tích trên petabyte dữ liệu. Đối với RAG, việc lưu trữ văn bản đoạn và metadata nằm trong khả năng của nó. Kích thước cơ sở dữ liệu tối đa và độ phức tạp của truy vấn nên được xem xét cho các ứng dụng quy mô rất lớn. Đối với các khối văn bản cực lớn, hãy cân nhắc lưu trữ chúng trong R2 và D1 chỉ lưu trữ khóa R2.
+
+4.  **Làm cách nào để đảm bảo hệ thống RAG của tôi cung cấp dữ liệu mới?**
+    Pipeline nhập liệu là chìa khóa. Triển khai một quy trình mạnh mẽ để định kỳ cập nhật hoặc nhập lại tài liệu. Đối với các cập nhật theo thời gian thực, bạn có thể kích hoạt Worker nhập liệu thông qua webhook hoặc hàng đợi tin nhắn bất cứ khi nào dữ liệu nguồn thay đổi. Vectorize hỗ trợ các hoạt động `upsert`, cho phép bạn cập nhật các vector hiện có theo ID. D1 cũng hỗ trợ `UPSERT` hoặc `INSERT OR REPLACE` cho metadata.
+
+5.  **Có thể sử dụng một LLM tùy chỉnh được lưu trữ bên ngoài Workers AI không?**
+    Có. Như đã trình bày với ví dụ Gemini, bạn có thể thực hiện các yêu cầu `fetch` từ Cloudflare Worker của mình đến bất kỳ API LLM bên ngoài nào. Điều này cho phép linh hoạt nhưng gây ra độ trễ mạng và sự phụ thuộc bên ngoài. Để có hiệu suất tối ưu và lợi ích biên, việc sử dụng các mô hình Workers AI thường được ưu tiên khi có sẵn và phù hợp với trường hợp sử dụng của bạn. Đảm bảo bạn xử lý khóa API một cách an toàn bằng cách sử dụng `wrangler secret put` cho sản xuất.
