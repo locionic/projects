@@ -1,0 +1,670 @@
+---
+title: "RustとAxumで高スループットなマイクロサービスを構築する: 完全なプロダクションガイド"
+images: ['/static/images/rust-axum-production-microservices.png']
+date: '2026-10-01'
+lastUpdated: '2026-10-01'
+tags: ["rust", "backend", "performance", "architecture"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Intermediate"
+programmingLanguage: "TypeScript"
+summary: "RustとAxumで高スループットなマイクロサービスを構築するための包括的なガイド。プロダクションレベルのアーキテクチャとコード例を交え、本番環境での利用を想定した完全なプロダクションガイドです。"
+---
+
+このガイドでは、Rust、Axum、Tokio を使用した高スループットなマイクロサービスの構築について詳しく説明します。プロジェクト構造、重要な運用上の懸念事項に対応する高度な Tower ミドルウェア、SQLx を使用した堅牢なデータベース連携、グレースフルシャットダウンメカニズム、そして最小限のプロダクションイメージを実現する最適化された Docker マルチステージビルドについて解説します。
+
+## プロジェクト構造と依存関係
+
+適切に整理されたプロジェクト構造は、保守性とスケーラビリティにとって非常に重要です。私たちはモジュール化されたアプローチを推奨し、関心事を個別のクレートまたはモジュールに分離します。
+
+```text
+.
+├── Cargo.toml
+├── src
+│   ├── main.rs
+│   ├── config.rs
+│   ├── handlers.rs
+│   ├── models.rs
+│   ├── middleware
+│   │   ├── mod.rs
+│   │   ├── rate_limit.rs
+│   │   └── tracing.rs
+│   └── db.rs
+└── Dockerfile
+```
+
+私たちの `Cargo.toml` には、不可欠な依存関係が含まれます。
+
+```toml
+# Cargo.toml
+[package]
+name = "high-throughput-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.4", features = ["full"] }
+tower-http = { version = "0.5", features = ["full"] }
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
+deadpool-redis = { version = "0.13", features = ["rt-tokio-1"] } # For rate limiting
+
+# Serialization/Deserialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Configuration
+config = { version = "0.13", features = ["toml", "yaml"] } # Or `envy` for env vars
+
+# Logging and Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+opentelemetry = { version = "0.21", features = ["rt-tokio"] }
+opentelemetry-sdk = { version = "0.21", features = ["rt-tokio"] }
+opentelemetry-stdout = { version = "0.16" } # For local dev
+opentelemetry-otlp = { version = "0.14", features = ["grpc-tonic", "reqwest-client", "tokio"] }
+tracing-opentelemetry = "0.22"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+```
+
+## 設定管理
+
+外部化された設定は非常に重要です。環境変数と設定ファイルから設定を読み込むために `config` クレートを使用します。
+
+```rust
+// src/config.rs
+use serde::Deserialize;
+use std::net::SocketAddr;
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AppConfig {
+    pub server_address: SocketAddr,
+    pub database_url: String,
+    pub redis_url: String,
+    pub service_name: String,
+    pub otel_exporter_otlp_endpoint: Option<String>,
+}
+
+impl AppConfig {
+    pub fn load() -> Result<Self, config::ConfigError> {
+        let s = config::Config::builder()
+            .add_source(config::File::with_name("config.toml").required(false))
+            .add_source(config::Environment::with_prefix("APP"))
+            .build()?;
+        s.try_deserialize()
+    }
+}
+```
+
+## SQLx を使用したデータベース接続プーリング
+
+SQLx は、コンパイル時にチェックされるクエリと堅牢な接続プーリングを提供します。Redis には `deadpool-redis` を使用します。
+
+```rust
+// src/db.rs
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
+use deadpool_redis::{Pool as RedisPool, Config as RedisConfig, Runtime};
+use std::time::Duration;
+use anyhow::Result;
+
+pub async fn setup_pg_pool(database_url: &str) -> Result<PgPool> {
+    let pool = PgPoolOptions::new()
+        .max_connections(50)
+        .min_connections(10)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(5))
+        .idle_timeout(Duration::from_secs(30 * 60)) // 30 minutes
+        .test_before_acquire(true)
+        .connect(database_url)
+        .await?;
+    Ok(pool)
+}
+
+pub fn setup_redis_pool(redis_url: &str) -> Result<RedisPool> {
+    let cfg = RedisConfig::from_url(redis_url);
+    let pool = cfg.create_pool(Some(Runtime::Tokio1))?;
+    Ok(pool)
+}
+```
+
+## 運用上の懸念事項に対応する Tower ミドルウェア
+
+Tower のサービス指向アーキテクチャは強力です。レート制限、分散トレーシング、リクエスト検証を実装します。
+
+### 分散トレーシング
+
+OpenTelemetry との統合は、可観測性にとって不可欠です。
+
+```rust
+// src/middleware/tracing.rs
+use axum::{
+    extract::Request,
+    middleware::Next,
+    response::Response,
+};
+use opentelemetry::{
+    global,
+    trace::{SpanKind, Tracer},
+    Context, KeyValue,
+};
+use opentelemetry_sdk::{
+    trace::{Config, TracerProvider},
+    Resource,
+};
+use opentelemetry_otlp::WithExportConfig;
+use tracing::{info_span, Instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+use anyhow::Result;
+
+pub fn init_tracer(service_name: &str, otlp_endpoint: Option<&str>) -> Result<()> {
+    let resource = Resource::new(vec![
+        KeyValue::new("service.name", service_name.to_string()),
+        KeyValue::new("service.version", env!("CARGO_PKG_VERSION").to_string()),
+    ]);
+
+    let tracer_provider = if let Some(endpoint) = otlp_endpoint {
+        opentelemetry_otlp::new_exporter()
+            .tonic()
+            .with_endpoint(endpoint)
+            .build_tracer_provider_with_config(
+                Config::default().with_resource(resource)
+            )
+    } else {
+        // Fallback to stdout for local development if no OTLP endpoint is configured
+        opentelemetry_stdout::new_pipeline()
+            .with_trace_config(Config::default().with_resource(resource))
+            .install_simple()
+            .expect("Failed to install stdout tracer provider")
+    };
+
+    global::set_tracer_provider(tracer_provider);
+    Ok(())
+}
+
+pub async fn trace_layer(req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    let method = req.method().to_string();
+
+    let tracer = global::tracer("axum-server");
+    let parent_cx = global::get_text_map_propagator(|propagator| {
+        propagator.extract(&opentelemetry_http::HeaderExtractor(req.headers()))
+    });
+
+    let span = tracer
+        .span_builder(format!("HTTP {} {}", method, path))
+        .with_kind(SpanKind::Server)
+        .with_parent_context(parent_cx)
+        .start(&tracer);
+
+    let cx = Context::current_with_span(span);
+    let _guard = cx.attach();
+
+    let response = next.run(req).instrument(info_span!("request_processing")).await;
+
+    let span = cx.span();
+    span.set_attribute(KeyValue::new("http.method", method));
+    span.set_attribute(KeyValue::new("http.target", path));
+    span.set_attribute(KeyValue::new("http.status_code", response.status().as_u16() as i64));
+    span.end();
+
+    response
+}
+```
+
+### レート制限
+
+リソースを保護するために、Redis を使用した分散レートリミッターは不可欠です。
+
+```rust
+// src/middleware/rate_limit.rs
+use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::Next,
+    response::Response,
+};
+use deadpool_redis::redis::AsyncCommands;
+use deadpool_redis::Pool as RedisPool;
+use std::time::Duration;
+use tracing::{error, info};
+
+#[derive(Clone)]
+pub struct RateLimiter {
+    pub redis_pool: RedisPool,
+    pub limit: u64,
+    pub window_seconds: u64,
+}
+
+impl RateLimiter {
+    pub fn new(redis_pool: RedisPool, limit: u64, window_seconds: u64) -> Self {
+        Self {
+            redis_pool,
+            limit,
+            window_seconds,
+        }
+    }
+
+    pub async fn layer(State(rate_limiter): State<RateLimiter>, request: Request, next: Next) -> Result<Response, StatusCode> {
+        let ip_address = request
+            .headers()
+            .get("X-Forwarded-For")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.split(',').next()) // Take the first IP in case of multiple proxies
+            .unwrap_or("unknown")
+            .to_string();
+
+        let key = format!("rate_limit:{}", ip_address);
+
+        let mut conn = rate_limiter.redis_pool.get().await.map_err(|e| {
+            error!("Failed to get Redis connection: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let (count, _): (u64, u64) = deadpool_redis::redis::pipe()
+            .atomic()
+            .incr(&key, 1)
+            .expire(&key, rate_limiter.window_seconds as usize)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| {
+                error!("Failed to execute Redis rate limit command: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        if count > rate_limiter.limit {
+            info!("Rate limit exceeded for IP: {}", ip_address);
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        Ok(next.run(request).await)
+    }
+}
+```
+
+## ハンドラーとルーティング
+
+Axum のハンドラー関数はシンプルです。簡単なヘルスチェックとデータエンドポイントを定義します。
+
+```rust
+// src/handlers.rs
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Json},
+};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
+use chrono::{DateTime, Utc};
+use tracing::{info, error};
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Item {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateItem {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub pg_pool: PgPool,
+    // Other shared state like RedisPool, etc.
+}
+
+pub async fn health_check() -> impl IntoResponse {
+    (StatusCode::OK, "OK")
+}
+
+pub async fn create_item(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateItem>,
+) -> Result<Json<Item>, StatusCode> {
+    info!("Attempting to create item: {}", payload.name);
+    let new_item = sqlx::query_as!(
+        Item,
+        r#"
+        INSERT INTO items (id, name, description, created_at)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, name, description, created_at
+        "#,
+        Uuid::new_v4(),
+        payload.name,
+        payload.description,
+        Utc::now()
+    )
+    .fetch_one(&state.pg_pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to insert item: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    info!("Successfully created item with ID: {}", new_item.id);
+    Ok(Json(new_item))
+}
+
+pub async fn get_item(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+) -> Result<Json<Item>, StatusCode> {
+    info!("Attempting to retrieve item with ID: {}", item_id);
+    let item = sqlx::query_as!(
+        Item,
+        r#"
+        SELECT id, name, description, created_at
+        FROM items
+        WHERE id = $1
+        "#,
+        item_id
+    )
+    .fetch_optional(&state.pg_pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to query item: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    info!("Successfully retrieved item with ID: {}", item_id);
+    Ok(Json(item))
+}
+```
+
+## グレースフルシャットダウン
+
+適切なシャットダウンは、処理中のリクエストが突然終了することなく、リソースが解放されることを保証します。
+
+```rust
+// src/main.rs (excerpt)
+// ... imports ...
+use tokio::signal;
+use tracing::info;
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    info!("Shutdown signal received, initiating graceful shutdown...");
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // ... config loading, tracing setup, db setup ...
+
+    let app = Router::new()
+        .route("/health", get(health_check))
+        .route("/items", post(create_item))
+        .route("/items/:id", get(get_item))
+        .with_state(app_state.clone())
+        .layer(middleware::from_fn_with_state(rate_limiter.clone(), RateLimiter::layer))
+        .layer(middleware::from_fn(trace_layer))
+        .layer(TraceLayer::new_for_http()) // Axum's built-in tracing for request/response logging
+        .layer(SetRequestIdLayer::new(
+            Make<Uuid>::new(),
+            PropagateRequestIdLayer::new(HeaderName::from_static("x-request-id")),
+        ))
+        .layer(TimeoutLayer::new(Duration::from_secs(30))); // Request timeout
+
+    let listener = tokio::net::TcpListener::bind(&config.server_address).await?;
+    info!("Listening on {}", config.server_address);
+
+    axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    info!("Server gracefully shut down.");
+    Ok(())
+}
+```
+
+## Docker マルチステージビルド
+
+最適化された Docker イメージは、迅速なデプロイと攻撃対象領域の削減に不可欠です。最小限の `scratch` イメージを生成するために、マルチステージビルドを使用します。
+
+```dockerfile
+# Dockerfile
+
+# Stage 1: Builder
+FROM rust:1.78-slim-bookworm AS builder
+
+# Install build dependencies for SQLx and OpenSSL
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    postgresql-client \
+    musl-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set the target for musl (static linking)
+RUN rustup target add x86_64-unknown-linux-musl
+
+WORKDIR /app
+
+# Copy Cargo.toml and Cargo.lock first to leverage Docker cache
+COPY Cargo.toml Cargo.lock ./
+
+# Create a dummy src directory and main.rs to cache dependencies
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+# Build dependencies only
+RUN cargo build --release --target x86_64-unknown-linux-musl
+# Remove dummy files
+RUN rm -rf src target/x86_64-unknown-linux-musl/release/high-throughput-service
+
+# Copy the actual source code
+COPY src ./src
+
+# Build the application
+RUN cargo build --release --target x86_64-unknown-linux-musl
+
+# Stage 2: Runtime
+FROM scratch
+
+# Set timezone data (important for many applications)
+# FROM debian:bookworm-slim # Alternative if scratch is too restrictive for your needs
+# RUN apt-get update && apt-get install -y tzdata && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the compiled binary from the builder stage
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/high-throughput-service ./high-throughput-service
+
+# Copy configuration file if present
+COPY config.toml ./config.toml
+
+# Expose the port the application listens on
+EXPOSE 8080
+
+# Set environment variables for configuration
+ENV APP_SERVER_ADDRESS="0.0.0.0:8080"
+ENV APP_DATABASE_URL="postgres://user:password@host:port/database"
+ENV APP_REDIS_URL="redis://:password@host:port/"
+ENV APP_SERVICE_NAME="high-throughput-service"
+# ENV APP_OTEL_EXPORTER_OTLP_ENDPOINT="http://otel-collector:4317"
+
+# Run the application
+CMD ["./high-throughput-service"]
+```
+
+この Dockerfile は、静的にリンクされたバイナリと必要な設定のみを含む、通常 20MB 未満のイメージを生成します。
+
+## アーキテクチャとトレードオフの比較
+
+| 機能/側面 | Rust/Axum/Tokio | Node.js/Express/Fastify | Go/Gin/Echo |
+| :-------------------- | :-------------------------------------------- | :---------------------------------------------------- | :---------------------------------------------------- |
+| **パフォーマンス** | 非常に優れている（ほぼベアメタル） | 良好（イベント駆動型、シングルスレッドのボトルネック） | 非常に優れている（ゴルーチン、コンパイル済み） |
+| **メモリフットプリント** | 非常に低い | 中程度から高い（V8エンジンのオーバーヘッド） | 低から中程度 |
+| **並行処理モデル** | Async/await (Tokio ランタイム) | イベントループ（シングルスレッド、ノンブロッキングI/O） | ゴルーチンとチャネル |
+| **型安全性** | 強い（コンパイル時） | 弱い（実行時、TypeScriptで改善） | 強い（コンパイル時） |
+| **エラーハンドリング** | Result enum、`anyhow`/`thiserror` | コールバック、Promise、`try/catch` | 複数の戻り値、`error` インターフェース |
+| **エコシステムの成熟度** | 急速に成長中、本番環境対応 | 非常に成熟、広大な npm エコシステム | 成熟、堅牢な標準ライブラリ |
+| **学習曲線** | 急（所有権、ボローチェッカー、async） | 中程度（JavaScriptのニュアンス、asyncパターン） | 中程度（並行処理プリミティブ、インターフェース） |
+| **バイナリサイズ** | 非常に小さい（静的リンク） | 大きい（Node.jsランタイムを含む） | 小さい（静的リンク） |
+| **ユースケース** | 高性能API、低遅延サービス、組み込み、システムプログラミング | 高速プロトタイピング、I/Oバウンドサービス、Webアプリ | マイクロサービス、CLIツール、ネットワークサービス |
+| **トレードオフ** | 初期開発コストが高い、学習曲線が急だが、実行時の安全性とパフォーマンスが非常に優れている。 | 開発が速い、ランタイムが大きい、実行時エラーの可能性、CPUバウンドなパフォーマンスは劣る。 | パフォーマンスと開発速度のバランスが良い、Rustよりも並行処理がシンプル、型システムは表現力に劣る。 |
+
+## 本番環境での落とし穴とトラブルシューティング
+
+### 1. `database connection timed out` または `connection refused`
+**障害モード:** アプリケーションが起動時または動作中に PostgreSQL データベースに接続できない。
+**修正:**
+*   **ネットワーク接続:** マイクロサービスの環境（例: `ping`, `telnet <db_host> <db_port>`）からデータベースホストに到達可能であることを確認する。
+*   **ファイアウォールルール:** 必要なポート（PostgreSQL のデフォルトは 5432）が開いていることを確認する。
+*   **データベース認証情報:** `APP_DATABASE_URL` のユーザー名、パスワード、ホスト、ポート、データベース名が正しいことを再確認する。
+*   **データベースの可用性:** PostgreSQL サーバーが稼働しており、接続を受け入れていることを確認する。
+*   **接続プールの枯渇:** 動作中にエラーが発生する場合、`max_connections` の `PgPoolOptions` を増やし、データベースの接続制限を監視する。
+
+### 2. `Redis connection timed out` または `connection refused`
+**障害モード:** レート制限やその他の Redis 依存機能が失敗する。
+**修正:**
+*   **ネットワーク接続:** Redis ホストに到達可能であることを確認する（例: `ping`, `telnet <redis_host> <redis_port>`）。
+*   **ファイアウォールルール:** Redis ポート（デフォルトは 6379）が開いていることを確認する。
+*   **Redis 認証情報:** `APP_REDIS_URL` のパスワードとホスト/ポートが正しいことを確認する。
+*   **Redis の可用性:** Redis サーバーが稼働していることを確認する。
+
+### 3. 高い CPU 使用率 / レイテンシースパイク
+**障害モード:** サービスが中程度の負荷で予期せぬ高い CPU 負荷または遅い応答時間を経験する。
+**修正:**
+*   **データベースクエリの最適化:** PostgreSQL の `EXPLAIN ANALYZE` を使用して遅いクエリを分析する。適切なインデックスが設定されていることを確認する。
+*   **N+1 クエリ問題:** ループ内で複数のデータベース呼び出しを行っているハンドラーを特定し、リファクタリングする。`JOIN` またはバッチ処理を使用する。
+*   **CPU バウンドな操作:** Rust コードをプロファイリングしてホットスポットを特定する。重い計算をバックグラウンドワーカーにオフロードするか、アルゴリズムを最適化することを検討する。
+*   **ロギングの冗長性:** 本番環境での過剰な `DEBUG` または `TRACE` レベルのロギングは、かなりのオーバーヘッドを追加する可能性がある。`RUST_LOG` 環境変数を調整する。
+
+### 4. `Too Many Open Files` エラー
+**障害モード:** サービスが、これ以上ファイルを開けないことを示す OS レベルのエラー（ソケットはファイルである）でクラッシュする。
+**修正:**
+*   **`ulimit`:** サービスを実行しているユーザーの `nofile` 制限を増やす。Docker では、`--ulimit nofile=65536:65536` で設定できる。
+*   **接続プール設定:** データベースおよび Redis プールの `max_connections` が妥当であり、ファイルディスクリプタを過剰に消費しないように高すぎないことを確認する。
+*   **リソースリーク:** 接続やファイルハンドルが適切に閉じられていないかどうかを調査する。Rust の RAII は役立つが、外部リソースに対しては手動の `drop` または `close` が必要になる場合がある。
+
+### 5. コレクターにトレースデータが表示されない
+**障害モード:** OpenTelemetry トレースが APM システム（例: Jaeger、Datadog）に表示されない。
+**修正:**
+*   **`APP_OTEL_EXPORTER_OTLP_ENDPOINT`:** エンドポイントが正しく設定され、マイクロサービスから到達可能であることを確認する。
+*   **コレクターの可用性:** OpenTelemetry コレクターまたは APM エージェントが実行されており、指定されたポートでリッスンしていることを確認する。
+*   **ファイアウォール:** サービスとコレクター間のファイアウォールルールを確認する。
+*   **サンプリング:** サンプラーを使用している場合、トレースが積極的にサンプリングされていないことを確認する。
+*   **サービス名:** トレースを識別するために重要な `APP_SERVICE_NAME` が設定されていることを確認する。
+
+### 6. Docker イメージサイズの問題
+**障害モード:** マルチステージビルドを使用しているにもかかわらず、最終的な Docker イメージが予期せず大きい。
+**修正:**
+*   **`FROM scratch`:** 最終ステージが本当に `FROM scratch` または `distroless/static` のような最小限のベースイメージを使用していることを確認する。
+*   **不要なファイル:** 最終ステージでコンパイルされたバイナリと必須の設定のみがコピーされていることを再確認する。`target` ディレクトリやソースコードのコピーは避ける。
+*   **静的リンク:** 最終イメージで glibc が不要になるように、静的リンクには `x86_64-unknown-linux-musl` ターゲットが使用されていることを確認する。
+*   **ビルドキャッシュの無効化:** `Cargo.toml` または `Cargo.lock` が頻繁に変更される場合、依存関係のビルドキャッシュが無効になる可能性がある。これらのファイルを最初にコピーするように Dockerfile を構成する。
+
+## よくある質問
+
+### Q1: 基本的な JSON デシリアライズ以外のリクエスト検証はどのように処理しますか？
+**A1:** 複雑な検証には、`validator` のような検証ライブラリを統合します。受信データをチェックするために `validator` を使用するカスタム Axum エクストラクターを作成できます。
+
+```rust
+// Example: Custom validator extractor
+use axum::{
+    async_trait,
+    extract::{FromRequest, Request},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
+use serde::de::DeserializeOwned;
+use validator::Validate;
+
+pub struct ValidatedJson<T>(pub T);
+
+#[async_trait]
+impl<T, S> FromRequest<S> for ValidatedJson<T>
+where
+    T: DeserializeOwned + Validate,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let Json(value) = Json::<T>::from_request(req, state)
+            .await
+            .map_err(|err| err.into_response())?;
+
+        value.validate().map_err(|err| {
+            (StatusCode::BAD_REQUEST, Json(err)).into_response()
+        })?;
+
+        Ok(ValidatedJson(value))
+    }
+}
+
+// Usage in handler:
+// pub async fn create_item(ValidatedJson(payload): ValidatedJson<CreateItem>) -> ...
+```
+
+### Q2: ハンドラー間で共有状態（データベースプールなど）を管理する最良の方法は何ですか？
+**A2:** Axum の `State` エクストラクターが慣用的な方法です。すべての共有リソースを保持する構造体（例: `AppState`）を定義し、それをクローンしてルーターの `.with_state()` メソッドに渡します。各ハンドラーは `State<AppState>` を抽出できます。状態構造体が `Clone` を実装していることを確認してください。
+
+### Q3: 認証と認可はどのように実装できますか？
+**A3:** 認証と認可は Tower ミドルウェアとして実装します。認証の場合、ミドルウェアはヘッダーからトークン（例: JWT）を抽出し、それを検証し、ユーザー情報をリクエスト拡張に挿入できます。その後の認可ミドルウェアまたはハンドラーロジックは、このユーザーデータを取得できます。`jsonwebtoken` のようなライブラリは JWT 処理に役立ちます。
+
+### Q4: サービスが `SIGSEGV` やその他の低レベルエラーでクラッシュします。どうすればよいですか？
+**A4:** Rust での `SIGSEGV`（セグメンテーション違反）はまれですが、メモリ破損を示しており、多くの場合 `unsafe` コードまたは FFI（外部関数インターフェース）の相互作用が原因です。
+1.  **`unsafe` ブロックのレビュー:** `unsafe` コードの正確性を慎重に監査します。
+2.  **FFI 境界:** C/C++ ライブラリと連携する場合、FFI 境界を越えた正しいメモリ管理と型変換を確実にします。
+3.  **依存関係の問題:** 依存関係、特に内部で `unsafe` を使用しているものに既知の問題がないか確認します。
+4.  **メモリサニタイザー:** Rust との統合は難しいですが、AddressSanitizer (ASan) のようなツールは、ネイティブメモリの問題のデバッグに役立つ場合があります。
+5.  **再現性:** 問題を特定するために、最小限の再現可能な例を作成してみてください。
+
+### Q5: 本番環境でのデータベースマイグレーションはどのように処理しますか？
+**A5:** マイグレーションの管理には `sqlx-cli` を使用します。
+1.  **マイグレーションの作成:** `sqlx migrate add <migration_name>`
+2.  **マイグレーションの適用:** アプリケーションの起動コードで `sqlx::migrate!().run(&pool).await;` を使用して、保留中のマイグレーションを自動的に適用します。これにより、データベーススキーマが常にアプリケーションコードと同期していることが保証されます。
+3.  **独立したマイグレーションサービス:** より複雑なデプロイメントの場合、マイグレーションをデプロイ前の個別のステップとして、または専用の Kubernetes init コンテナとして実行することを検討してください。
+```rust
+// src/main.rs (マイグレーションの抜粋)
+// ...
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // ...
+    let pg_pool = db::setup_pg_pool(&config.database_url).await?;
+
+    // データベースマイグレーションを適用
+    info!("Running database migrations...");
+    sqlx::migrate!("./migrations") // マイグレーションディレクトリへのパス
+        .run(&pg_pool)
+        .await?;
+    info!("Database migrations applied successfully.");
+    // ...
+}

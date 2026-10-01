@@ -1,0 +1,423 @@
+---
+title: "DeepSeek-R1と蒸留推論モデル：ローカルvLLMデプロイ、量子化、アーキテクチャ"
+images: ['/static/images/deepseek-r1-reasoning-patterns-local-vllm.png']
+date: '2026-10-01'
+lastUpdated: '2026-10-01'
+tags: ["ai", "llm", "performance", "architecture"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "DeepSeek-R1と蒸留推論モデルのローカルvLLMデプロイ、量子化、アーキテクチャを、本番環境レベルのアーキテクチャとコード例で網羅的に解説するガイド。"
+---
+
+DeepSeek-R1は、推論能力を持つ大規模言語モデル（LLM）において、特に人間のフィードバックからの強化学習（RLHF）と推論トレースに焦点を当てた自己対局の革新的な利用を通じて、大きな進歩を遂げました。この記事では、DeepSeek-R1とその蒸留されたバリアントのアーキテクチャの根幹を解剖し、vLLMとTensorRT-LLMを用いたローカルデプロイメント、量子化戦略、およびパフォーマンス最適化に関する実践的なガイドを提供します。
+
+## DeepSeek-R1のアーキテクチャと推論トレース
+
+DeepSeek-R1の核となる革新は、明示的な推論ステップの生成と洗練を重視するトレーニング手法にあります。暗黙的に推論を学習するモデルとは異なり、DeepSeek-R1は、最終的な回答を生成する前に、しばしば`<think>`ブロックにカプセル化された構造化された思考プロセスを生成するようにトレーニングされています。このアプローチは、Chain-of-Thought（CoT）プロンプティングに触発されていますが、モデルのトレーニング目標に直接統合されています。
+
+トレーニングプロセスには以下が含まれます。
+
+1.  **コールドスタートデータ収集:** 最初の推論トレースは、強力な教師モデル（例：GPT-4）または人間のアノテーターによって生成されます。これらのトレースは、複雑な問題を管理可能なステップに分解するようにモデルを導きます。
+2.  **自己対局による強化学習:** モデルは独自の推論トレースと回答を生成します。推論の品質と正確さに対する人間の好みに基づいてトレーニングされた報酬モデルが、これらの出力を評価します。その後、ポリシーモデルは、これらの報酬を最大化するために、近接ポリシー最適化（PPO）または同様のRLアルゴリズムを使用して更新されます。
+3.  **推論トレース構造:** モデルは、内部推論プロセスを区別するために、`<think>`や`</think>`のようなトークンを出力するように明示的にトレーニングされています。これにより、モデルの意思決定がより透明になり、デバッグ可能になります。
+
+DeepSeek-R1のインタラクションの例を以下に示します。
+
+```
+User: What is the capital of France, and what is its population?
+Assistant: <think>
+1. Identify the capital of France.
+2. Find the current population of Paris.
+3. Combine the information.
+</think>
+The capital of France is Paris. Its population is approximately 2.1 million (as of 2023).
+```
+
+この明示的な推論構造は、数学的な問題解決、コード生成、論理的推論のような複雑なタスクにおいて、中間ステップが最終的な回答と同じくらい重要であるため、非常に重要です。
+
+DeepSeek-R1の蒸留されたバリアントは、LlamaまたはQwenアーキテクチャに基づいていることが多く、より大きなDeepSeek-R1モデルから知識をより小さく効率的なモデルに蒸留することで、この推論能力を活用しています。この蒸留には通常、以下が含まれます。
+
+*   **知識蒸留:** より小さな生徒モデルをトレーニングして、より大きな教師モデルの出力（ロジット、隠れ状態、または推論トレース）を模倣させます。
+*   **選好アライメント:** DeepSeek-R1トレーニングからの報酬モデルを使用して、蒸留されたモデルをファインチューニングし、推論と有用性に関する人間の選好に合致するようにします。
+
+## 量子化戦略：FP8 vs. AWQ
+
+大規模LLMをローカルでデプロイするには、GPUメモリの制約内に収め、推論スループットを向上させるために、積極的な量子化が必要です。ここでは、パフォーマンスと精度のバランスが取れているFP8（Float8）とAWQ（Activation-aware Weight Quantization）に焦点を当てます。
+
+### FP8量子化
+
+FP8量子化は、特にE4M3（指数部4ビット、仮数部3ビット）またはE5M2（指数部5ビット、仮数部2ビット）形式を使用することで、大幅なメモリ削減（FP64から8倍、FP32から4倍、FP16/BF16から2倍）を実現します。NVIDIAのHopperアーキテクチャおよび新しいGPUは、ネイティブFP8テンソルコアアクセラレーションを提供し、非常に効率的です。
+
+プロセスは通常、以下を含みます。
+
+1.  **キャリブレーション:** 代表的なデータセットを分析して、重みとアクティベーションの最適なスケーリングファクターを決定します。
+2.  **量子化:** 導出されたスケーリングファクターを使用して、FP16/BF16の重みとアクティベーションをFP8に変換します。
+3.  **逆量子化（オンザフライ）:** 推論中、FP8値は計算のためにFP16/BF16に逆量子化され、その後ストレージのためにFP8に再量子化されます。
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Example: Loading a model with FP8 (requires specific libraries like NVIDIA's TransformerEngine or custom implementations)
+# This is a conceptual example as direct FP8 loading via transformers is often through specific backend integrations.
+# For actual FP8, you'd typically use TensorRT-LLM or a custom FP8-enabled inference engine.
+
+model_id = "deepseek-ai/deepseek-llm-7b-base" # Or a distilled variant
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+# Placeholder for FP8 loading logic. In practice, this would involve
+# converting the model to FP8 format using tools like `huggingface-cli convert`
+# or TensorRT-LLM's build process.
+# For demonstration, we'll show a standard load, but note FP8 requires specific hardware/software.
+try:
+    # This would typically fail without a specific FP8 implementation or TRT-LLM
+    # model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float8_e4m3fn)
+    print("Direct FP8 loading via transformers is not standard. Use TensorRT-LLM or similar.")
+except Exception as e:
+    print(f"Error loading with torch.float8_e4m3fn directly: {e}")
+
+# A more realistic scenario for FP8 would be via TensorRT-LLM:
+# (See TensorRT-LLM section below for full example)
+```
+
+### AWQ量子化
+
+AWQは、アクティベーションをFP16/BF16に保ちながら、重みの量子化に焦点を当てたトレーニング後量子化（PTQ）手法です。すべての重みがモデルのパフォーマンスにとって等しく重要ではないこと、特に大きなアクティベーションによって乗算される重みは量子化エラーに敏感であることを観察しています。AWQは、アクティベーションの大きさに基づいて重みを選択的に量子化します。
+
+核となるアイデア：
+
+1.  **顕著性に基づく重み量子化:** 顕著な重み（大きなアクティベーションの大きさのために量子化すると最大のエラーを引き起こす重み）を特定します。
+2.  **チャネルごとのスケーリング:** 量子化エラーを最小限に抑えるために、重みにチャネルごとのスケーリングファクターを適用します。
+3.  **量子化:** 重みを4ビット（または3ビット）整数に量子化します。
+
+AWQは通常、最小限のキャリブレーションデータで、素朴なINT4量子化よりも優れた精度を達成します。vLLMのような推論エンジンによって十分にサポートされています。
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Example: Loading a model with AWQ using vLLM's integration
+# This requires the model to be pre-quantized or vLLM to perform on-the-fly quantization.
+# For vLLM, you typically specify `quantization="awq"` during engine initialization.
+
+# To prepare a model for AWQ, you might use AutoGPTQ or similar libraries.
+# Example using AutoGPTQ for AWQ (conceptual, as vLLM handles the inference part):
+# from accelerate import Accelerator
+# from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
+
+# model_id = "deepseek-ai/deepseek-llm-7b-base"
+# quant_config = BaseQuantizeConfig(
+#     bits=4,
+#     group_size=128,
+#     desc_act=False, # For AWQ, often False
+#     quant_method="awq"
+# )
+#
+# model = AutoGPTQForCausalLM.from_pretrained(model_id, quantize_config=quant_config)
+# model.quantize(tokenizer.train_dataloader) # Requires a calibration dataset
+# model.save_quantized("deepseek-llm-7b-awq")
+
+# For vLLM, you just point to the AWQ-quantized model directory or specify the quantization method.
+```
+
+### 量子化の比較
+
+| 機能             | FP8 (E4M3/E5M2)                               | AWQ (4-bit)                                   |
+| :------------------ | :-------------------------------------------- | :-------------------------------------------- |
+| **メモリフットプリント**| 8倍削減 (FP64から), 2倍 (FP16から)      | 4倍削減 (FP16から)                      |
+| **ハードウェアサポート**| NVIDIA Hopper/Blackwellでネイティブ (Tensor Cores)| GPUに依存せず、推論エンジンによって最適化  |
+| **精度**        | 一般的に高い、特にキャリブレーションあり   | 4ビットで優れている、アクティベーション認識         |
+| **複雑さ**      | 特定のハードウェア/ソフトウェアスタックが必要     | トレーニング後、比較的簡単     |
+| **推論速度** | ネイティブハードウェアサポートで非常に高速   | 高速、コンシューマーGPUで良好なスループット        |
+| **キャリブレーション**     | 最適なスケーリングファクターのために推奨       | 重みの重要度決定のために必要  |
+| **ユースケース**        | ハイエンドデータセンター、最大スループット     | ローカルデプロイメント、コンシューマーGPU、良好なバランス |
+
+## ローカルvLLMデプロイメント
+
+vLLMは、PagedAttentionを活用してKVキャッシュメモリを効率的に管理する、高速LLM推論のためのオープンソースライブラリです。特にバッチ推論において、素朴な実装と比較してスループットを大幅に向上させます。
+
+### インストール
+
+```bash
+# Ensure you have a compatible CUDA toolkit installed
+pip install vllm
+```
+
+### vLLMによるデプロイメント
+
+DeepSeek-R1またはその蒸留されたバリアントをvLLMでデプロイするには、Python APIを使用するか、サーバーを起動します。
+
+#### Python APIの例
+
+```python
+from vllm import LLM, SamplingParams
+
+# Model ID from Hugging Face Hub. Replace with your specific DeepSeek-R1 variant.
+# For AWQ, ensure the model is either pre-quantized or vLLM supports on-the-fly AWQ for it.
+model_id = "deepseek-ai/deepseek-llm-7b-base" # Example, use a distilled/quantized version for production
+
+# Initialize the LLM engine
+# For AWQ, you'd typically specify quantization="awq" if the model supports it or is pre-quantized.
+# For FP8, you'd need TensorRT-LLM integration or a custom vLLM build.
+llm = LLM(
+    model=model_id,
+    tensor_parallel_size=1, # Number of GPUs to use for tensor parallelism
+    dtype="auto",           # Automatically detect dtype (e.g., bfloat16, float16)
+    gpu_memory_utilization=0.9, # Max GPU memory to use
+    quantization="awq"      # Specify AWQ quantization if using an AWQ model
+)
+
+# Define sampling parameters
+sampling_params = SamplingParams(
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=256,
+    stop=["<|im_end|>", "User:"] # Example stop tokens for chat models
+)
+
+# Generate prompts
+prompts = [
+    "User: Explain the concept of PagedAttention in vLLM. Assistant:",
+    "User: What are the key differences between FP8 and AWQ quantization? Assistant:"
+]
+
+# Generate outputs
+outputs = llm.generate(prompts, sampling_params)
+
+# Print the outputs
+for i, output in enumerate(outputs):
+    prompt = output.prompt
+    generated_text = output.outputs[0].text
+    print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+    print("-" * 80)
+
+```
+
+#### vLLMサーバーのデプロイメント
+
+本番環境対応のAPIエンドポイントの場合：
+
+```bash
+# Start the vLLM API server
+# Replace deepseek-ai/deepseek-llm-7b-base with your model path or HF ID.
+# --quantization awq for AWQ models.
+# --dtype bfloat16 for bfloat16 inference.
+python -m vllm.entrypoints.api_server \
+    --model deepseek-ai/deepseek-llm-7b-base \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.9 \
+    --port 8000 \
+    --host 0.0.0.0 \
+    --quantization awq # Use this if your model is AWQ quantized
+```
+
+その後、`curl`またはPythonクライアントを使用して操作します。
+
+```python
+import requests
+import json
+
+api_url = "http://localhost:8000/generate"
+headers = {"Content-Type": "application/json"}
+
+payload = {
+    "prompt": "User: Explain the concept of PagedAttention in vLLM. Assistant:",
+    "sampling_params": {
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "max_tokens": 256,
+        "stop": ["<|im_end|>", "User:"]
+    }
+}
+
+response = requests.post(api_url, headers=headers, data=json.dumps(payload))
+print(json.dumps(response.json(), indent=2))
+```
+
+## FP8のためのTensorRT-LLMデプロイメント
+
+特にNVIDIA GPUでのFP8量子化で最高のパフォーマンスを得るには、TensorRT-LLMが推奨されるソリューションです。これはLLMグラフを高度に最適化されたTensorRTエンジンにコンパイルします。
+
+### 前提条件
+
+*   NVIDIA GPU（ネイティブFP8アクセラレーションにはHopper以降）
+*   CUDA Toolkit
+*   TensorRT-LLMがインストールされていること（通常はソースまたはプリビルドされたコンテナから）
+
+### ワークフロー
+
+1.  **Hugging FaceモデルをTensorRT-LLM形式に変換:**
+    このステップでは、モデルの重みとアーキテクチャをTensorRT-LLMが理解し最適化できる形式に変換します。
+
+    ```bash
+    # Example for Llama-based models (DeepSeek-R1 distilled variants)
+    # Ensure you have the TensorRT-LLM environment set up.
+    # This script is usually part of the TensorRT-LLM examples.
+
+    # Clone TensorRT-LLM if you haven't
+    # git clone https://github.com/NVIDIA/TensorRT-LLM.git
+    # cd TensorRT-LLM
+    # pip install -e .
+
+    # Navigate to the examples directory
+    # cd examples/llama
+
+    # Convert the Hugging Face model.
+    # Replace deepseek-ai/deepseek-llm-7b-base with your model.
+    # --dtype float8 for FP8 quantization.
+    # --output_dir specifies where the TensorRT-LLM engine will be saved.
+    python convert_checkpoint.py \
+        --model_dir deepseek-ai/deepseek-llm-7b-base \
+        --output_dir ./tllm_deepseek_7b_fp8 \
+        --dtype float8 \
+        --tp_size 1 # Tensor parallelism size
+    ```
+
+2.  **TensorRT-LLMエンジンの構築:**
+    このステップでは、変換されたモデルを最適化されたTensorRTエンジンにコンパイルします。
+
+    ```bash
+    # Navigate to the TensorRT-LLM root directory
+    # cd TensorRT-LLM
+
+    # Build the engine
+    # Replace the path to your converted model.
+    # --max_batch_size, --max_input_len, --max_output_len are crucial for performance tuning.
+    # --dtype float8 for FP8.
+    # --workers for parallel compilation.
+    trtllm-build --checkpoint_dir ./tllm_deepseek_7b_fp8 \
+                 --output_dir ./tllm_deepseek_7b_fp8_engine \
+                 --gemm_plugin float8 \
+                 --max_batch_size 8 \
+                 --max_input_len 512 \
+                 --max_output_len 256 \
+                 --workers 1 \
+                 --dtype float8
+    ```
+
+3.  **TensorRT-LLMによる推論の実行:**
+    構築されたエンジンを推論に使用します。
+
+    ```python
+    import tensorrt_llm
+    from tensorrt_llm.runtime import ModelRunner
+    import torch
+
+    # Load the tokenizer
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/deepseek-llm-7b-base")
+
+    # Initialize the TensorRT-LLM runner
+    # Specify the engine directory and max_batch_size used during build.
+    runner = ModelRunner(
+        engine_dir='./tllm_deepseek_7b_fp8_engine',
+        lora_dir=None, # If using LoRA adapters
+        rank=0,
+        max_batch_size=8,
+        max_input_len=512,
+        max_output_len=256,
+        dtype='float8' # Must match the engine's dtype
+    )
+
+    prompts = [
+        "User: Explain the concept of PagedAttention in vLLM. Assistant:",
+        "User: What are the key differences between FP8 and AWQ quantization? Assistant:"
+    ]
+
+    # Tokenize prompts
+    input_ids = [tokenizer.encode(p, return_tensors="pt").cuda() for p in prompts]
+
+    # Generate outputs
+    # The `generate` method takes a list of input_ids tensors.
+    # It returns a list of output_ids tensors.
+    output_ids = runner.generate(
+        input_ids,
+        max_new_tokens=256,
+        temperature=0.7,
+        top_p=0.95,
+        stop_words_list=[tokenizer.encode("<|im_end|>", add_special_tokens=False),
+                         tokenizer.encode("User:", add_special_tokens=False)]
+    )
+
+    # Decode and print
+    for i, output in enumerate(output_ids):
+        generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+        print(f"Prompt: {prompts[i]!r}, Generated text: {generated_text!r}")
+        print("-" * 80)
+    ```
+
+## 本番環境での落とし穴とトラブルシューティング
+
+1.  **GPUメモリ不足（`CUDA out of memory`）:**
+    *   **原因:** モデルサイズ、バッチサイズ、`max_model_len` (vLLM)、または`max_input_len`/`max_output_len` (TensorRT-LLM) が利用可能なVRAMを超えている。
+    *   **修正:**
+        *   `tensor_parallel_size`を減らす（複数のGPUを使用している場合、正しく設定されていることを確認する）。
+        *   vLLMの`gpu_memory_utilization`を減らす（例：0.85に）。
+        *   `max_batch_size`を減らす。
+        *   `max_model_len` (vLLM) または`max_input_len`/`max_output_len` (TensorRT-LLM) を下げる。
+        *   より積極的な量子化を使用する（例：FP16の代わりにAWQ 4ビット、またはハードウェアがサポートしていればFP8）。
+        *   より小さな蒸留モデルに切り替える。
+        *   GPUハードウェアをアップグレードする。
+
+2.  **低スループット/高レイテンシ:**
+    *   **原因:** 最適でないバッチ処理、CPU-GPUデータ転送のボトルネック、非効率なモデルアーキテクチャ、またはハードウェアアクセラレーションの欠如。
+    *   **修正:**
+        *   GPU並列処理を活用するために、`max_batch_size`を増やす（メモリ制限まで）。
+        *   マルチGPUセットアップで`tensor_parallel_size`が正しく設定されていることを確認する。
+        *   `dtype`（例：`bfloat16`または`float16`）が使用されており、`float32`ではないことを確認する。
+        *   FP8の場合、Hopper/Blackwell GPUでTensorRT-LLMを使用していることを確認する。
+        *   CPUのボトルネック（例：トークン化速度）を確認する。
+        *   ボトルネックを特定するために`nvprof`または`NVIDIA Nsight Systems`でプロファイリングする。
+
+3.  **量子化後のモデル出力品質の劣化:**
+    *   **原因:** 積極的な量子化（例：適切なキャリブレーションなしのINT4）は精度損失につながる可能性がある。
+    *   **修正:**
+        *   AWQやFP8のような確立された量子化手法を適切なキャリブレーションとともに使用する。
+        *   量子化後に代表的な検証セットでモデルを評価する。
+        *   AWQを使用している場合、キャリブレーションデータセットが多様で、期待される入力の代表であることを確認する。
+        *   精度が重要である場合、わずかに積極的でない量子化（例：4ビットの代わりに8ビット）を検討する。
+
+4.  **TensorRT-LLMエンジンビルドの失敗:**
+    *   **原因:** 誤った`convert_checkpoint.py`引数、互換性のないモデルアーキテクチャ、または環境の問題。
+    *   **修正:**
+        *   `model_dir`、`dtype`、および`tp_size`引数を再確認する。
+        *   Hugging FaceモデルがTensorRT-LLMの変換スクリプト（例：Llama、Falconなど）と互換性があることを確認する。
+        *   TensorRT-LLMのインストールとCUDA環境を確認する。
+        *   特定のモデル変換要件については、TensorRT-LLMのドキュメントを確認する。
+        *   より詳細なエラーメッセージのために、ビルド中に詳細度を上げる（`--log_level verbose`）。
+
+5.  **vLLMの`stop_tokens`が期待通りに機能しない:**
+    *   **原因:** ストップシーケンスのトークンIDが間違っているか、モデルがストップシーケンスの一部であるトークンを生成するが、完全なシーケンスではない。
+    *   **修正:**
+        *   `stop`トークンが正しくトークン化されていることを確認する。例えば、`stop=["<|im_end|>", "User:"]`は生のトークンIDを使用する場合、`stop_token_ids=[tokenizer.encode("<|im_end|>", add_special_tokens=False), tokenizer.encode("User:", add_special_tokens=False)]`であるべきです。vLLMの`SamplingParams` `stop`引数は文字列マッチングを処理しますが、特定のトークンIDの場合、`stop_token_ids`の方が堅牢です。
+        *   まず、単純で曖昧さのないストップシーケンスでテストする。
+        *   モデルが部分的なストップシーケンスを生成する可能性があることに注意する。
+
+## よくある質問
+
+### Q1: DeepSeek-R1モデルをコンシューマーグレードのGPU（例：RTX 3090、4090）で実行できますか？
+
+A1: はい、特に蒸留および量子化されたバリアントは可能です。RTX 3090（24GB VRAM）または4090（24GB VRAM）は、4ビット（AWQ）に量子化された7B-13Bパラメータモデル、またはvLLMでFP16/BF16の7Bモデルの一部を快適に実行できます。より大きなモデルやFP8の場合、複数のGPUまたはより多くのVRAMが必要です。FP8でのTensorRT-LLMは主にHopper/Blackwell向けですが、FP16/BF16エンジンはコンシューマーカードでも実行できます。
+
+### Q2: DeepSeek-R1で`<think>`ブロックを使用することのパフォーマンスへの影響は何ですか？
+
+A2: `<think>`ブロックの明示的な生成は、生成されるトークンの総数を増加させ、推論レイテンシに直接影響します。しかし、このオーバーヘッドは、推論品質の向上とハルシネーションの削減によって正当化されることがよくあります。モデルのトレーニングは、これらのブロックが簡潔で関連性があることを保証します。レイテンシが重要なアプリケーションの場合、ユーザーに提示する前にこれらのブロックを後処理で削除するか、よりコンパクトな推論を生成するように蒸留モデルをファインチューニングすることができます。
+
+### Q3: ローカルデプロイメントでvLLMとTensorRT-LLMのどちらを選択すればよいですか？
+
+A3:
+*   **vLLM:** 使いやすさ、幅広いモデルサポート（Hugging Faceモデル）、効率的なバッチ処理（PagedAttention）に優れています。ほとんどのローカルデプロイメントの優れた出発点であり、AWQ量子化をうまくサポートします。
+*   **TensorRT-LLM:** NVIDIAのHopper/Blackwell GPUでのFP8において、最高のパフォーマンスと最低のレイテンシを提供します。より複雑なセットアップ（モデル変換、エンジンコンパイル）が必要であり、NVIDIAハードウェアに密接に結合しています。絶対的なピークパフォーマンスと最小のレイテンシが最優先で、互換性のあるハードウェアがある場合は、TensorRT-LLMを選択してください。
+
+### Q4: DeepSeek-R1の蒸留モデルをローカルでファインチューニングすることは可能ですか？
+
+A4: はい、十分なVRAM（24GB以上）を持つコンシューマーGPUで、より小さな蒸留モデル（例：7B）をファインチューニングすることは可能です。LoRA（Low-Rank Adaptation）やQLoRA（Quantized LoRA）のような技術は、メモリフットプリントを削減するために強く推奨されます。特定のタスクに合わせたデータセットと、Hugging Face `transformers`や`peft`のようなフレームワークが必要です。
+
+### Q5: vLLMとTensorRT-LLMにおける`tensor_parallel_size`の意味は何ですか？
+
+A5: `tensor_parallel_size`は、モデルのレイヤーまたはテンソルを分散させるGPUの数を指定します。
+*   **利点:** 単一のGPUに収まらないより大きなモデルを実行でき、計算を並列化することでスループットを向上させる可能性があります。
+*   **欠点:** GPU間の通信オーバーヘッドが発生し、最適に設定されていない場合やインターコネクトが遅い場合、パフォーマンスの向上が相殺されることがあります。ローカルデプロイメントの場合、テンソル並列処理で最高のパフォーマンスを得るには、GPUがNVLink経由で接続されていることを確認してください。単一のGPUしかない場合は、`tensor_parallel_size=1`を設定します。
