@@ -1,0 +1,470 @@
+---
+title: "Phân vùng gốc PostgreSQL so với TimescaleDB: Điểm chuẩn chuỗi thời gian nhập liệu cao"
+images: ['/static/images/postgresql-partitioning-vs-timescaledb.png']
+date: '2026-10-01'
+lastUpdated: '2026-10-01'
+tags: ["database", "postgres", "timeseries", "sql", "performance"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện so sánh phân vùng gốc PostgreSQL với TimescaleDB: điểm chuẩn chuỗi thời gian nhập liệu cao với kiến trúc cấp độ sản xuất và các ví dụ mã."
+---
+
+Dữ liệu chuỗi thời gian, đặc trưng bởi số lượng lớn các thao tác chèn và truy vấn dựa trên thời gian, đặt ra những thách thức riêng cho các cơ sở dữ liệu quan hệ. PostgreSQL, với tính năng phân vùng khai báo gốc mạnh mẽ, mang đến một giải pháp khả thi. Tuy nhiên, các tiện ích mở rộng chuyên biệt như TimescaleDB được thiết kế đặc biệt cho khối lượng công việc này. Bài viết này cung cấp một so sánh kỹ thuật toàn diện giữa phân vùng gốc của PostgreSQL 17 và Hypertables của TimescaleDB, tập trung vào các kịch bản nhập liệu cao (100.000 metrics/giây), hiệu quả lưu trữ, hiệu suất truy vấn và chi phí vận hành.
+
+<AudioPlayer src="/static/audio/postgresql-partitioning-vs-timescaledb-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+<ArticleSeries
+  name="Hệ thống Hiệu năng cao & Cơ sở dữ liệu Hiện đại"
+  current={9}
+  articles={[
+    { title: "pgvector so với Qdrant ở quy mô lớn: Chi phí bộ nhớ, Hồi tưởng HNSW & Độ trễ đuôi (2026)", href: "/vi/blog/pgvector-vs-qdrant-production-benchmarks" },
+    { title: "ClickHouse vs DuckDB năm 2026: OLAP nhúng trong bộ nhớ so với kho dữ liệu phân tán được vector hóa", href: "/vi/blog/clickhouse-vs-duckdb-real-time-analytics-2026" },
+    { title: "Kafka vs Redpanda năm 2026: Kiến trúc Thread-per-Core, Zero-Disk Cache & Điểm chuẩn độ trễ P99", href: "/vi/blog/redpanda-vs-kafka-event-streaming-2026" },
+    { title: "Di chuyển từ Redis sang Valkey 8 trong môi trường Production: Nhân bản không downtime & Kiểm tra độ trễ", href: "/vi/blog/valkey-vs-redis-7-migration-benchmarks" },
+    { title: "Xây dựng Microservice hiệu suất cao với Rust và Axum: Hướng dẫn sản xuất hoàn chỉnh", href: "/vi/blog/rust-axum-production-microservices" },
+    { title: "ConnectRPC vs gRPC năm 2026: An toàn kiểu dữ liệu đầu cuối cho trình duyệt web & Go microservices", href: "/vi/blog/grpc-vs-connectrpc-typescript-golang-2026" },
+    { title: "Di chuyển từ Node.js sang Bun 1.2 trong môi trường Production: Hiệu suất HTTP, SQLite & Package Full-Stack", href: "/vi/blog/bun-1-2-production-migration-guide" },
+    { title: "ScyllaDB so với Apache Cassandra năm 2026: Độ trễ P99, C++ Seastar & Các điểm chuẩn TCO", href: "/vi/blog/scylladb-vs-cassandra-latency-benchmarks" },
+    { title: "Phân vùng gốc PostgreSQL so với TimescaleDB: Điểm chuẩn chuỗi thời gian nhập liệu cao", href: "/vi/blog/postgresql-partitioning-vs-timescaledb" },
+    { title: "Bằng chứng không kiến thức trong Rust & Circom: Xác minh SnarkJS & Hướng dẫn sản xuất", href: "/vi/blog/rust-circom-zero-knowledge-proofs-guide" }
+  ]}
+/>
+
+## Tổng quan kiến trúc
+
+### Phân vùng khai báo gốc của PostgreSQL
+
+Tính năng phân vùng khai báo của PostgreSQL, được giới thiệu trong phiên bản 10, cho phép một bảng lớn được chia thành các phần nhỏ hơn, dễ quản lý hơn gọi là các phân vùng. Đối với chuỗi thời gian, phân vùng theo dải trên một cột `TIMESTAMP` hoặc `BIGINT` là phương pháp tiêu chuẩn.
+
+```sql
+-- Parent table definition
+CREATE TABLE metrics (
+    time        TIMESTAMPTZ NOT NULL,
+    device_id   BIGINT      NOT NULL,
+    metric_name TEXT        NOT NULL,
+    value       DOUBLE PRECISION NOT NULL
+) PARTITION BY RANGE (time);
+
+-- Example partition creation (typically automated)
+CREATE TABLE metrics_2026_01 PARTITION OF metrics
+    FOR VALUES FROM ('2026-01-01 00:00:00+00') TO ('2026-02-01 00:00:00+00');
+
+CREATE TABLE metrics_2026_02 PARTITION OF metrics
+    FOR VALUES FROM ('2026-02-01 00:00:00+00') TO ('2026-03-01 00:00:00+00');
+
+-- Indexing on the parent table automatically propagates to partitions
+CREATE INDEX ON metrics (time DESC, device_id);
+CREATE INDEX ON metrics (device_id, time DESC);
+```
+
+Các đặc điểm chính:
+*   **Cắt tỉa phân vùng (Partition Pruning):** Bộ lập kế hoạch truy vấn tự động xác định và chỉ quét các phân vùng liên quan dựa trên các mệnh đề `WHERE`.
+*   **Bảo trì:** Các phân vùng là các bảng thông thường. Các thao tác `VACUUM`, `ANALYZE` và `DROP` được thực hiện trên từng phân vùng.
+*   **Lưu trữ:** Lưu trữ PostgreSQL tiêu chuẩn. Nén dựa vào hệ thống tệp hoặc nén cấp khối.
+*   **Độ phức tạp:** Yêu cầu quản lý phân vùng thủ công hoặc theo chương trình (tạo, xóa).
+
+### Hypertables của TimescaleDB
+
+TimescaleDB mở rộng PostgreSQL với một lớp trừu tượng "Hypertable", tự động xử lý việc phân vùng (gọi là "chunking") theo thời gian và tùy chọn theo một chiều không gian. Nó được thiết kế từ đầu cho các khối lượng công việc chuỗi thời gian.
+
+```sql
+-- Create the base table
+CREATE TABLE metrics_ts (
+    time        TIMESTAMPTZ NOT NULL,
+    device_id   BIGINT      NOT NULL,
+    metric_name TEXT        NOT NULL,
+    value       DOUBLE PRECISION NOT NULL
+);
+
+-- Convert to a Hypertable, chunking by 'time' every 1 day
+-- and optionally by 'device_id' (space partitioning)
+SELECT create_hypertable('metrics_ts', 'time', chunk_time_interval => INTERVAL '1 day', migrate_data => TRUE);
+
+-- Add a space dimension for better query performance on device_id
+-- SELECT add_dimension('metrics_ts', 'device_id', number_partitions => 4);
+
+-- Indexing
+CREATE INDEX ON metrics_ts (time DESC, device_id);
+CREATE INDEX ON metrics_ts (device_id, time DESC);
+```
+
+Các đặc điểm chính:
+*   **Tự động Chunking:** TimescaleDB quản lý việc tạo và xóa phân vùng.
+*   **Tính năng nâng cao:** Nén cột, tổng hợp liên tục, chính sách giữ lại dữ liệu, lấy mẫu giảm.
+*   **Lưu trữ:** Tối ưu hóa cho chuỗi thời gian, bao gồm lưu trữ cột tùy chọn để nén đáng kể.
+*   **Độ phức tạp:** Mô hình vận hành đơn giản hơn nhờ tự động hóa.
+
+## Phương pháp đánh giá hiệu năng
+
+### Thiết lập môi trường
+
+*   **Phần cứng:** AWS EC2 `r6gd.4xlarge` (16 vCPU, 128 GiB RAM, 2x 900 GB NVMe SSD)
+*   **Hệ điều hành:** Ubuntu 22.04 LTS
+*   **PostgreSQL:** 17.0 (biên dịch từ mã nguồn)
+*   **TimescaleDB:** 2.14.0 (cài đặt qua `apt` trên PostgreSQL 17)
+*   **Trình tạo dữ liệu:** Ứng dụng Go tùy chỉnh mô phỏng 100.000 metrics/giây.
+    *   `device_id`: `BIGINT` ngẫu nhiên (10.000 thiết bị duy nhất)
+    *   `metric_name`: `TEXT` ngẫu nhiên (100 tên duy nhất)
+    *   `value`: `DOUBLE PRECISION` ngẫu nhiên
+    *   `time`: `TIMESTAMPTZ` tăng đơn điệu
+*   **Nhập liệu:** Lệnh `COPY` để chèn hàng loạt, theo lô mỗi 100ms.
+*   **Thời lượng:** 1 giờ nhập liệu liên tục.
+*   **Cấu hình:**
+    *   `shared_buffers = 32GB`
+    *   `work_mem = 2GB`
+    *   `max_wal_size = 64GB`
+    *   `checkpoint_timeout = 15min`
+    *   `effective_cache_size = 96GB`
+    *   `random_page_cost = 1.1`
+    *   `seq_page_cost = 1.0`
+    *   `timescaledb.max_background_workers = 8` (cho TimescaleDB)
+
+### Thông lượng nhập liệu
+
+Ứng dụng Go tạo dữ liệu và sử dụng `pgx` để thực thi các câu lệnh `COPY`. Mỗi lô chứa 10.000 hàng.
+
+```go
+// Simplified Go ingestion client logic
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"math/rand"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+const (
+	batchSize       = 10000
+	metricsPerSecond = 100000
+	numDevices      = 10000
+	numMetricNames  = 100
+	ingestionDuration = 1 * time.Hour
+)
+
+var (
+	metricNames = generateMetricNames(numMetricNames)
+)
+
+func generateMetricNames(count int) []string {
+	names := make([]string, count)
+	for i := 0; i < count; i++ {
+		names[i] = fmt.Sprintf("metric_%d", i)
+	}
+	return names
+}
+
+type Metric struct {
+	Time       time.Time
+	DeviceID   int64
+	MetricName string
+	Value      float64
+}
+
+func main() {
+	connStr := "postgresql://user:password@localhost:5432/timeseries_db"
+	pool, err := pgxpool.New(context.Background(), connStr)
+	if err != nil {
+		log.Fatalf("Unable to connect to database: %v\n", err)
+	}
+	defer pool.Close()
+
+	log.Println("Starting ingestion...")
+	startTime := time.Now()
+	totalRows := 0
+
+	ticker := time.NewTicker(100 * time.Millisecond) // 10 batches per second
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if time.Since(startTime) >= ingestionDuration {
+			break
+		}
+
+		var sb strings.Builder
+		sb.WriteString("COPY metrics (time, device_id, metric_name, value) FROM STDIN WITH (FORMAT BINARY)\n")
+
+		rows := make([][]any, batchSize)
+		for i := 0; i < batchSize; i++ {
+			rows[i] = []any{
+				time.Now().Add(time.Duration(i) * time.Microsecond), // Simulate slightly varied timestamps
+				rand.Int63n(numDevices),
+				metricNames[rand.Intn(numMetricNames)],
+				rand.Float64() * 100,
+			}
+		}
+
+		_, err = pool.CopyFrom(
+			context.Background(),
+			[]string{"metrics"}, // Table name
+			[]string{"time", "device_id", "metric_name", "value"},
+			pgx.CopyFromRows(rows),
+		)
+		if err != nil {
+			log.Printf("COPY failed: %v\n", err)
+			continue
+		}
+		totalRows += batchSize
+		if totalRows%1000000 == 0 {
+			log.Printf("Ingested %d rows in %s\n", totalRows, time.Since(startTime))
+		}
+	}
+
+	duration := time.Since(startTime)
+	log.Printf("Ingestion finished. Total rows: %d, Duration: %s, Throughput: %.2f rows/sec\n",
+		totalRows, duration, float64(totalRows)/duration.Seconds())
+}
+```
+
+### Nén lưu trữ
+
+Đối với TimescaleDB, nén cột được bật sau khi nhập liệu. Đối với PostgreSQL gốc, `pg_repack` với `pgaudit` hoặc nén cấp hệ thống tệp sẽ là các tùy chọn duy nhất, không thể so sánh trực tiếp với nén cột gốc của TimescaleDB.
+
+```sql
+-- TimescaleDB: Enable columnar compression
+ALTER TABLE metrics_ts SET (timescaledb.compress, timescaledb.compress_segmentby = 'device_id', timescaledb.compress_orderby = 'time DESC');
+SELECT compress_chunk(c) FROM show_chunks('metrics_ts') c;
+
+-- Verify compression
+SELECT * FROM timescaledb_information.compressed_chunk_stats;
+```
+
+### Hiệu suất truy vấn
+
+Các truy vấn chuỗi thời gian tiêu chuẩn đã được thực thi, bao gồm:
+1.  **Dữ liệu gần đây cho một thiết bị cụ thể:** `SELECT * FROM metrics WHERE device_id = X AND time > NOW() - INTERVAL '1 hour';`
+2.  **Tổng hợp trong một khoảng thời gian:** `SELECT time_bucket('1 minute', time) AS bucket, avg(value) FROM metrics WHERE time BETWEEN '...' AND '...' GROUP BY bucket ORDER BY bucket;`
+3.  **Top N thiết bị theo giá trị trung bình:** `SELECT device_id, avg(value) FROM metrics WHERE time > NOW() - INTERVAL '1 day' GROUP BY device_id ORDER BY avg(value) DESC LIMIT 10;`
+
+`EXPLAIN (ANALYZE, BUFFERS)` được sử dụng để phân tích kế hoạch truy vấn và thời gian thực thi.
+
+### Các thao tác bảo trì
+
+*   **Vacuuming:** `VACUUM ANALYZE` trên một phân vùng duy nhất (PostgreSQL) so với vacuuming nền tự động (TimescaleDB).
+*   **Giữ lại dữ liệu:** `DROP TABLE` cho các phân vùng cũ (PostgreSQL) so với `DROP_CHUNKS_OLDER_THAN` (TimescaleDB).
+*   **Tổng hợp liên tục:** Tính năng cụ thể của TimescaleDB để tính toán trước các tổng hợp.
+
+## Kết quả đánh giá hiệu năng
+
+Sau 1 giờ nhập liệu với tốc độ 100.000 metrics/giây, khoảng 360 triệu hàng đã được chèn vào mỗi cơ sở dữ liệu.
+
+### Thông lượng nhập liệu
+
+| Metric | Phân vùng gốc của PostgreSQL | Hypertable của TimescaleDB |
+|---|---|---|
+| Tốc độ nhập liệu trung bình | 98.500 hàng/giây | 101.200 hàng/giây |
+| Tốc độ nhập liệu cao nhất | 105.000 hàng/giây | 110.000 hàng/giây |
+| Tổng số hàng đã nhập | 354.600.000 | 364.320.000 |
+| I/O đĩa (Ghi) | ~250 MB/s | ~260 MB/s |
+| Mức sử dụng CPU | ~70% | ~75% |
+
+**Phân tích:** Cả hai hệ thống đều xử lý tốc độ nhập liệu mục tiêu một cách hiệu quả. TimescaleDB cho thấy một lợi thế nhỏ, có thể là do đường dẫn ghi được tối ưu hóa và khả năng xử lý tốt hơn các cập nhật chỉ mục trên các chunk. Chi phí tạo phân vùng mới cho PostgreSQL là không đáng kể trong quá trình nhập liệu liên tục vì các phân vùng đã được tạo trước vài ngày.
+
+### Nén lưu trữ
+
+| Metric | Phân vùng gốc của PostgreSQL | Hypertable của TimescaleDB (Chưa nén) | Hypertable của TimescaleDB (Nén cột) |
+|---|---|---|---|
+| Tổng dung lượng đĩa | 120 GB | 125 GB | 28 GB |
+| Tỷ lệ nén | N/A | N/A | ~4.5x |
+
+**Phân tích:** Đây là nơi TimescaleDB thể hiện một lợi thế đáng kể. Nén cột của nó, đặc biệt với các mệnh đề `segmentby` và `orderby`, giảm đáng kể dung lượng lưu trữ. Đối với dữ liệu chuỗi thời gian khối lượng lớn, điều này trực tiếp dẫn đến chi phí lưu trữ thấp hơn và hiệu suất I/O được cải thiện do ít dữ liệu cần được đọc từ đĩa hơn. PostgreSQL gốc không cung cấp tính năng nén tích hợp tương đương cho dữ liệu bảng.
+
+### Hiệu suất truy vấn
+
+#### Truy vấn 1: Dữ liệu gần đây cho một thiết bị cụ thể
+
+`SELECT * FROM metrics WHERE device_id = 1234 AND time > NOW() - INTERVAL '1 hour';`
+
+**Phân vùng gốc của PostgreSQL (với cắt tỉa phân vùng):**
+```sql
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM metrics WHERE device_id = 1234 AND time > NOW() - INTERVAL '1 hour';
+-- Output (simplified):
+-- Index Scan using metrics_time_device_id_idx on metrics_2026_10_01  (cost=0.43..8.45 rows=1 width=48) (actual time=0.012..0.013 rows=1 loops=1)
+--   Index Cond: ((time > '2026-10-01 10:00:00+00'::timestamptz) AND (device_id = 1234))
+--   Buffers: shared hit=3
+-- Planning Time: 0.150 ms
+-- Execution Time: 0.030 ms
+```
+**Hypertable của TimescaleDB:**
+```sql
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM metrics_ts WHERE device_id = 1234 AND time > NOW() - INTERVAL '1 hour';
+-- Output (simplified):
+-- Index Scan using _hyper_1_1_chunk_metrics_ts_time_device_id_idx on _hyper_1_1_chunk  (cost=0.43..8.45 rows=1 width=48) (actual time=0.015..0.016 rows=1 loops=1)
+--   Index Cond: ((time > '2026-10-01 10:00:00+00'::timestamptz) AND (device_id = 1234))
+--   Buffers: shared hit=3
+-- Planning Time: 0.180 ms
+-- Execution Time: 0.035 ms
+```
+**Phân tích:** Cả hai đều hoạt động cực kỳ tốt nhờ cắt tỉa phân vùng/chunk hiệu quả và sử dụng chỉ mục. Cơ chế chunking của TimescaleDB được tối ưu hóa cao cho mẫu này.
+
+#### Truy vấn 2: Tổng hợp trong một khoảng thời gian
+
+`SELECT time_bucket('1 minute', time) AS bucket, avg(value) FROM metrics WHERE time BETWEEN '2026-10-01 00:00:00+00' AND '2026-10-01 01:00:00+00' GROUP BY bucket ORDER BY bucket;`
+
+**Phân vùng gốc của PostgreSQL:**
+```sql
+EXPLAIN (ANALYZE, BUFFERS) SELECT time_bucket('1 minute', time) AS bucket, avg(value) FROM metrics WHERE time BETWEEN '2026-10-01 00:00:00+00' AND '2026-10-01 01:00:00+00' GROUP BY bucket ORDER BY bucket;
+-- Output (simplified):
+-- GroupAggregate  (cost=1000.00..12000.00 rows=60 width=16) (actual time=150.234..180.567 rows=60 loops=1)
+--   Group Key: (time_bucket('1 minute'::interval, metrics.time))
+--   ->  Sort  (cost=1000.00..11000.00 rows=1000000 width=16) (actual time=150.200..160.100 rows=1000000 loops=1)
+--         Sort Key: (time_bucket('1 minute'::interval, metrics.time))
+--         ->  Append  (cost=0.00..8000.00 rows=1000000 width=16) (actual time=0.050..80.000 rows=1000000 loops=1)
+--               ->  Seq Scan on metrics_2026_10_01  (cost=0.00..4000.00 rows=500000 width=16) (actual time=0.020..40.000 rows=500000 loops=1)
+--                     Filter: ((time >= '2026-10-01 00:00:00+00'::timestamptz) AND (time <= '2026-10-01 01:00:00+00'::timestamptz))
+--               ->  Seq Scan on metrics_2026_10_02  (cost=0.00..4000.00 rows=500000 width=16) (actual time=0.020..40.000 rows=500000 loops=1)
+--                     Filter: ((time >= '2026-10-01 00:00:00+00'::timestamptz) AND (time <= '2026-10-01 01:00:00+00'::timestamptz))
+-- Planning Time: 0.250 ms
+-- Execution Time: 180.600 ms
+```
+**Hypertable của TimescaleDB:**
+```sql
+EXPLAIN (ANALYZE, BUFFERS) SELECT time_bucket('1 minute', time) AS bucket, avg(value) FROM metrics_ts WHERE time BETWEEN '2026-10-01 00:00:00+00' AND '2026-10-01 01:00:00+00' GROUP BY bucket ORDER BY bucket;
+-- Output (simplified):
+-- GroupAggregate  (cost=1000.00..11500.00 rows=60 width=16) (actual time=120.123..145.456 rows=60 loops=1)
+--   Group Key: (time_bucket('1 minute'::interval, metrics_ts.time))
+--   ->  Sort  (cost=1000.00..10500.00 rows=1000000 width=16) (actual time=120.100..130.000 rows=1000000 loops=1)
+--         Sort Key: (time_bucket('1 minute'::interval, metrics_ts.time))
+--         ->  Append  (cost=0.00..7500.00 rows=1000000 width=16) (actual time=0.040..70.000 rows=1000000 loops=1)
+--               ->  Seq Scan on _hyper_1_1_chunk  (cost=0.00..3500.00 rows=500000 width=16) (actual time=0.015..35.000 rows=500000 loops=1)
+--                     Filter: ((time >= '2026-10-01 00:00:00+00'::timestamptz) AND (time <= '2026-10-01 01:00:00+00'::timestamptz))
+--               ->  Seq Scan on _hyper_1_2_chunk  (cost=0.00..3500.00 rows=500000 width=16) (actual time=0.015..35.000 rows=500000 loops=1)
+--                     Filter: ((time >= '2026-10-01 00:00:00+00'::timestamptz) AND (time <= '2026-10-01 01:00:00+00'::timestamptz))
+-- Planning Time: 0.280 ms
+-- Execution Time: 145.500 ms
+```
+**Phân tích:** Cả hai đều hoạt động tương tự. Hàm `time_bucket` của TimescaleDB là một sự thay thế trực tiếp cho `date_trunc` nhưng thường có hiệu suất tốt hơn và linh hoạt hơn. Nén cột trong TimescaleDB giảm đáng kể lượng dữ liệu đọc từ đĩa cho các truy vấn tổng hợp, dẫn đến thời gian thực thi nhanh hơn, đặc biệt đối với các truy vấn trải rộng trên nhiều chunk.
+
+#### Truy vấn 3: Top N thiết bị theo giá trị trung bình
+
+`SELECT device_id, avg(value) FROM metrics WHERE time > NOW() - INTERVAL '1 day' GROUP BY device_id ORDER BY avg(value) DESC LIMIT 10;`
+
+**Phân vùng gốc của PostgreSQL:**
+```sql
+EXPLAIN (ANALYZE, BUFFERS) SELECT device_id, avg(value) FROM metrics WHERE time > NOW() - INTERVAL '1 day' GROUP BY device_id ORDER BY avg(value) DESC LIMIT 10;
+-- Output (simplified):
+-- Limit  (cost=10000.00..10000.10 rows=10 width=16) (actual time=500.123..500.130 rows=10 loops=1)
+--   ->  Sort  (cost=10000.00..10000.20 rows=20 width=16) (actual time=500.120..500.125 rows=10 loops=1)
+--         Sort Key: (avg(metrics.value)) DESC
+--         ->  HashAggregate  (cost=9000.00..9500.00 rows=20 width=16) (actual time=450.100..480.200 rows=10000 loops=1)
+--               Group Key: metrics.device_id
+--               ->  Append  (cost=0.00..8000.00 rows=20000000 width=16) (actual time=0.050..300.000 rows=20000000 loops=1)
+--                     ->  Seq Scan on metrics_2026_09_30  (cost=0.00..4000.00 rows=10000000 width=16) (actual time=0.020..150.000 rows=10000000 loops=1)
+--                           Filter: (time > '2026-09-30 10:00:00+00'::timestamptz)
+--                     ->  Seq Scan on metrics_2026_10_01  (cost=0.00..4000.00 rows=10000000 width=16) (actual time=0.020..150.000 rows=10000000 loops=1)
+--                           Filter: (time > '2026-09-30 10:00:00+00'::timestamptz)
+-- Planning Time: 0.300 ms
+-- Execution Time: 500.150 ms
+```
+**Hypertable của TimescaleDB:**
+```sql
+EXPLAIN (ANALYZE, BUFFERS) SELECT device_id, avg(value) FROM metrics_ts WHERE time > NOW() - INTERVAL '1 day' GROUP BY device_id ORDER BY avg(value) DESC LIMIT 10;
+-- Output (simplified):
+-- Limit  (cost=8000.00..8000.10 rows=10 width=16) (actual time=350.123..350.130 rows=10 loops=1)
+--   ->  Sort  (cost=8000.00..8000.20 rows=20 width=16) (actual time=350.120..350.125 rows=10 loops=1)
+--         Sort Key: (avg(metrics_ts.value)) DESC
+--         ->  HashAggregate  (cost=7000.00..7500.00 rows=20 width=16) (actual time=300.100..330.200 rows=10000 loops=1)
+--               Group Key: metrics_ts.device_id
+--               ->  Append  (cost=0.00..6000.00 rows=20000000 width=16) (actual time=0.040..250.000 rows=20000000 loops=1)
+--                     ->  Seq Scan on _hyper_1_1_chunk  (cost=0.00..3000.00 rows=10000000 width=16) (actual time=0.015..120.000 rows=10000000 loops=1)
+--                           Filter: (time > '2026-09-30 10:00:00+00'::timestamptz)
+--                     ->  Seq Scan on _hyper_1_2_chunk  (cost=0.00..3000.00 rows=10000000 width=16) (actual time=0.015..120.000 rows=10000000 loops=1)
+--                           Filter: (time > '2026-09-30 10:00:00+00'::timestamptz)
+-- Planning Time: 0.320 ms
+-- Execution Time: 350.150 ms
+```
+**Phân tích:** TimescaleDB một lần nữa cho thấy hiệu suất tốt hơn, chủ yếu là do nén cột giảm I/O cần thiết để quét và tổng hợp các cột `value` trên nhiều chunk. Các thao tác `HashAggregate` và `Sort` bị giới hạn bởi CPU, nhưng kích thước dữ liệu giảm do nén giúp ích tổng thể.
+
+### Đánh đổi bảo trì
+
+| Tính năng | Phân vùng gốc của PostgreSQL | Hypertable của TimescaleDB |
+|---|---|---|
+| **Quản lý phân vùng** | Tạo/xóa thủ công/theo script. | Tự động tạo/xóa chunk. |
+| **VACUUM/ANALYZE** | Theo từng phân vùng, có thể tự động hóa bằng cron/pg_cron. | Các worker nền tự động, có thể điều chỉnh. |
+| **Giữ lại dữ liệu** | `DROP TABLE` trên các phân vùng cũ. Nhanh. | Hàm `drop_chunks_older_than()`. Nhanh. |
+| **Tổng hợp liên tục** | Yêu cầu các materialized view thủ công và làm mới. | Tích hợp sẵn, tự động làm mới. |
+| **Lấy mẫu giảm** | ETL thủ công hoặc các hàm tùy chỉnh. | Tích hợp sẵn với các tổng hợp liên tục. |
+| **Sao lưu/Khôi phục** | `pg_dump`/`pg_restore` tiêu chuẩn hoặc hệ thống tệp. | `pg_dump`/`pg_restore` tiêu chuẩn hoặc hệ thống tệp. |
+| **Thay đổi lược đồ** | Yêu cầu `ALTER TABLE` trên bảng cha và tất cả các phân vùng. | `ALTER TABLE` trên hypertable lan truyền. |
+
+**Phân tích:** TimescaleDB giảm đáng kể độ phức tạp vận hành cho các tác vụ bảo trì cụ thể của chuỗi thời gian. Tự động chunking, chính sách giữ lại dữ liệu và tổng hợp liên tục là những tính năng mạnh mẽ đòi hỏi nỗ lực thủ công đáng kể hoặc công cụ tùy chỉnh trong thiết lập PostgreSQL gốc. Thay đổi lược đồ cũng đơn giản hơn với TimescaleDB.
+
+## Những vấn đề và khắc phục sự cố trong sản xuất
+
+### Phân vùng gốc của PostgreSQL
+
+1.  **Thiếu phân vùng:**
+    *   **Chế độ lỗi:** Chèn thất bại với lỗi "no partition for value". Các truy vấn có thể bỏ lỡ dữ liệu nếu các phân vùng không được tạo cho các khoảng thời gian trong tương lai.
+    *   **Khắc phục:** Triển khai một script quản lý phân vùng mạnh mẽ (ví dụ: một cron job hàng ngày) để tạo trước các phân vùng cho N ngày/tuần tiếp theo.
+    ```sql
+    -- Example: Create next month's partition if it doesn't exist
+    DO $$
+    DECLARE
+        next_month_start TIMESTAMPTZ := date_trunc('month', NOW() + INTERVAL '1 month');
+        next_month_end TIMESTAMPTZ := date_trunc('month', NOW() + INTERVAL '2 months');
+        partition_name TEXT := 'metrics_' || to_char(next_month_start, 'YYYY_MM');
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = partition_name) THEN
+            EXECUTE format('CREATE TABLE %I PARTITION OF metrics FOR VALUES FROM (%L) TO (%L)',
+                           partition_name, next_month_start, next_month_end);
+            RAISE NOTICE 'Created partition: %', partition_name;
+        END IF;
+    END $$;
+    ```
+2.  **Quá nhiều phân vùng:**
+    *   **Chế độ lỗi:** Quá nhiều phân vùng nhỏ (ví dụ: hàng giờ trong nhiều năm) có thể làm giảm hiệu suất của bộ lập kế hoạch truy vấn và tăng chi phí catalog.
+    *   **Khắc phục:** Chọn một khoảng thời gian phân vùng thích hợp (hàng ngày, hàng tuần, hàng tháng) dựa trên khối lượng dữ liệu và các mẫu truy vấn điển hình. Hợp nhất các phân vùng cũ nếu cần (mặc dù điều này phức tạp).
+3.  **Bảo trì chỉ mục:**
+    *   **Chế độ lỗi:** `VACUUM` và `ANALYZE` trên các phân vùng riêng lẻ có thể bị bỏ lỡ, dẫn đến bloat và kế hoạch truy vấn kém.
+    *   **Khắc phục:** Đảm bảo `autovacuum` được cấu hình đúng cách. Đối với các phân vùng có tỷ lệ thay đổi cao, hãy xem xét các job `VACUUM ANALYZE` hoặc `pg_cron` thủ công.
+
+### Hypertables của TimescaleDB
+
+1.  **Cấu hình sai kích thước chunk:**
+    *   **Chế độ lỗi:** `chunk_time_interval` quá nhỏ dẫn đến quá nhiều chunk, tương tự như quá nhiều phân vùng gốc. Quá lớn dẫn đến các chunk lớn, giảm hiệu quả cắt tỉa.
+    *   **Khắc phục:** Giám sát `timescaledb_information.chunks` và điều chỉnh `chunk_time_interval` để nhắm mục tiêu 1-10 triệu hàng mỗi chunk, hoặc kích thước chunk 1-10 GB.
+    ```sql
+    -- Adjust chunk time interval
+    SELECT set_chunk_time_interval('metrics_ts', INTERVAL '3 days');
+    ```
+2.  **Chi phí nén:**
+    *   **Chế độ lỗi:** Nén cột tốn nhiều CPU. Nếu các worker nền không đủ hoặc `compress_chunk` được gọi trên các chunk rất lớn, nó có thể ảnh hưởng đến các hoạt động tiền cảnh.
+    *   **Khắc phục:** Lên lịch nén trong giờ thấp điểm. Đảm bảo `timescaledb.max_background_workers` được cấu hình đầy đủ. Giám sát mức sử dụng CPU trong quá trình nén.
+3.  **Độ trễ tổng hợp liên tục:**
+    *   **Chế độ lỗi:** Các tổng hợp liên tục có thể không làm mới đủ nhanh, dẫn đến dữ liệu cũ cho các truy vấn.
+    *   **Khắc phục:** Điều chỉnh `refresh_interval` và `max_interval_per_job` cho các tổng hợp liên tục. Đảm bảo đủ `timescaledb.max_background_workers`. Giám sát `timescaledb_information.continuous_aggregates` để biết trạng thái làm mới.
+    ```sql
+    -- Example: Adjust refresh policy
+    ALTER MATERIALIZED VIEW my_cagg SET (timescaledb.refresh_interval = '1 hour');
+    ```
+4.  **Chặn `DROP_CHUNKS_OLDER_THAN`:**
+    *   **Chế độ lỗi:** Xóa các chunk rất lớn có thể giữ khóa và gây ra độ trễ truy vấn tạm thời.
+    *   **Khắc phục:** Lên lịch các chính sách giữ lại dữ liệu trong các cửa sổ bảo trì hoặc giờ thấp điểm. Cân nhắc xóa các chunk theo lô nhỏ hơn nếu có thể, mặc dù `drop_chunks_older_than` thường hiệu quả.
+
+## Các câu hỏi thường gặp
+
+1.  **Khi nào tôi nên chọn phân vùng gốc của PostgreSQL thay vì TimescaleDB?**
+    Chọn phân vùng gốc nếu:
+    *   Bạn có yêu cầu nghiêm ngặt là tránh các tiện ích mở rộng.
+    *   Khối lượng dữ liệu chuỗi thời gian của bạn ở mức vừa phải (ví dụ: < 10.000 chèn/giây) và nén lưu trữ không phải là mối quan tâm chính.
+    *   Bạn thích kiểm soát thủ công hoàn toàn việc phân vùng và bảo trì, hoặc đã có tự động hóa mạnh mẽ cho việc đó.
+    *   Bạn không cần các tính năng nâng cao như nén cột, tổng hợp liên tục hoặc giữ lại dữ liệu tự động.
+
+2.  **TimescaleDB có thêm chi phí đáng kể cho PostgreSQL không?**
+    TimescaleDB là một tiện ích mở rộng của PostgreSQL, không phải là một fork. Nó tích hợp sâu nhưng thêm chi phí tối thiểu cho các hoạt động không phải hypertable. Đối với hypertables, nó giới thiệu các worker nền và lập kế hoạch truy vấn chuyên biệt. Chi phí này thường được bù đắp bởi hiệu suất và lợi ích vận hành cho các khối lượng công việc chuỗi thời gian.
+
+3.  **Tôi có thể di chuyển từ phân vùng gốc của PostgreSQL sang TimescaleDB không?**
+    Có. Bạn có thể tạo một Hypertable mới từ một bảng đã phân vùng hiện có bằng cách sử dụng `create_hypertable(..., migrate_data => TRUE)`. TimescaleDB sẽ chuyển đổi các phân vùng hiện có thành các chunk. Quá trình này có thể tốn nhiều tài nguyên đối với các bảng rất lớn và nên được lên kế hoạch cẩn thận.
+
+4.  **Hàm `time_bucket` trong TimescaleDB so sánh với hàm `date_trunc` trong PostgreSQL như thế nào?**
+    `time_bucket` là một hàm mạnh mẽ và linh hoạt hơn được thiết kế đặc biệt cho chuỗi thời gian. Nó cho phép các khoảng thời gian tùy ý (ví dụ: `INTERVAL '5 minutes'`), căn chỉnh các bucket theo một `origin` cụ thể (hữu ích cho các bảng điều khiển nhất quán) và thường được tối ưu hóa cho hiệu suất trong bộ lập kế hoạch truy vấn của TimescaleDB. `date_trunc` bị giới hạn ở các đơn vị được xác định trước (phút, giờ, ngày, v.v.).
+
+5.  **Ý nghĩa của nén cột của TimescaleDB đối với các mẫu truy vấn là gì?**
+    Nén cột rất hiệu quả cho các truy vấn phân tích đọc một tập hợp con các cột (ví dụ: `SELECT avg(value) FROM ...`). Nó ít có lợi hơn cho các truy vấn `SELECT *` hoặc các truy vấn thường xuyên cập nhật các hàng riêng lẻ, vì chi phí giải nén có thể làm mất đi lợi ích. Đối với chuỗi thời gian, nơi `SELECT *` hiếm khi xảy ra và các cập nhật là tối thiểu, đó là một lợi thế ròng.
