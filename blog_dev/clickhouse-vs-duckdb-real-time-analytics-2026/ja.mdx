@@ -1,0 +1,380 @@
+---
+title: "2026年のClickHouseとDuckDB：インメモリ組み込みOLAP対分散型ベクトル化ウェアハウス"
+images: ['/static/images/clickhouse-vs-duckdb-real-time-analytics-2026.png']
+date: '2026-10-01'
+lastUpdated: '2026-10-01'
+tags: ["database", "olap", "performance", "architecture"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "2026年におけるClickHouseとDuckDBを、インメモリ組み込みOLAPと分散型ベクトル化ウェアハウスの観点から、本番環境レベルのアーキテクチャとコード例を交えて網羅的に解説するガイドです。"
+---
+
+このガイドでは、2026年におけるリアルタイム分析ワークロード向けのDuckDBとClickHouseのデータ駆動型エンジニアリングベンチマークとアーキテクチャ比較を提供します。Google Cloud上での様々なデータ規模、並行処理要件、インフラコストプロファイルにおける両者の適合性を分析します。
+
+## アーキテクチャの概要
+
+DuckDBは、組み込み型のインプロセスOLAPデータベースとして動作します。その主な強みは、単一ノードでの高性能分析クエリに最適化された、カラム型ベクトル化実行エンジンにあります。Parquet、CSV、その他のファイル形式を、別のサーバープロセスへの事前取り込みなしに直接クエリできるため、ローカルデータ処理に優れています。
+
+ClickHouseは、ペタバイト規模のデータウェアハウジングとリアルタイム分析のために設計された、分散型カラム型OLAPデータベースです。大規模な並列処理、洗練されたインデックス（例：MergeTreeファミリー）、および分散アーキテクチャを活用して、膨大なデータセットにわたる高スループットの取り込みと複雑な分析クエリを処理します。
+
+## ベンチマーク手法
+
+当社のベンチマークは、クエリパフォーマンス、並行処理下でのメモリオーバーヘッド、取り込みスループットの3つの主要分野に焦点を当てています。すべてのテストはGoogle Cloud Platform（GCP）で実施されます。
+
+### データ生成
+`(timestamp DATETIME, user_id UUID, event_type VARCHAR, value FLOAT, region VARCHAR, properties JSON)`。
+データ規模: 1,000万（10M）、1億（100M）、10億（1B）行。
+データ形式: Snappyで圧縮されたParquet。
+
+### ハードウェア仕様
+
+**DuckDB（シングルノード）:**
+*   `n2-standard-16`（16 vCPU、64 GB RAM）
+*   `n2-standard-32`（32 vCPU、128 GB RAM）
+*   Parquetファイル用のローカルSSD。
+
+**ClickHouse（分散クラスター）:**
+*   3ノードのClickHouseクラスター（3シャード、HA用にシャードあたり1レプリカ）。
+*   各ノード: `n2-standard-16`（16 vCPU、64 GB RAM）。
+*   データストレージ用の永続SSD。
+*   オーケストレーション用のGoogle Kubernetes Engine（GKE）。
+
+### クエリワークロード
+
+リアルタイムダッシュボードとアドホック分析を代表する一連の分析クエリを定義します。
+
+1.  **Q1: ディメンション別集計:** `SELECT region, count() FROM events WHERE timestamp BETWEEN ? AND ? GROUP BY region ORDER BY count() DESC LIMIT 10;`
+2.  **Q2: 時系列集計:** `SELECT toStartOfHour(timestamp) AS hour, avg(value) FROM events WHERE event_type = ? AND timestamp BETWEEN ? AND ? GROUP BY hour ORDER BY hour;`
+3.  **Q3: 高カーディナリティグループ化:** `SELECT user_id, count() FROM events WHERE timestamp BETWEEN ? AND ? GROUP BY user_id HAVING count() > 50 ORDER BY count() DESC LIMIT 100;`
+4.  **Q4: JSONプロパティアクセス（ClickHouseのみ、DuckDBはUDFまたは特定のパースが必要）:** `SELECT JSONExtractString(properties, 'campaign_id'), count() FROM events WHERE timestamp BETWEEN ? AND ? GROUP BY 1 ORDER BY count() DESC LIMIT 10;`（DuckDBの場合、事前に抽出されたカラムまたはUDFでシミュレートします）。
+
+### 並行処理テスト
+
+並行処理は、ClickHouseには`locust`を、DuckDBにはマルチスレッドPythonスクリプトを使用してシミュレートし、10、50、100の並行クエリ下での平均クエリレイテンシとメモリフットプリントを測定します。
+
+## 実装の詳細
+
+### DuckDBによるParquetのクエリ
+
+DuckDBの強みは、Parquetファイルを直接クエリできる点です。
+
+```python
+import duckdb
+import pandas as pd
+import time
+import os
+
+# Ensure Parquet files are available locally
+# For 1B rows, this would be multiple Parquet files
+PARQUET_FILE_PATH = "s3://your-bucket/events_100M.parquet" # Or local path
+
+def run_duckdb_query(query: str, params: tuple = None):
+    """
+    Executes a DuckDB query against a Parquet file.
+    """
+    start_time = time.perf_counter()
+    try:
+        # DuckDB can directly query S3/GCS paths if credentials are set up
+        # For local files, just use the path
+        con = duckdb.connect(database=':memory:', read_only=False)
+        con.execute(f"INSTALL httpfs; LOAD httpfs;") # For S3/GCS access
+        con.execute(f"SET s3_region='us-central1';") # Example for GCS, adjust as needed
+
+        # Register the Parquet file as a table
+        con.execute(f"CREATE OR REPLACE VIEW events AS SELECT * FROM '{PARQUET_FILE_PATH}';")
+
+        if params:
+            result = con.execute(query, params).fetchall()
+        else:
+            result = con.execute(query).fetchall()
+
+        end_time = time.perf_counter()
+        return (end_time - start_time) * 1000 # ms
+    except Exception as e:
+        print(f"DuckDB Query failed: {e}")
+        return -1
+
+# Example Q1 execution
+start_date = "2026-01-01 00:00:00"
+end_date = "2026-01-01 23:59:59"
+query_q1 = """
+SELECT region, count()
+FROM events
+WHERE timestamp BETWEEN ? AND ?
+GROUP BY region
+ORDER BY count() DESC
+LIMIT 10;
+"""
+# print(f"DuckDB Q1 (100M rows): {run_duckdb_query(query_q1, (start_date, end_date)):.2f} ms")
+
+# DuckDB ingestion (if needed, e.g., from CSV to Parquet)
+def duckdb_ingest_csv_to_parquet(csv_path: str, parquet_path: str):
+    con = duckdb.connect(database=':memory:', read_only=False)
+    con.execute(f"COPY (SELECT * FROM '{csv_path}') TO '{parquet_path}' (FORMAT PARQUET, COMPRESSION SNAPPY);")
+    con.close()
+```
+
+### ClickHouseによるクエリ
+
+ClickHouseは、データをテーブルに取り込む必要があります。Pythonには`clickhouse-driver`を使用します。
+
+```python
+from clickhouse_driver import Client
+import time
+import json
+
+CLICKHOUSE_HOST = "your-clickhouse-cluster-ip"
+CLICKHOUSE_PORT = 9000 # Native protocol
+CLICKHOUSE_USER = "default"
+CLICKHOUSE_PASSWORD = "your-password"
+CLICKHOUSE_DB = "default"
+
+def get_clickhouse_client():
+    return Client(
+        host=CLICKHOUSE_HOST,
+        port=CLICKHOUSE_PORT,
+        user=CLICKHOUSE_USER,
+        password=CLICKHOUSE_PASSWORD,
+        database=CLICKHOUSE_DB
+    )
+
+def run_clickhouse_query(query: str, params: dict = None):
+    """
+    Executes a ClickHouse query.
+    """
+    client = get_clickhouse_client()
+    start_time = time.perf_counter()
+    try:
+        result = client.execute(query, params)
+        end_time = time.perf_counter()
+        return (end_time - start_time) * 1000 # ms
+    except Exception as e:
+        print(f"ClickHouse Query failed: {e}")
+        return -1
+    finally:
+        client.disconnect()
+
+# Example Q1 execution
+start_date = "2026-01-01 00:00:00"
+end_date = "2026-01-01 23:59:59"
+query_q1_ch = """
+SELECT region, count()
+FROM events
+WHERE timestamp BETWEEN %(start_date)s AND %(end_date)s
+GROUP BY region
+ORDER BY count() DESC
+LIMIT 10;
+"""
+# print(f"ClickHouse Q1 (100M rows): {run_clickhouse_query(query_q1_ch, {'start_date': start_date, 'end_date': end_date}):.2f} ms")
+
+# ClickHouse Ingestion (example using HTTP interface for bulk)
+def clickhouse_ingest_parquet(parquet_file_path: str, table_name: str):
+    """
+    Ingests a Parquet file into ClickHouse using the HTTP interface.
+    Requires 'clickhouse-client' or similar tool for direct file upload.
+    For Python, usually involves reading Parquet into DataFrame and then inserting.
+    """
+    # This is a simplified example. For 1B rows, use `clickhouse-client` or Kafka Connect.
+    # Example using pandas and clickhouse-driver for smaller batches:
+    import pandas as pd
+    df = pd.read_parquet(parquet_file_path)
+    client = get_clickhouse_client()
+    start_time = time.perf_counter()
+    try:
+        # Ensure table schema matches DataFrame
+        client.execute(f"INSERT INTO {table_name} VALUES", df.to_dict(orient='records'))
+        end_time = time.perf_counter()
+        return (end_time - start_time) * 1000 # ms
+    except Exception as e:
+        print(f"ClickHouse Ingestion failed: {e}")
+        return -1
+    finally:
+        client.disconnect()
+
+# For large-scale ingestion, consider:
+# 1. `clickhouse-client --query="INSERT INTO events FORMAT Parquet"` < your_file.parquet
+# 2. Kafka Connect with ClickHouse Sink Connector
+# 3. Materialize views from object storage (e.g., S3/GCS) using `s3` or `gcs` table functions.
+```
+
+## ベンチマーク結果（2026年シミュレーション）
+
+これらの結果は、現在の傾向と予想される最適化に基づいて推定されたものです。
+
+### クエリパフォーマンス（平均レイテンシ、ミリ秒）
+
+| クエリ | 行数 | DuckDB (n2-std-16) | DuckDB (n2-std-32) | ClickHouse (3x n2-std-16) |
+|---|---|---|---|---|
+| Q1 | 10M | 25 | 18 | 15 |
+| Q1 | 100M | 180 | 110 | 80 |
+| Q1 | 1B | 2500 | 1500 | 450 |
+| Q2 | 10M | 30 | 22 | 18 |
+| Q2 | 100M | 220 | 140 | 100 |
+| Q2 | 1B | 3000 | 1800 | 550 |
+| Q3 | 10M | 40 | 30 | 25 |
+| Q3 | 100M | 300 | 190 | 150 |
+| Q3 | 1B | 4000 | 2500 | 800 |
+| Q4 | 10M | N/A* | N/A* | 35 |
+| Q4 | 100M | N/A* | N/A* | 250 |
+| Q4 | 1B | N/A* | N/A* | 1200 |
+
+*N/A*: DuckDBは効率的なJSONクエリのためにUDFまたは事前パースが必要であり、これはClickHouseのネイティブな`JSONExtract`関数と直接比較できない複雑さとオーバーヘッドを追加します。
+
+**所見:**
+*   1,000万～1億行の場合、強力なシングルノードのDuckDBは非常に競争力があり、ネットワークオーバーヘッドがゼロで効率的なインプロセス実行のため、単純な集計ではClickHouseを上回ることがよくあります。
+*   10億行の場合、ClickHouseの分散型特性と並列処理能力が大きな利点となり、DuckDBが数秒かかるクエリをサブ秒で処理できます。
+*   DuckDBのパフォーマンスは、シングルノード操作の場合、CPU/RAMに比例してスケーリングします。
+*   ClickHouseの特殊なインデックス（例：`MergeTree`と`minmax`および`set`インデックス）は、大規模データセットでの優れたパフォーマンスに貢献しています。
+
+### 高並行処理下でのメモリオーバーヘッド
+
+| 並行処理 | 行数 | DuckDB (n2-std-32) | ClickHouse (3x n2-std-16) |
+|---|---|---|---|
+| 10 | 100M | 10 GB | 15 GB |
+| 50 | 100M | 40 GB | 30 GB |
+| 100 | 100M | 80 GB (スラッシング) | 45 GB |
+| 10 | 1B | 30 GB | 25 GB |
+| 50 | 1B | 100 GB (スラッシング) | 50 GB |
+| 100 | 1B | OOM | 70 GB |
+
+**所見:**
+*   DuckDBは組み込み型であるため、ホストアプリケーションとメモリを共有します。特に大規模な中間結果を処理する場合、高い並行処理によって利用可能なRAMがすぐに枯渇する可能性があります。各並行クエリは、データのかなりの部分をメモリにロードする可能性があります。
+*   ClickHouseはサーバーとして、共有キャッシュと分散処理を活用して単一ノードのボトルネックを回避し、並行クエリ間でメモリをより効率的に管理します。そのメモリフットプリントは、アクティブなクエリの数と処理されるデータ量に応じてスケーリングしますが、管理されたサーバー環境内で行われます。
+
+### 取り込みスループット（行/秒）
+
+| データサイズ | DuckDB (CSVからParquetへ) | ClickHouse (Parquetからテーブルへ) |
+|---|---|---|
+| 10M | 500,000 | 1,200,000 |
+| 100M | 400,000 | 800,000 |
+| 1B | 200,000 | 500,000 |
+
+**所見:**
+*   ClickHouseは、高度に最適化された`MergeTree`エンジンと分散取り込み機能（例：Kafka Connect、`INSERT INTO ... SELECT FROM S3`）により、大幅に高い取り込みスループットを提供します。
+*   DuckDBの取り込みは、ファイル間操作の場合、通常シングルスレッドですが、その規模では非常に高速です。その主なユースケースは、永続サーバーへの継続的な大量取り込みではありません。
+
+## インフラコスト（GCPでの月額推定、2026年）
+
+| メトリック | DuckDB (n2-std-32) | ClickHouse (3x n2-std-16) |
+|---|---|---|
+| コンピューティング (VM/GKE) | $1,200 | $3,600 |
+| ストレージ (ローカルSSD/永続SSD) | $150 | $450 |
+| ネットワーク (エグレス) | $50 | $150 |
+| **合計月額推定** | **$1,400** | **$4,200** |
+
+**注記:**
+*   DuckDBのコストは、単一の強力なVMに対するものです。
+*   ClickHouseのコストは、GKEのオーバーヘッドを含む3ノードクラスターに対するものです。
+*   コストは、実際の使用量、データ量、および特定のGCP料金ティアに大きく依存します。これは比較のためのベースラインです。
+*   DuckDBの「コスト」は、インプロセスで実行されるため、既存のアプリケーションインフラストラクチャに償却されることがよくあります。ここでのコストは、重い分析タスク専用のVMを表します。
+
+## 意思決定マトリックス
+
+| 機能 | DuckDB | ClickHouse |
+|---|---|---|
+| **アーキテクチャ** | 組み込み型、インプロセス | 分散型、サーバークライアント |
+| **データ規模** | 数MBから数百GB（シングルノード） | 数TBから数PB（分散型） |
+| **並行処理** | 低から中程度（CPU/RAMに依存） | 高（分散型、共有リソース） |
+| **取り込み** | バッチ（ファイル間）、中程度のスループット | ストリーミング、高スループット |
+| **クエリレイテンシ** | 小～中規模データに優れる | 大規模データに優れる |
+| **セットアップの複雑さ** | 低（ライブラリのインポート） | 高（クラスターデプロイ、運用） |
+| **運用オーバーヘッド** | 最小限（アプリの一部） | 高（監視、スケーリング、HA） |
+| **コスト効率** | 組み込みユースケースで高 | 大規模データウェアハウジングで高 |
+| **ユースケース** | ローカル分析、ETL、エッジコンピューティング、データアプリ | リアルタイムダッシュボード、BI、大規模データレイク |
+| **データ形式** | 直接Parquet/CSV/JSON | 内部カラム型ストレージ (MergeTree) |
+
+## 本番環境での落とし穴とトラブルシューティング
+
+### DuckDB
+
+1.  **落とし穴: 大規模ファイルでのメモリ枯渇:**
+    *   **症状:** 大規模なParquetファイルをクエリしたり、複雑な結合を実行したりすると、OOMエラーでアプリケーションがクラッシュする。
+    *   **原因:** DuckDBは処理のためにデータの大部分をメモリにロードします。作業セットが利用可能なRAMを超えると、OSがスワップを開始し、深刻なパフォーマンス低下またはOOMにつながります。
+    *   **解決策:**
+        *   VMのRAMを増やす。
+        *   データを早期にフィルタリングする: 述語をParquetリーダーにプッシュダウンする。
+        *   ページネーションには`LIMIT`と`OFFSET`を使用する。
+        *   複雑なクエリをより小さなステップに分割し、中間結果を一時的なParquetファイルに書き込む。
+        *   DuckDBのメモリ制限を調整する: `PRAGMA memory_limit='XGB';`を使用してOSレベルのスラッシングを防ぎ、DuckDBが適切にエラーを処理できるようにする。
+2.  **落とし穴: ファイルハンドル制限:**
+    *   **症状:** 多数の小さなParquetファイルをクエリしたり、高並行処理下で`Too many open files`エラーが発生する。
+    *   **原因:** 各Parquetファイル（またはセグメント）にはファイルハンドルが必要な場合があります。
+    *   **解決策:**
+        *   小さなParquetファイルをより大きなファイルに統合する。
+        *   OSのファイルハンドル制限（`ulimit -n`）を増やす。
+        *   適切な接続管理を確保し、不要になったDuckDB接続を閉じる。
+3.  **落とし穴: リモートストレージ（S3/GCS）でのパフォーマンス低下:**
+    *   **症状:** S3/GCS Parquetファイルに対するクエリが、ローカルファイルよりも大幅に遅い。
+    *   **原因:** ネットワークレイテンシと帯域幅の制限。DuckDBは、ネットワーク経由でParquetの行グループ全体またはカラム全体をフェッチする場合があります。
+    *   **解決策:**
+        *   VMがS3/GCSバケットと同じリージョンにあることを確認する。
+        *   `httpfs`拡張機能を使用し、S3/GCS認証情報を正しく設定する。
+        *   Parquetファイルを最適化する: 適切な行グループサイズ（例：128MB～512MB）、カラムプルーニング、述語プッシュダウンを確保する。
+        *   データアクセスパターンが反復的である場合は、ローカルキャッシュメカニズムを検討する。
+
+### ClickHouse
+
+1.  **落とし穴: 低メモリノードでの高カーディナリティ`GROUP BY`:**
+    *   **症状:** 数百万のユニークな値を持つカラムに対する`GROUP BY`を含むクエリが、`Memory limit exceeded`で失敗するか、極端に遅い。
+    *   **原因:** ClickHouseは、`GROUP BY`操作のためにメモリ内にハッシュテーブルを構築する必要があります。単一シャードで利用可能なRAMに対してカーディナリティが高すぎると、失敗する可能性があります。
+    *   **解決策:**
+        *   `max_memory_usage`と`max_bytes_before_external_group_by`の設定を増やす。
+        *   ClickHouseノードのRAMを増やす。
+        *   一般的な高カーディナリティディメンションに対しては、マテリアライズドビューを使用してデータを事前集計する。
+        *   可能であれば、`shard`キーに`GROUP BY`を持つ`DISTRIBUTED`テーブルエンジンを使用するか、データが均等に分散されていることを確認する。
+2.  **落とし穴: 小さなバッチでの取り込みの遅延:**
+    *   **症状:** 強力なノードであっても、取り込みスループットが低い。
+    *   **原因:** ClickHouseは大規模なバッチ挿入に最適化されています。多数の小さな挿入は、高いオーバーヘッド（トランザクションコスト、マージツリーパーツの作成）を伴います。
+    *   **解決策:**
+        *   バッチ挿入: 10,000～100,000行以上のバッチを目指す。
+        *   ストリーミングには非同期挿入またはKafka Connectを使用する。
+        *   `MergeTree`テーブルの`merge_tree_min_rows_for_wide_part`と`merge_tree_min_bytes_for_wide_part`を調整する。
+3.  **落とし穴: マージによるディスク容量の枯渇:**
+    *   **症状:** データ量に比例して増加していないにもかかわらず、ディスク使用量が急速に増加し、`No space left on device`エラーが発生する。
+    *   **原因:** `MergeTree`テーブルは、小さなデータパーツを定期的に大きなパーツにマージします。このプロセスには、一時的に追加のディスク容量（マージするパーツの最大2倍のサイズ）が必要です。
+    *   **解決策:**
+        *   十分なディスク容量（予想されるデータサイズの少なくとも2～3倍）をプロビジョニングする。
+        *   ディスク使用量とマージアクティビティを監視する。
+        *   `merge_tree_max_bytes_to_merge_at_once`と`merge_tree_max_parts_to_merge_at_once`を調整してマージ動作を制御するが、これはクエリパフォーマンスに影響を与える可能性があるため注意が必要。
+        *   利用可能な場合は階層型ストレージ（例：古いデータ用のコールドストレージ）を実装する。
+
+## よくある質問
+
+### Q1: ClickHouseではなくDuckDBを選択すべきなのはどのような場合ですか？
+
+DuckDBを選択すべきなのは、次のような場合です。
+*   データが単一の強力なマシンのメモリ/ディスク（数百GBまで）に収まる場合。
+*   アプリケーション内に組み込み分析エンジンが必要な場合（例：デスクトップアプリ、ローカルETL、エッジデバイス）。
+*   デプロイの簡素さと運用オーバーヘッドのゼロを優先する場合。
+*   主要なデータソースがローカルファイル（Parquet、CSV）であり、それらを直接クエリしたい場合。
+*   コストが主要な懸念事項であり、既存のコンピューティングリソースを活用できる場合。
+
+### Q2: ClickHouseが明確な勝者となるのはどのような場合ですか？
+
+ClickHouseが優れた選択肢となるのは、次のような場合です。
+*   ペタバイト規模で運用し、分散処理が必要な場合。
+*   高スループットのリアルタイム取り込み（毎秒数百万行）が必要な場合。
+*   アプリケーションが分析クエリに対して高い並行処理（数百から数千QPS）を要求する場合。
+*   分析データストアに高可用性とフォールトトレランスが必要な場合。
+*   専任の運用チームがいるか、分散システムの管理に慣れている場合。
+*   複雑な複数テーブル結合や高度な分析関数が頻繁に使用される場合。
+
+### Q3: DuckDBとClickHouseは一緒に使用できますか？
+
+はい、互いに補完的に使用できます。
+*   **ローカルでの前処理/ETLにDuckDBを使用:** DuckDBを使用して、データをクリーンアップ、変換、ローカルで集計してから、ClickHouseクラスターに取り込みます。これにより、ClickHouseのコンピューティング負荷が軽減され、よりクリーンなデータが保証されます。
+*   **エッジ分析にDuckDBを使用:** エッジデバイスやクライアントアプリケーションにDuckDBをデプロイして、即座のローカルな洞察を得る一方、ClickHouseはグローバル分析のための中央データウェアハウスとして機能します。
+*   **ClickHouseをサービス提供に、DuckDBをアドホック探索に:** ClickHouseは本番ダッシュボードを動かし、データサイエンティストはDuckDBを使用して、ClickHouseまたは生ファイルから抽出された小規模なデータサブセットを迅速にアドホック探索します。
+
+### Q4: 両者のデータ鮮度はどのように比較されますか？
+
+*   **DuckDB:** ローカルファイルをクエリする場合、データ鮮度は即時です。データがファイルにストリーミングされる場合、鮮度はファイルの書き込み頻度に依存します。
+*   **ClickHouse:** 優れたデータ鮮度を提供します。`MergeTree`テーブルとストリーミング取り込み（例：Kafka）を使用すると、データは取り込み後数ミリ秒以内にクエリ可能になります。これにより、リアルタイム分析に最適です。
+
+### Q5: 2026年におけるそれぞれの主なスケーリングの限界は何ですか？
+
+*   **DuckDB:** 主に垂直方向（より多くのCPU、RAM、高速なローカルストレージ）にスケーリングします。その根本的な限界は、単一ノードアーキテクチャにあります。分散ファイルシステムをクエリできますが、処理自体はローカルです。将来の開発には、特定の操作に対する限定的なマルチコア並列処理が含まれるかもしれませんが、真の分散クエリ処理は主要なミッションではありません。
+*   **ClickHouse:** ノード（シャード）を追加することで水平方向にスケーリングします。その限界は通常、ノード間のネットワーク帯域幅、非常に大規模なクラスター管理の複雑さ、およびデータが最適にシャーディングされていない場合の分散結合のオーバーヘッドに関連します。しかし、分散クエリ最適化とクラウドネイティブデプロイメント（例：ClickHouse Cloud）の継続的な改善により、これらの課題の多くは軽減されています。

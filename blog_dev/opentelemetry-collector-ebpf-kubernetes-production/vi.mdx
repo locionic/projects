@@ -1,0 +1,720 @@
+---
+title: "OpenTelemetry Collector & eBPF trong Production: Tracing, Metrics & Prometheus Pipelines Không Cần Code"
+images: ['/static/images/opentelemetry-collector-ebpf-kubernetes-production.png']
+date: '2026-10-01'
+lastUpdated: '2026-10-01'
+tags: ["devops", "kubernetes", "opentelemetry", "ebpf", "monitoring"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về OpenTelemetry Collector & eBPF trong môi trường production: tracing, metrics & prometheus pipelines không cần code với kiến trúc cấp độ production và các ví dụ code."
+---
+
+OpenTelemetry Collector, khi được tăng cường khả năng tự động đo lường dựa trên eBPF, cung cấp một giải pháp mạnh mẽ để quan sát toàn diện mà không yêu cầu sửa đổi mã ứng dụng. Hướng dẫn này trình bày chi tiết việc triển khai và cấu hình một hệ thống như vậy trong môi trường Kubernetes, tập trung vào việc theo dõi, đo lường và các pipeline Prometheus không cần mã.
+
+## Tổng quan kiến trúc
+
+Kiến trúc cốt lõi bao gồm việc triển khai OpenTelemetry Collector dưới dạng DaemonSet trên Kubernetes. Điều này đảm bảo một phiên bản collector chạy trên mọi node, tạo điều kiện thuận lợi cho việc thu thập và xử lý dữ liệu cục bộ. Các tác nhân eBPF, thường được tích hợp vào hoặc cùng với collector, tận dụng các probe cấp kernel để thu thập các lệnh gọi mạng, tiến trình và hệ thống, chuyển đổi chúng thành các trace và metric của OpenTelemetry.
+
+```mermaid
+graph TD
+    subgraph Kubernetes Node A
+        AppA[Application A]
+        AppB[Application B]
+        eBPF_AgentA[eBPF Agent]
+        OTel_CollectorA[OTel Collector (DaemonSet)]
+        eBPF_AgentA -- Captures syscalls, network I/O --> OTel_CollectorA
+        AppA -- (Optional) OTel SDK --> OTel_CollectorA
+        AppB -- (Optional) OTel SDK --> OTel_CollectorA
+    end
+
+    subgraph Kubernetes Node B
+        AppC[Application C]
+        eBPF_AgentB[eBPF Agent]
+        OTel_CollectorB[OTel Collector (DaemonSet)]
+        eBPF_AgentB -- Captures syscalls, network I/O --> OTel_CollectorB
+        AppC -- (Optional) OTel SDK --> OTel_CollectorB
+    end
+
+    OTel_CollectorA -- OTLP/HTTP or gRPC --> OTel_Collector_Gateway[OTel Collector Gateway (Deployment)]
+    OTel_CollectorB -- OTLP/HTTP or gRPC --> OTel_Collector_Gateway
+
+    OTel_Collector_Gateway -- Traces --> Trace_Backend[Trace Backend (e.g., Jaeger, Tempo)]
+    OTel_Collector_Gateway -- Metrics --> Metrics_Backend[Metrics Backend (e.g., Prometheus, Mimir)]
+    OTel_Collector_Gateway -- Logs --> Log_Backend[Log Backend (e.g., Loki, Elasticsearch)]
+    OTel_Collector_Gateway -- Prometheus Scrape --> Prometheus[Prometheus Server]
+```
+
+Thiết lập này thường bao gồm:
+1.  **Tác nhân eBPF**: Được triển khai dưới dạng DaemonSet, thường được tích hợp với OpenTelemetry Collector hoặc dưới dạng sidecar. Nó sử dụng các chương trình eBPF để đo lường các sự kiện kernel, tạo ra dữ liệu OpenTelemetry. Các ví dụ bao gồm Pixie, Parca Agent hoặc các giải pháp eBPF tùy chỉnh. Đối với hướng dẫn này, chúng ta sẽ giả định một bản phân phối collector hỗ trợ eBPF hoặc một tác nhân eBPF riêng biệt xuất OTLP đến collector.
+2.  **OpenTelemetry Collector (Agent)**: Được triển khai dưới dạng DaemonSet trên mỗi node Kubernetes. Nó nhận dữ liệu từ các tác nhân eBPF và tùy chọn từ các ứng dụng được đo lường bằng OpenTelemetry SDK. Nó thực hiện xử lý ban đầu (gom nhóm, lọc, làm giàu cơ bản).
+3.  **OpenTelemetry Collector (Gateway)**: Được triển khai dưới dạng Deployment, thường với nhiều bản sao, hoạt động như một điểm tổng hợp trung tâm. Nó nhận dữ liệu từ các agent collector, áp dụng xử lý nâng cao (lấy mẫu, thao tác thuộc tính, tổng hợp) và xuất sang các backend khác nhau.
+4.  **Backend quan sát**: Các hệ thống lưu trữ và trực quan hóa trace, metric và log (ví dụ: Jaeger, Prometheus, Loki).
+
+## Triển khai Kubernetes: OpenTelemetry Collector DaemonSet
+
+Chúng ta sẽ triển khai OpenTelemetry Collector dưới dạng DaemonSet. Điều này đảm bảo rằng một phiên bản collector chạy trên mọi node, thu thập dữ liệu từ các tác nhân eBPF và ứng dụng cục bộ.
+
+```yaml
+# otel-collector-agent-daemonset.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-collector-agent
+  namespace: observability
+  labels:
+    app: otel-collector-agent
+spec:
+  selector:
+    matchLabels:
+      app: otel-collector-agent
+  template:
+    metadata:
+      labels:
+        app: otel-collector-agent
+    spec:
+      serviceAccountName: otel-collector-agent
+      hostNetwork: true # Required for eBPF agents to capture all network traffic
+      dnsPolicy: ClusterFirstWithHostNet # Required with hostNetwork
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.90.1 # Use contrib for more receivers/processors
+          command: ["/otelcol", "--config=/conf/otel-collector-config.yaml"]
+          securityContext:
+            privileged: true # Required for eBPF agent capabilities
+            runAsUser: 0
+            runAsGroup: 0
+          volumeMounts:
+            - name: otel-collector-config
+              mountPath: /conf
+            - name: varlog
+              mountPath: /var/log # For host log collection
+              readOnly: true
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers # For Docker container logs
+              readOnly: true
+            - name: sysfs
+              mountPath: /sys # For eBPF kernel access
+              readOnly: true
+            - name: procfs
+              mountPath: /proc # For eBPF process info
+              readOnly: true
+          env:
+            - name: KUBERNETES_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              hostPort: 4317 # Expose OTLP gRPC on host
+            - name: otlp-http
+              containerPort: 4318
+              hostPort: 4318 # Expose OTLP HTTP on host
+            - name: prometheus
+              containerPort: 8888 # Collector's own metrics
+            - name: health-check
+              containerPort: 13133
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 13133
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 13133
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+      volumes:
+        - name: otel-collector-config
+          configMap:
+            name: otel-collector-agent-config
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+        - name: sysfs
+          hostPath:
+            path: /sys
+        - name: procfs
+          hostPath:
+            path: /proc
+---
+# otel-collector-agent-serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector-agent
+  namespace: observability
+---
+# otel-collector-agent-clusterrole.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector-agent
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/proxy", "pods", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["extensions"]
+    resources: ["daemonsets", "deployments", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["policy"]
+    resources: ["podsecuritypolicies"]
+    verbs: ["use"]
+    resourceNames:
+      - otel-collector-agent # If using PSPs
+---
+# otel-collector-agent-clusterrolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector-agent
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector-agent
+    namespace: observability
+roleRef:
+  kind: ClusterRole
+  name: otel-collector-agent
+  apiGroup: rbac.authorization.k8s.io
+```
+
+**Giải thích cấu hình DaemonSet:**
+*   `hostNetwork: true`: Cần thiết để các tác nhân eBPF quan sát tất cả lưu lượng mạng trên host. Điều này cho phép collector liên kết với các cổng host và thu thập lưu lượng trên tất cả các pod trên node.
+*   `privileged: true`: Thường được yêu cầu để các tác nhân eBPF tải các module kernel và truy cập các giao diện kernel nhạy cảm. Điều này cấp cho container các khả năng rộng lớn.
+*   `volumeMounts` cho `/var/log`, `/var/lib/docker/containers`, `/sys`, `/proc`: Các đường dẫn host này được mount để cho phép collector (hoặc một tác nhân eBPF tích hợp) truy cập các log host, log container và thông tin kernel/tiến trình cần thiết cho các hoạt động eBPF.
+*   `ports`: Mở các cổng OTLP gRPC và HTTP trên mạng host, cho phép các ứng dụng hoặc tác nhân eBPF gửi dữ liệu trực tiếp đến collector trên cùng một node.
+
+## Cấu hình OpenTelemetry Collector (Agent)
+
+Cấu hình này minh họa cách agent collector nhận dữ liệu, xử lý và chuyển tiếp đến một gateway collector. Nó bao gồm một bộ thu eBPF cơ bản (khái niệm, vì các bộ thu eBPF cụ thể khác nhau), các metric host và thu thập log.
+
+```yaml
+# otel-collector-agent-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-agent-config
+  namespace: observability
+data:
+  otel-collector-config.yaml: |
+    receivers:
+      # OTLP receiver for applications and eBPF agents exporting directly
+      otlp:
+        protocols:
+          grpc:
+          http:
+
+      # Host metrics receiver
+      hostmetrics:
+        collection_interval: 10s
+        scrapers:
+          cpu:
+          memory:
+          disk:
+          filesystem:
+          network:
+          load:
+          paging:
+          processes:
+
+      # Filelog receiver for host logs (e.g., systemd, kernel logs)
+      # Requires hostPath mount for /var/log
+      filelog:
+        include:
+          - /var/log/*.log
+          - /var/log/*/*.log
+        start_at: beginning
+        poll_interval: 1s
+        operators:
+          - type: json_parser
+            output: json
+          - type: regex_parser
+            regex: '^(?P<time>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\s(?P<level>\w+)\s(?P<message>.*)$'
+            output: json
+            timestamp:
+              parse_from: time
+              layout: '%Y-%m-%dT%H:%M:%S.%LZ'
+            severity:
+              parse_from: level
+              preset: syslog
+          - type: move
+            from: json.message
+            to: body
+          - type: remove
+            field: json
+
+      # Kubernetes Container Logs (Docker/CRI-O)
+      # Requires hostPath mount for /var/lib/docker/containers
+      # This is a basic example; for production, consider a dedicated log agent or more robust K8s integration
+      filelog/container:
+        include:
+          - /var/lib/docker/containers/*/*-json.log
+        start_at: beginning
+        poll_interval: 1s
+        operators:
+          - type: json_parser
+            output: json
+          - type: move
+            from: json.log
+            to: body
+          - type: move
+            from: json.stream
+            to: attributes.log.stream
+          - type: move
+            from: json.time
+            to: attributes.log.time
+          - type: add
+            field: attributes.log.file.path
+            value: "{{ .file.path }}"
+          - type: add
+            field: attributes.container.id
+            value: "{{ .file.name }}" # Extract container ID from filename
+          - type: add
+            field: attributes.k8s.node.name
+            value: "${KUBERNETES_NODE_NAME}" # Injected via env var
+          - type: regex_parser
+            regex: '^/var/lib/docker/containers/(?P<container_id>[a-f0-9]{64})/(?P<container_id_short>[a-f0-9]{12})-json.log$'
+            parse_from: attributes.log.file.path
+            output: attributes
+          - type: remove
+            field: json
+
+    processors:
+      # Batching for efficiency
+      batch:
+        send_batch_size: 1024
+        timeout: 5s
+
+      # Resource detection for Kubernetes metadata
+      resourcedetection:
+        detectors: ["system", "env", "kubernetes"]
+        timeout: 2s
+        kubernetes:
+          pod_association:
+            - from: "ip"
+            - from: "cgroup"
+          exclude:
+            pods:
+              - name: "otel-collector-agent" # Exclude self-instrumentation
+
+      # Memory limiter to prevent OOMs
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 256
+        spike_limit_mib: 64
+
+      # Tail-based sampling (example, typically done at gateway)
+      # For agent, head-based is more common if sampling is needed here
+      # This example is for demonstration, usually agents forward all data.
+      # tail_sampling:
+      #   decision_wait: 10s
+      #   num_traces: 100000
+      #   expected_new_traces_per_sec: 100
+      #   policies:
+      #     [
+      #       {
+      #         name: "error-policy",
+      #         type: "status_code",
+      #         status_code: { status_codes: ["ERROR"] }
+      #       },
+      #       {
+      #         name: "latency-policy",
+      #         type: "latency",
+      #         latency: { threshold_ms: 500 }
+      #       }
+      #     ]
+
+    exporters:
+      # Export to a central OpenTelemetry Collector Gateway
+      otlp:
+        endpoint: "otel-collector-gateway.observability.svc.cluster.local:4317" # Internal K8s service
+        tls:
+          insecure: true # Use mTLS in production
+
+      # Optional: Prometheus exporter for collector's own metrics
+      prometheus:
+        endpoint: "0.0.0.0:8888"
+
+    service:
+      telemetry:
+        metrics:
+          address: 0.0.0.0:8888
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [resourcedetection, batch, memory_limiter] # Add tail_sampling if needed
+          exporters: [otlp]
+        metrics:
+          receivers: [otlp, hostmetrics]
+          processors: [resourcedetection, batch, memory_limiter]
+          exporters: [otlp]
+        logs:
+          receivers: [otlp, filelog, filelog/container]
+          processors: [resourcedetection, batch, memory_limiter]
+          exporters: [otlp]
+```
+
+**Các yếu tố cấu hình chính:**
+*   **`receivers`**:
+    *   `otlp`: Chấp nhận dữ liệu OTLP (trace, metric, log) từ các ứng dụng hoặc tác nhân eBPF.
+    *   `hostmetrics`: Thu thập CPU, bộ nhớ, đĩa, mạng, v.v., từ host.
+    *   `filelog`: Thu thập log từ các đường dẫn host được chỉ định, phân tích chúng thành các log có cấu trúc. Điều này rất quan trọng cho việc tổng hợp log không cần mã.
+*   **`processors`**:
+    *   `batch`: Gom nhóm dữ liệu để xuất hiệu quả.
+    *   `resourcedetection`: Làm giàu dữ liệu telemetry với siêu dữ liệu Kubernetes (tên pod, namespace, tên node, v.v.), rất quan trọng cho ngữ cảnh.
+    *   `memory_limiter`: Ngăn collector tiêu thụ bộ nhớ quá mức, rất quan trọng đối với DaemonSet.
+*   **`exporters`**:
+    *   `otlp`: Chuyển tiếp tất cả dữ liệu telemetry đã xử lý đến một OpenTelemetry Collector Gateway trung tâm.
+    *   `prometheus`: Mở các metric nội bộ của collector ở định dạng Prometheus.
+*   **`service.pipelines`**: Định nghĩa cách dữ liệu chảy qua các bộ thu, bộ xử lý và bộ xuất cho trace, metric và log.
+
+## Triển khai & Cấu hình OpenTelemetry Collector Gateway
+
+Gateway collector tổng hợp dữ liệu từ tất cả các agent collector, áp dụng xử lý nâng cao như lấy mẫu và xuất sang các backend cuối cùng.
+
+```yaml
+# otel-collector-gateway-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector-gateway
+  namespace: observability
+  labels:
+    app: otel-collector-gateway
+spec:
+  replicas: 2 # Scale as needed
+  selector:
+    matchLabels:
+      app: otel-collector-gateway
+  template:
+    metadata:
+      labels:
+        app: otel-collector-gateway
+    spec:
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.90.1
+          command: ["/otelcol", "--config=/conf/otel-collector-config.yaml"]
+          volumeMounts:
+            - name: otel-collector-config
+              mountPath: /conf
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: prometheus
+              containerPort: 8888
+            - name: health-check
+              containerPort: 13133
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 13133
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 13133
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+            requests:
+              cpu: 200m
+              memory: 512Mi
+      volumes:
+        - name: otel-collector-config
+          configMap:
+            name: otel-collector-gateway-config
+---
+# otel-collector-gateway-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector-gateway
+  namespace: observability
+spec:
+  selector:
+    app: otel-collector-gateway
+  ports:
+    - name: otlp-grpc
+      protocol: TCP
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      protocol: TCP
+      port: 4318
+      targetPort: 4318
+    - name: prometheus
+      protocol: TCP
+      port: 8888
+      targetPort: 8888
+```
+
+## Cấu hình OpenTelemetry Collector (Gateway)
+
+Cấu hình này bao gồm các bộ xử lý nâng cao như lấy mẫu dựa trên đuôi và xuất sang các backend khác nhau.
+
+```yaml
+# otel-collector-gateway-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-gateway-config
+  namespace: observability
+data:
+  otel-collector-config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+          http:
+
+    processors:
+      batch:
+        send_batch_size: 1024
+        timeout: 5s
+
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 1500
+        spike_limit_mib: 500
+
+      # Tail-based sampling for traces
+      # This is crucial for reducing trace volume while retaining important traces.
+      tail_sampling:
+        decision_wait: 10s # How long to wait for all spans of a trace
+        num_traces: 100000 # Max number of traces to keep in memory for sampling
+        expected_new_traces_per_sec: 1000 # Estimate of new traces per second
+        policies:
+          - name: "always-sample"
+            type: "always_on" # Always sample 100% of traces (for dev/low traffic)
+          - name: "error-policy"
+            type: "status_code"
+            status_code: { status_codes: ["ERROR", "UNSET"] } # Sample traces with errors
+          - name: "latency-policy"
+            type: "latency"
+            latency: { threshold_ms: 500 } # Sample traces exceeding 500ms
+          - name: "probabilistic-policy"
+            type: "probabilistic"
+            probabilistic: { sampling_percentage: 10 } # Sample 10% of remaining traces
+
+      # Attributes processor for general attribute manipulation
+      attributes:
+        actions:
+          - key: "service.namespace"
+            action: "insert"
+            value: "default" # Default namespace if not present
+          - key: "k8s.cluster.name"
+            action: "insert"
+            value: "my-prod-cluster" # Add cluster name
+          - key: "host.ip"
+            action: "delete" # Remove sensitive host IP if not needed downstream
+
+      # Resource processor for adding/modifying resource attributes
+      resource:
+        attributes:
+          - key: "cloud.provider"
+            value: "aws"
+            action: "insert"
+          - key: "cloud.region"
+            value: "us-east-1"
+            action: "insert"
+
+    exporters:
+      # Export traces to Jaeger
+      jaeger:
+        endpoint: "jaeger-collector.observability.svc.cluster.local:14250" # gRPC
+        tls:
+          insecure: true
+
+      # Export metrics to Prometheus remote write (e.g., Mimir, Thanos)
+      prometheusremotewrite:
+        endpoint: "http://prometheus-mimir-gateway.observability.svc.cluster.local:9009/api/v1/push"
+        headers:
+          X-Scope-OrgID: "locionic"
+        # auth:
+        #   oauth2:
+        #     client_id: "..."
+        #     client_secret: "..."
+        #     token_url: "..."
+
+      # Export logs to Loki
+      loki:
+        endpoint: "http://loki.observability.svc.cluster.local:3100/loki/api/v1/push"
+        tls:
+          insecure: true
+        # auth:
+        #   basic:
+        #     username: "..."
+        #     password: "..."
+        labels:
+          attributes:
+            - host.name
+            - k8s.namespace.name
+            - k8s.pod.name
+            - service.name
+          resource:
+            - k8s.node.name
+            - k8s.cluster.name
+
+      # Optional: Prometheus exporter for collector's own metrics
+      prometheus:
+        endpoint: "0.0.0.0:8888"
+
+    service:
+      telemetry:
+        metrics:
+          address: 0.0.0.0:8888
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch, tail_sampling, attributes, resource]
+          exporters: [jaeger]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, batch, attributes, resource]
+          exporters: [prometheusremotewrite]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, batch, attributes, resource]
+          exporters: [loki]
+```
+
+**Các chiến lược lấy mẫu: Dựa trên đầu so với Dựa trên đuôi**
+
+| Tính năng        | Lấy mẫu dựa trên đầu                              | Lấy mẫu dựa trên đuôi                                  |
+|------------------|---------------------------------------------------|--------------------------------------------------------|
+| Điểm quyết định  | Khi bắt đầu một trace (span đầu tiên)             | Khi kết thúc một trace (tất cả các span được thu thập) |
+| Dữ liệu cần thiết | Chỉ ngữ cảnh của span đầu tiên                   | Tất cả các span thuộc về một trace                     |
+| Triển khai       | SDK ứng dụng, OTel Collector Agent                 | OTel Collector Gateway                                 |
+| Ưu điểm          | Chi phí thấp, đơn giản, giảm lưu lượng mạng sớm   | Nhận biết ngữ cảnh (lỗi, độ trễ, thuộc tính cụ thể)    |
+|                  |                                                   | Quyết định lấy mẫu thông minh hơn                      |
+| Nhược điểm        | Không nhận biết ngữ cảnh, có thể bỏ qua các trace quan trọng | Sử dụng tài nguyên cao hơn (bộ nhớ, CPU) trên collector |
+|                  |                                                   | Yêu cầu tất cả các span của một trace phải đến collector |
+|                  |                                                   | Gây ra độ trễ trước khi đưa ra quyết định             |
+| Trường hợp sử dụng | Khối lượng lớn, lấy mẫu cơ bản, lọc ban đầu      | Môi trường sản xuất, logic lấy mẫu phức tạp            |
+|                  |                                                   | Tập trung vào các trace quan trọng (lỗi, yêu cầu chậm) |
+
+**Khuyến nghị**: Sử dụng lấy mẫu dựa trên đầu ở cấp ứng dụng hoặc tác nhân cho các trace không quan trọng, khối lượng rất cao (ví dụ: lấy mẫu xác suất 1%). Triển khai lấy mẫu dựa trên đuôi ở gateway collector để lấy mẫu thông minh, nhận biết ngữ cảnh của các trace quan trọng (lỗi, độ trễ cao, ID người dùng cụ thể).
+
+## Xuất metric Prometheus
+
+OpenTelemetry Collector có thể hoạt động như một mục tiêu Prometheus scraper hoặc xuất metric thông qua Prometheus remote write.
+
+**1. Collector làm mục tiêu Prometheus Scrape (cho các metric của chính nó):**
+Bộ xuất `prometheus` trong cả cấu hình agent và gateway hiển thị các metric nội bộ của collector (ví dụ: `otelcol_receiver_accepted_spans_total`). Prometheus sau đó có thể thu thập các endpoint này.
+
+```yaml
+# Example Prometheus scrape config for OTel Collector Gateway
+# Add this to your Prometheus server's scrape_configs
+- job_name: 'otel-collector-gateway'
+  kubernetes_sd_configs:
+    - role: endpoints
+      namespaces:
+        names: ['observability']
+  relabel_configs:
+    - source_labels: [__meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+      action: keep
+      regex: otel-collector-gateway;prometheus
+    - source_labels: [__meta_kubernetes_pod_name]
+      target_label: kubernetes_pod_name
+      action: replace
+    - source_labels: [__meta_kubernetes_namespace]
+      target_label: kubernetes_namespace
+      action: replace
+```
+
+**2. Xuất metric ứng dụng thông qua Prometheus Remote Write:**
+Bộ xuất `prometheusremotewrite` trong cấu hình gateway gửi các metric đã xử lý đến một bộ lưu trữ từ xa tương thích với Prometheus (ví dụ: Mimir, Thanos, Cortex). Điều này tập trung hóa việc lưu trữ metric và cho phép lưu giữ dài hạn và tính sẵn sàng cao.
+
+## Các vấn đề và khắc phục sự cố trong sản xuất
+
+1.  **Quyền eBPF (`privileged: true`, `hostNetwork: true`):**
+    *   **Vấn đề**: Không có `privileged: true` và `hostNetwork: true`, các tác nhân eBPF sẽ không thể tải chương trình hoặc thu thập lưu lượng mạng. Đây là một cấu hình sai phổ biến.
+    *   **Khắc phục**: Đảm bảo DaemonSet có `privileged: true` trong `securityContext` và `hostNetwork: true` ở cấp pod. Ngoài ra, xác minh ServiceAccount có các quyền ClusterRole cần thiết (ví dụ: `nodes/proxy`).
+    *   **Khắc phục sự cố**: Kiểm tra log pod để tìm lỗi `permission denied`, `operation not permitted` hoặc `failed to load eBPF program`. Sử dụng `kubectl describe pod <pod-name>` để xác minh ngữ cảnh bảo mật và cài đặt mạng.
+
+2.  **Giới hạn bộ nhớ và Collector bị OOMKilled:**
+    *   **Vấn đề**: OpenTelemetry Collector, đặc biệt là các gateway có lấy mẫu dựa trên đuôi, có thể tiêu thụ bộ nhớ đáng kể, dẫn đến OOMKills.
+    *   **Khắc phục**:
+        *   Triển khai bộ xử lý `memory_limiter` trong cấu hình collector.
+        *   Đặt `resources.limits.memory` thích hợp trong các manifest Kubernetes.
+        *   Điều chỉnh các tham số `tail_sampling` (`num_traces`, `expected_new_traces_per_sec`) để phù hợp với khối lượng trace và bộ nhớ khả dụng của bạn.
+        *   Mở rộng các gateway collector nếu một phiên bản duy nhất không thể xử lý tải.
+    *   **Khắc phục sự cố**: Kiểm tra `kubectl describe pod <pod-name>` để biết trạng thái `OOMKilled`. Giám sát việc sử dụng bộ nhớ của collector thông qua các metric Prometheus của chính nó (`otelcol_processor_memory_limiter_memory_usage_bytes`).
+
+3.  **Sự cố kết nối mạng (Agent đến Gateway, Gateway đến Backend):**
+    *   **Vấn đề**: Tên dịch vụ, cổng hoặc quy tắc tường lửa không chính xác có thể ngăn chặn luồng dữ liệu.
+    *   **Khắc phục**:
+        *   Xác minh các giá trị `endpoint` trong các bộ xuất (ví dụ: `otel-collector-gateway.observability.svc.cluster.local:4317`).
+        *   Đảm bảo các Kubernetes Service được định nghĩa chính xác và nhắm mục tiêu đến các pod collector.
+        *   Kiểm tra các chính sách mạng nếu chúng đang được sử dụng.
+    *   **Khắc phục sự cố**:
+        *   Kiểm tra log collector để tìm lỗi `connection refused`, `unavailable` hoặc `timeout`.
+        *   Sử dụng `kubectl exec -it <collector-pod> -- curl <target-endpoint>` (nếu curl có sẵn trong image) hoặc `nc -vz <target-host> <target-port>` từ bên trong pod collector để kiểm tra kết nối.
+        *   Xác minh phân giải DNS từ bên trong pod.
+
+4.  **Dữ liệu Telemetry bị thiếu hoặc không đầy đủ:**
+    *   **Vấn đề**: Dữ liệu có thể bị mất do bộ thu, bộ xử lý hoặc bộ xuất được cấu hình sai, hoặc do lấy mẫu quá mức.
+    *   **Khắc phục**:
+        *   Xem xét `service.pipelines` để đảm bảo tất cả các bộ thu, bộ xử lý và bộ xuất mong muốn được liên kết chính xác.
+        *   Kiểm tra các quy tắc `include`/`exclude` trong các bộ thu (ví dụ: `filelog`).
+        *   Điều chỉnh các chính sách lấy mẫu nếu quá nhiều dữ liệu bị mất.
+        *   Đảm bảo `resourcedetection` được cấu hình chính xác để làm giàu dữ liệu với siêu dữ liệu cần thiết.
+    *   **Khắc phục sự cố**:
+        *   Giám sát các metric nội bộ của collector (`otelcol_receiver_accepted_spans_total`, `otelcol_exporter_sent_spans_total`, `otelcol_processor_batch_batch_send_size_sum`) để xác định nơi dữ liệu có thể bị mất.
+        *   Bật ghi log debug cho collector (`--config=/conf/otel-collector-config.yaml --set service.telemetry.logs.level=debug`) để có đầu ra chi tiết hơn.
+
+5.  **Khả năng tương thích của tác nhân eBPF và phiên bản Kernel:**
+    *   **Vấn đề**: Các chương trình eBPF nhạy cảm với phiên bản kernel. Một tác nhân eBPF được biên dịch cho một phiên bản kernel có thể không hoạt động trên một phiên bản khác, hoặc có thể yêu cầu các tiêu đề kernel cụ thể.
+    *   **Khắc phục**:
+        *   Sử dụng các tác nhân eBPF hỗ trợ CO-RE (Compile Once – Run Everywhere) hoặc được phân phối với các tệp nhị phân được biên dịch sẵn cho các phiên bản kernel phổ biến.
+        *   Đảm bảo các node Kubernetes của bạn đang chạy một phiên bản kernel tương thích.
+        *   Một số giải pháp eBPF yêu cầu các module hoặc tính năng kernel cụ thể phải được bật.
+    *   **Khắc phục sự cố**: Tìm các lỗi như `BPF program load failed`, `invalid argument` hoặc `kernel version mismatch` trong log của tác nhân eBPF. Tham khảo tài liệu của tác nhân eBPF cụ thể của bạn.
+
+## Các câu hỏi thường gặp
+
+1.  **Hỏi: Chi phí hiệu suất khi sử dụng eBPF để tự động đo lường là gì?**
+    Đ: Việc đo lường dựa trên eBPF thường có chi phí rất thấp, thường nằm trong phạm vi phần trăm một chữ số đối với CPU và bộ nhớ. Điều này là do các chương trình eBPF chạy trực tiếp trong kernel, tránh chuyển đổi ngữ cảnh và chi phí không gian người dùng. Tuy nhiên, chi phí có thể tăng lên theo độ phức tạp và tần suất của các probe eBPF và khối lượng dữ liệu được thu thập. Việc xử lý dữ liệu quá mức và các thuộc tính có tính phân loại cao trong collector cũng có thể góp phần làm tăng việc sử dụng tài nguyên.
+
+2.  **Hỏi: Tôi có thể sử dụng tự động đo lường eBPF cùng với đo lường OpenTelemetry SDK truyền thống không?**
+    Đ: Vâng, hoàn toàn có thể. Đây là một mô hình phổ biến và được khuyến nghị. eBPF cung cấp khả năng hiển thị "không cần mã" vào các tương tác mạng, lệnh gọi hệ thống và thực thi tiến trình, lấp đầy các khoảng trống mà mã ứng dụng có thể không được đo lường. OpenTelemetry SDK cung cấp ngữ cảnh ngữ nghĩa phong phú hơn trực tiếp từ logic nghiệp vụ của ứng dụng. OpenTelemetry Collector có thể hợp nhất và tương quan dữ liệu từ cả hai nguồn, cung cấp một bức tranh hoàn chỉnh hơn.
+
+3.  **Hỏi: Làm cách nào để đảm bảo tác nhân eBPF của tôi đang thu thập dữ liệu từ tất cả các ứng dụng của tôi trong Kubernetes?**
+    Đ: Triển khai tác nhân eBPF (hoặc collector hỗ trợ eBPF) dưới dạng DaemonSet đảm bảo nó chạy trên mọi node. Với `hostNetwork: true` và `privileged: true`, nó có được quyền truy cập cần thiết để giám sát tất cả các tiến trình và lưu lượng mạng trên node đó, bất kể chúng thuộc về pod hoặc namespace nào. Các bộ xử lý phát hiện tài nguyên trong collector sau đó làm giàu dữ liệu này bằng siêu dữ liệu Kubernetes để liên kết nó trở lại các pod và dịch vụ cụ thể.
+
+4.  **Hỏi: Cách tốt nhất để xử lý dữ liệu trace khối lượng lớn để tránh làm quá tải backend của tôi là gì?**
+    Đ: Triển khai chiến lược lấy mẫu đa giai đoạn:
+    *   **Lấy mẫu dựa trên đầu** (xác suất) ở cấp ứng dụng hoặc tác nhân để giảm ban đầu các trace không quan trọng.
+    *   **Lấy mẫu dựa trên đuôi** ở OpenTelemetry Collector Gateway. Điều này cho phép lấy mẫu thông minh dựa trên các thuộc tính trace như lỗi, độ trễ hoặc logic nghiệp vụ cụ thể, đảm bảo các trace quan trọng luôn được thu thập.
+    *   **Gom nhóm và giới hạn bộ nhớ** trong collector cũng rất quan trọng để quản lý thông lượng và việc sử dụng tài nguyên.
+
+5.  **Hỏi: OpenTelemetry Collector xử lý log như thế nào mà không cần thay đổi ứng dụng?**
+    Đ: Bộ thu `filelog` trong OpenTelemetry Collector có thể được cấu hình để thu thập log trực tiếp từ các đường dẫn host (ví dụ: `/var/log` cho log hệ thống, `/var/lib/docker/containers` cho log container). Bằng cách mount các đường dẫn host này vào DaemonSet của collector, collector có thể đọc, phân tích cú pháp và xử lý các log này, sau đó xuất chúng sang một backend log như Loki hoặc Elasticsearch, tất cả mà không yêu cầu bất kỳ sửa đổi nào đối với mã ứng dụng. Điều này cung cấp một pipeline thu thập log thống nhất cùng với trace và metric.
