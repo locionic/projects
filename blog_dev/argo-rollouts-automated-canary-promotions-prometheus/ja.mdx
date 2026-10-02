@@ -1,0 +1,493 @@
+---
+title: "Argo RolloutsとPrometheus：自動化されたプログレッシブデリバリーと分析テンプレート"
+images: ['/static/images/argo-rollouts-automated-canary-promotions-prometheus.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["kubernetes", "devops", "ci-cd", "cloud", "observability"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Intermediate"
+programmingLanguage: "TypeScript"
+summary: "Argo RolloutsとPrometheusを用いた、自動化されたプログレッシブデリバリーと分析テンプレートに関する、本番環境レベルのアーキテクチャとコード例を含む包括的なガイドです。"
+---
+
+Kubernetesにおける自動化されたプログレッシブデリバリー（progressive delivery）には、トラフィック管理のための堅牢なコントロールプレーンと、自動分析のための包括的な可観測性（observability）が必要です。このガイドでは、Argo RolloutsとPrometheusを統合してカナリアデプロイメントを自動化し、Gateway APIをトラフィックシフトに、AnalysisTemplatesをSLO検証に活用する方法を詳しく説明します。ステップベースのロールアウトを設定し、SLO違反時の自動ロールバックを実演し、Slack通知を統合します。
+
+<AudioPlayer src="/static/audio/argo-rollouts-automated-canary-promotions-prometheus-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+## アーキテクチャの概要
+
+このセットアップの主要コンポーネントは以下の通りです。
+
+1.  **Argo Rollouts**: プログレッシブデリバリー戦略（カナリア、ブルー/グリーン）をオーケストレーションします。
+2.  **Kubernetes Gateway API**: イングレストラフィックを管理し、ルーティングとトラフィックスプリット（traffic splitting）をきめ細かく制御します。データプレーン（data plane）としてEnvoyを使用します。
+3.  **Prometheus**: アプリケーションとインフラストラクチャからメトリクスを収集し、SLO検証のデータソースとして機能します。
+4.  **Argo Rollouts AnalysisTemplates**: Prometheusに対するクエリを定義し、SLI（Service Level Indicators）を評価してロールアウトの健全性を判断します。
+5.  **Slack Webhooks**: ロールアウトイベントのリアルタイム通知に使用します。
+
+ワークフローは次のとおりです。新しいアプリケーションバージョンが`Rollout`リソースを介してデプロイされます。Argo Rolloutsはカナリアレプリカセットを作成し、Gateway APIを使用してトラフィックのごく一部をそこに向けます。AnalysisTemplatesはエラー率やレイテンシなどのSLIについてPrometheusを継続的にクエリします。SLIが事前定義されたしきい値を満たした場合、トラフィックは段階的にシフトされます。SLIが悪化した場合は、ロールアウトは自動的に中止され、ロールバックされます。
+
+## 前提条件
+
+Kubernetesクラスター（v1.22+）に以下がインストールされていることを確認してください。
+
+*   Argo Rollouts
+*   PrometheusとGrafana（例: kube-prometheus-stack経由）
+*   Gateway API CRDとEnvoyベースのGatewayコントローラー（例: Istio、Contour、またはスタンドアロンのEnvoy Gateway実装）。ここでは、基本的なEnvoy Gatewayセットアップを想定します。
+*   `kubectl`が設定されていること。
+
+## アプリケーションとGateway APIのセットアップ
+
+ここでは、デモンストレーション目的でエラーを返すように設定できるシンプルなNGINXアプリケーションを使用します。
+
+まず、アプリケーションの`Deployment`と`Service`を定義します。Argo Rolloutsが`Deployment`のライフサイクルを管理するため、Argo Rolloutsが`Rollout`リソースに変換する標準の`Deployment`マニフェストを定義します。
+
+```yaml
+# app.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: canary-app
+  labels:
+    app: canary-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: canary-app
+  template:
+    metadata:
+      labels:
+        app: canary-app
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.23.3 # Initial stable version
+        ports:
+        - containerPort: 80
+        env:
+        - name: ERROR_RATE
+          value: "0" # Simulate no errors initially
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: canary-app-stable
+spec:
+  selector:
+    app: canary-app
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: canary-app-canary
+spec:
+  selector:
+    app: canary-app
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+```
+
+これらを適用します: `kubectl apply -f app.yaml`
+
+次に、Gateway APIを設定してトラフィックを管理します。`Gateway`と、最初はすべてのトラフィックを安定版サービスに向ける`HTTPRoute`を作成します。
+
+```yaml
+# gateway-api.yaml
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: Gateway
+metadata:
+  name: my-gateway
+spec:
+  gatewayClassName: envoy # Replace with your GatewayClass name
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: HTTPRoute
+metadata:
+  name: canary-app-route
+spec:
+  parentRefs:
+  - name: my-gateway
+  hostnames:
+  - "canary.example.com" # Replace with your domain
+  rules:
+  - backendRefs:
+    - name: canary-app-stable
+      port: 80
+      weight: 100
+```
+
+これらを適用します: `kubectl apply -f gateway-api.yaml`
+
+## Argo Rolloutsの設定
+
+次に、`Rollout`リソースを定義します。これは`Deployment`を置き換え、カナリア戦略についてArgo Rolloutsに指示します。
+
+```yaml
+# rollout.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: canary-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: canary-app
+  template:
+    metadata:
+      labels:
+        app: canary-app
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.23.3 # Initial stable version
+        ports:
+        - containerPort: 80
+        env:
+        - name: ERROR_RATE
+          value: "0"
+  strategy:
+    canary:
+      canaryService: canary-app-canary
+      stableService: canary-app-stable
+      trafficRouting:
+        gatewayAPI:
+          httpRoute: canary-app-route
+          # The controllerName is crucial for Argo Rollouts to find the correct Gateway API controller.
+          # This typically matches the 'controllerName' field in your GatewayClass.
+          # For Envoy Gateway, it might be "gateway.envoyproxy.io/gatewayclass-controller" or similar.
+          # Consult your GatewayClass definition.
+          controllerName: "gateway.envoyproxy.io/gatewayclass-controller" # Adjust as per your Gateway API setup
+      steps:
+      - setWeight: 10 # Send 10% traffic to canary
+      - pause: {} # Manual pause for initial observation
+      - analysis:
+          templates:
+          - templateName: canary-app-analysis
+          args:
+          - name: service
+            value: "canary-app-canary" # Target the canary service for analysis
+      - setWeight: 50 # Send 50% traffic to canary
+      - pause: { duration: 60s } # Automatic pause for 60 seconds
+      - analysis:
+          templates:
+          - templateName: canary-app-analysis
+          args:
+          - name: service
+            value: "canary-app-canary"
+      - setWeight: 100 # Send 100% traffic to canary
+      - pause: { duration: 60s }
+      - analysis:
+          templates:
+          - templateName: canary-app-analysis
+          args:
+          - name: service
+            value: "canary-app-canary"
+      - promote: {} # Promote canary to stable
+      - pause: { duration: 30s } # Final pause before full promotion
+```
+
+これを適用します: `kubectl apply -f rollout.yaml`
+
+Argo Rolloutsが`canary-app`デプロイメントの制御を引き継ぎます。`kubectl argo rollouts get rollout canary-app`でそのステータスを監視できます。
+
+## Prometheus AnalysisTemplates
+
+Argo RolloutsがPrometheusをクエリするために使用する`AnalysisTemplate`リソースを定義する必要があります。これらのテンプレートは、HTTPエラー率とp99レイテンシをチェックします。
+
+まず、アプリケーションがPrometheusがスクレイピングできるメトリクスを公開していることを確認してください。NGINXの場合、NGINXエクスポーターを使用するか、アプリケーションを直接計測（instrument）することができます。この例では、一般的な`http_requests_total`カウンターと`http_request_duration_seconds`ヒストグラムが、`service`と`status_code`によってラベル付けされて利用可能であると仮定します。
+
+```yaml
+# analysis-template.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: canary-app-analysis
+spec:
+  args:
+  - name: service
+  metrics:
+  - name: error-rate
+    interval: 30s # How often to run the query
+    failureLimit: 1 # Fail if this many checks fail
+    successCondition: "result[0] < 0.01" # Error rate < 1%
+    # Prometheus query for 5xx errors over the last 5 minutes
+    # We use `sum(rate(...))` to get the rate of errors and total requests.
+    # The `service` label is passed as an argument to target the correct service.
+    # `{{args.service}}` is how arguments are referenced in AnalysisTemplates.
+    # This query calculates the percentage of 5xx errors.
+    prometheus:
+      address: http://prometheus-kube-prometheus-stack.monitoring:9090 # Adjust Prometheus service address
+      query: |
+        sum(rate(http_requests_total{service="{{args.service}}", status_code=~"5.."}[5m]))
+        /
+        sum(rate(http_requests_total{service="{{args.service}}", status_code!~"4.."}[5m]))
+  - name: p99-latency
+    interval: 30s
+    failureLimit: 1
+    successCondition: "result[0] < 0.5" # p99 latency < 500ms
+    # Prometheus query for p99 latency over the last 5 minutes
+    # `histogram_quantile` is used for percentile calculations from histograms.
+    prometheus:
+      address: http://prometheus-kube-prometheus-stack.monitoring:9090 # Adjust Prometheus service address
+      query: |
+        histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{service="{{args.service}}"}[5m])) by (le))
+```
+
+これを適用します: `kubectl apply -f analysis-template.yaml`
+
+## 自動ロールバックの実演
+
+自動ロールバックを実演するために、エラーを導入する新しいイメージバージョンに`Rollout`を更新します。
+
+まず、メトリクスを生成するためにトラフィックをシミュレートしましょう。ループ内で`hey`または`curl`を使用できます。
+
+```bash
+# Get the IP/hostname of your Gateway
+GATEWAY_IP=$(kubectl get svc -n envoy-gateway-system envoy-gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}') # Adjust namespace/service name
+while true; do curl -s -H "Host: canary.example.com" http://$GATEWAY_IP/ > /dev/null; sleep 0.1; done
+```
+
+次に、`Rollout`を新しいイメージに更新します。環境変数に基づいて500エラーを返すカスタムNGINXイメージを使用します。
+
+```dockerfile
+# Dockerfile for error-injecting NGINX
+FROM nginx:1.23.3
+COPY default.conf /etc/nginx/conf.d/default.conf
+# default.conf will check for ERROR_RATE env var and return 500 for a percentage of requests
+```
+
+`default.conf`:
+```nginx
+server {
+    listen 80;
+    location / {
+        set $error_rate $env_ERROR_RATE;
+        if ($error_rate = "") {
+            set $error_rate "0";
+        }
+
+        # Generate a random number between 0 and 99
+        set $random_num "";
+        perl_set $random_num 'int(rand(100))';
+
+        # If random_num is less than ERROR_RATE, return 500
+        if ($random_num < $error_rate) {
+            return 500 "Internal Server Error\n";
+        }
+
+        return 200 "Hello from NGINX!\n";
+    }
+}
+```
+
+このイメージをビルドしてプッシュします（例: `myregistry/nginx-error:1.24.0`）。
+
+次に、`Rollout`を更新してこの新しいイメージを使用し、`ERROR_RATE`を`20`（20%のエラー）に設定します。
+
+```yaml
+# rollout-update.yaml (partial update)
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: canary-app
+spec:
+  template:
+    spec:
+      containers:
+      - name: nginx
+        image: myregistry/nginx-error:1.24.0 # New image with potential errors
+        env:
+        - name: ERROR_RATE
+          value: "20" # Introduce 20% errors
+```
+
+この更新を適用します: `kubectl apply -f rollout-update.yaml --field-manager=kubectl-client-side-apply`
+
+ロールアウトステータスを監視します: `kubectl argo rollouts get rollout canary-app`。
+Argo Rolloutsは新しいカナリアをデプロイし、トラフィックの10%をシフトし、その後`analysis`ステップが開始されます。Prometheusはカナリアからメトリクスをスクレイピングします。`AnalysisTemplate`の`error-rate`メトリクスは20%のエラー率を検出し、これは`result[0] < 0.01`に違反します。Argo Rolloutsは自動的にロールアウトを中止し、安定版バージョンにロールバックします。
+
+次のような出力が表示されます。
+```
+Name:            canary-app
+Namespace:       default
+Status:          Degraded
+Strategy:        Canary
+  Step:          1/8
+  Message:       Rollout is in Degraded state due to failed AnalysisRun
+  SetWeight:     10%
+  ActualWeight:  10%
+  ...
+  AnalysisRun:   canary-app-canary-app-analysis-xxxx
+    Status:      Failed
+    Message:     Metric 'error-rate' success condition was not met
+```
+
+## SlackアラートWebhooks
+
+ロールアウトイベントのSlack通知を統合します。これには、Slackウェブフックを設定し、それに対するKubernetes Secretを作成する必要があります。
+
+1.  SlackインカミングウェブフックURLを作成します。
+2.  それをKubernetes Secretに保存します。
+
+```yaml
+# slack-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: argo-rollouts-slack-webhook
+stringData:
+  url: "https://example.com/api/slack-webhook-placeholder" # Replace with your Slack webhook URL
+```
+
+これを適用します: `kubectl apply -f slack-secret.yaml`
+
+次に、Argo Rolloutsがこのウェブフックを通知に使用するように設定します。これは通常、Argo CD Notificationsを使用している場合は`argocd-notifications-cm` ConfigMapを介して行われ、カスタム通知コントローラーを使用している場合は`Rollout`スペック内で直接行われます。ここでは、ウェブフックを消費できる基本的な通知設定を想定します。
+
+より堅牢なソリューションには、`Rollout`イベントのアラートを送信するように設定できるArgo CD Notificationsが含まれます。
+
+```yaml
+# Example of Argo CD Notifications ConfigMap entry (if using Argo CD)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-notifications-cm
+  namespace: argocd # Or your Argo CD namespace
+data:
+  service.slack: |
+    token: $argo-rollouts-slack-webhook:url # Reference the secret
+  template.rollout-status: |
+    message: |
+      Rollout {{.app.metadata.name}} status: {{.rollout.status.phase}}
+      {{if .rollout.status.message}}Message: {{.rollout.status.message}}{{end}}
+      {{if .rollout.status.canary.currentStepIndex}}Current Step: {{.rollout.status.canary.currentStepIndex}}/{{len .rollout.spec.strategy.canary.steps}}{{end}}
+      {{if .rollout.status.canary.trafficRouting.gatewayAPI.currentWeight}}Traffic Weight: {{.rollout.status.canary.trafficRouting.gatewayAPI.currentWeight}}%{{end}}
+    slack:
+      attachments:
+      - title: Rollout Details
+        title_link: {{.context.argocdUrl}}/applications/{{.app.metadata.name}}
+        color: "{{if eq .rollout.status.phase "Succeeded"}}#00FF00{{else if eq .rollout.status.phase "Failed"}}#FF0000{{else}}#FFFF00{{end}}"
+        fields:
+        - title: Application
+          value: {{.app.metadata.name}}
+          short: true
+        - title: Namespace
+          value: {{.app.metadata.namespace}}
+          short: true
+        - title: Status
+          value: {{.rollout.status.phase}}
+          short: true
+        - title: Revision
+          value: {{.rollout.status.currentRevision}}
+          short: true
+  trigger.on-rollout-status-change: |
+    - when: rollout.status.phase != rollout.status.previousPhase
+      send: [rollout-status]
+```
+
+この`ConfigMap`はArgo CDの名前空間に適用されます。次に、`Rollout`マニフェストに通知を有効にするアノテーションを追加します。
+
+```yaml
+# rollout.yaml (with notification annotations)
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: canary-app
+  annotations:
+    notifications.argoproj.io/subscribe.on-rollout-status-change.slack: "true"
+    # Or specify a channel: notifications.argoproj.io/subscribe.on-rollout-status-change.slack: "#my-channel"
+spec:
+  # ... rest of your rollout spec
+```
+
+## アーキテクチャとトレードオフの比較
+
+| 機能                | Argo Rollouts + Gateway API + Prometheus | Istio + Kiali + Prometheus | Flagger + Linkerd + Prometheus |
+|---------------------|------------------------------------------|----------------------------|--------------------------------|
+| **トラフィック制御** | Gateway API (Envoy, NGINXなど)           | Istio VirtualService/Gateway | Linkerd SMI/TrafficSplit       |
+| **可観測性**        | Prometheus + AnalysisTemplates           | Prometheus + Kiali         | Prometheus + Grafana           |
+| **複雑性**          | 中程度 (Gateway APIのセットアップ)       | 高 (フルサービスメッシュ)  | 中程度 (Linkerdのセットアップ) |
+| **データプレーン**  | 外部 (Envoy Gateway, NGINX Ingress)      | Envoy Proxy (サイドカー)   | Linkerd Proxy (サイドカー)     |
+| **リソース使用量**  | 低 (アプリのサイドカーなし)             | 高 (すべてにサイドカー)    | 中程度 (アプリのサイドカー)   |
+| **柔軟性**          | 高 (任意のGateway API実装を選択可能)     | 高 (豊富なメッシュ機能)    | 良好 (SMI標準)                 |
+| **学習曲線**        | 中程度                                   | 高                         | 中程度                         |
+| **ユースケース**    | 外部トラフィック、きめ細かい制御         | 内部/外部、高度なメッシュ  | 内部トラフィック、シンプルなメッシュ |
+
+この表は、Istioが包括的なサービスメッシュを提供する一方で、Argo Rollouts + Gateway APIのアプローチが、特に専用のEnvoy Gatewayを活用する場合、イングレストラフィックに焦点を当てた、強力でありながら軽量なプログレッシブデリバリーソリューションを提供することを示しています。FlaggerとLinkerdも、特に内部のサービス間カナリアデプロイメントにおいて強力な選択肢です。
+
+## 本番環境での落とし穴とトラブルシューティング
+
+1.  **Prometheusスクレイプ設定**:
+    *   **落とし穴**: Prometheusがアプリケーションポッド、特にカナリアからメトリクスをスクレイピングしていない。
+    *   **解決策**: `ServiceMonitor`または`PodMonitor`リソースが、Argo Rolloutsによって作成されたポッド（`rollouts-pod-template-hash`のようなラベルを持つ）を含むアプリケーションポッドを正しくターゲットにしていることを確認してください。`prometheus.yml`に正しいスクレイプ設定があることを確認してください。`kubectl -n <prometheus-namespace> port-forward svc/prometheus-kube-prometheus-stack 9090`を使用し、Prometheus UIの「Status」->「Targets」で確認してください。
+
+2.  **Gateway APIトラフィックシフトの問題**:
+    *   **落とし穴**: 安定版サービスとカナリアサービス間でトラフィックが正しくシフトしない、または`HTTPRoute`が更新されない。
+    *   **解決策**:
+        *   `GatewayClass`と`Gateway`が正しく設定されており、コントローラーが実行されていることを確認してください。
+        *   Gateway APIの更新に関連するエラーがないか、Argo Rolloutsのログ（`kubectl logs -f -n argo-rollouts deploy/argo-rollouts`）を確認してください。
+        *   `HTTPRoute`リソースを直接検査し（`kubectl get httproute canary-app-route -o yaml`）、Argo Rolloutsがその`backendRefs`ウェイトを変更しようとしているかどうかを確認してください。
+        *   `Rollout`の`trafficRouting.gatewayAPI`セクションにある`controllerName`が、`GatewayClass`で定義されている`controllerName`と正確に一致していることを確認してください。これはよくある設定ミスです。
+
+3.  **AnalysisTemplateクエリの失敗**:
+    *   **落とし穴**: メトリクスが存在するにもかかわらず、分析の実行が「no data」または「query error」で失敗する。
+    *   **解決策**:
+        *   **Prometheusアドレス**: `AnalysisTemplate`の`prometheus`セクションにある`address`を再確認してください。クラスター内のPrometheusインスタンスの正しいサービス名とポートである必要があります（例: `http://prometheus-kube-prometheus-stack.monitoring:9090`）。
+        *   **クエリ構文**: Prometheus UIでPrometheusクエリを直接テストしてください。安定版サービスとカナリアサービスの両方で有効なデータが返されることを確認してください。ラベルマッチング（`service="{{args.service}}"`）に特に注意してください。
+        *   **時間範囲**: `interval`とPrometheusクエリの時間ウィンドウ（例: `[5m]`）が、トラフィック量とメトリクス生成レートに適していることを確認してください。トラフィックが少ない場合は、より長いウィンドウが必要になる場合があります。
+
+4.  **ロールアウトが一時停止でスタックする**:
+    *   **落とし穴**: ロールアウトが`pause: {}`ステップで無期限にスタックする。
+    *   **解決策**: これは手動の一時停止では予期される動作です。続行するには、`kubectl argo rollouts promote canary-app`を使用します。自動一時停止の場合は、`duration`が正しく設定されており、進行を妨げる他の条件がないことを確認してください（例: 実行中または失敗した先行の`analysis`ステップ）。
+
+5.  **リソース制限**:
+    *   **落とし穴**: Argo RolloutsコントローラーまたはPrometheusポッドがクラッシュしたり、パフォーマンスが低下したりする。
+    *   **解決策**: `argo-rollouts`デプロイメントとPrometheusコンポーネントのリソース要求と制限を確認してください。必要に応じてCPU/メモリを増やしてください。特にビジーなクラスターや多数のロールアウト/メトリクスがある場合は重要です。
+
+## よくある質問
+
+1.  **Envoy Gateway以外のイングレスコントローラーをGateway APIで使用できますか？**
+    はい。Gateway APIの利点はその抽象化にあります。イングレスコントローラーがGateway API仕様を実装している限り（例: NGINX Gateway Fabric、Contour、Istio）、Argo Rolloutsはそれと統合できます。`Rollout`の`controllerName`が`GatewayClass`と一致していることを確認するだけです。
+
+2.  **カナリアデプロイメントでデータベーススキーマのマイグレーションをどのように処理しますか？**
+    データベーススキーマのマイグレーションはカナリアデプロイメントでは複雑です。一般的なアプローチは、マイグレーションを後方互換性のあるものにし、古いアプリケーションバージョンと新しいアプリケーションバージョンの両方が同じデータベーススキーマに対して同時に実行できるようにすることです。これには、多くの場合、2段階のマイグレーションが含まれます。
+    1.  新しいカラム/テーブルを追加しますが、古いものは保持します。新しいアプリバージョンをデプロイします。
+    2.  新しいアプリが完全にプロモートされたら、後続のマイグレーションで古いカラム/テーブルを削除します。
+    あるいは、データベースの変更にはブルー/グリーン戦略を使用するか、別途厳密に管理されたマイグレーションプロセスを使用します。
+
+3.  **アプリケーションがPrometheusメトリクスを公開していない場合はどうなりますか？**
+    Prometheus形式でメトリクスを公開するようにアプリケーションを計測（instrument）する必要があります。HTTPサービスの場合、一般的なメトリクスにはリクエスト数、期間、ステータスコードなどがあります。ほとんどの言語にはライブラリが存在します（例: Node.js用の`prom-client`、Python用の`prometheus_client`、Java用の`micrometer`）。直接の計測が不可能な場合は、HTTPメトリクスを自動的に収集できるサイドカープロキシ（EnvoyやLinkerdなど）を使用するか、メトリクスを公開するNGINXイングレスコントローラーを検討してください。
+
+4.  **`AnalysisTemplate`をより堅牢にするにはどうすればよいですか？例えば、低トラフィックシナリオを処理するには？**
+    低トラフィックの場合、`rate()`クエリは`NaN`またはゼロを返し、誤検知/誤陰性につながる可能性があります。
+    *   **`irate()` vs `rate()`**: `irate()`はスパイクに敏感ですが、ノイズが多い場合があります。`rate()`は時間をかけて平滑化します。感度の必要性に基づいて選択してください。
+    *   **`unless`演算子**: ゼロ除算を防ぐため、またはリクエストが観測されないケースを処理するために`unless`を使用します。例えば、`(sum(rate(http_requests_total{...}[5m])) by (service) unless sum(rate(http_requests_total{...}[5m])) by (service) == 0)`。
+    *   **最小リクエストしきい値**: SLIを評価する前に、カナリアによって処理された最小リクエスト数を保証するために、`AnalysisTemplate`に別途メトリクスチェックを追加します。例: `sum(increase(http_requests_total{...}[5m]))`クエリの場合の`successCondition: "result[0] > 100"`。
+    *   **`absent_over_time()`**: メトリクスが消滅したことを検出するために使用できます。これは問題を示している可能性があります。
+
+5.  **単一の`Rollout`ステップで複数の`AnalysisTemplate`を使用できますか？**
+    はい、`Rollout`ステップの`analysis`ブロック内に複数の`templates`を指定できます。Argo Rolloutsは指定されたすべての分析を同時に実行し、すべての分析が成功した場合にのみステップが成功します。これにより、異なるSLIにわたる包括的な検証が可能になります。
+
+```yaml
+      - analysis:
+          templates:
+          - templateName: canary-app-error-rate-analysis
+          - templateName: canary-app-p99-latency-analysis
+          args:
+          - name: service
+            value: "canary-app-canary"
+```
+これで、Argo Rollouts、Gateway API、Prometheusを使用した自動プログレッシブデリバリーの実装に関するガイドは終わりです。これらのパターンに従うことで、重要なSLOに対して新しいリリースを自動的に検証する、堅牢で信頼性の高いデプロイメントパイプラインを確立できます。

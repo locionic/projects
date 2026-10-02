@@ -1,0 +1,696 @@
+---
+title: 'Distributed Locking in Distributed Systems: Redlock, PostgreSQL Advisory Locks & etcd Leases'
+images: ['/static/images/distributed-locking-patterns-redis-postgres-etcd.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["distributed-systems", "redis", "postgresql", "backend", "architecture"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: 'Comprehensive guide covering distributed locking in distributed systems: redlock, postgresql advisory locks & etcd leases with production-grade architecture and code examples.'
+---
+
+Distributed locking is a fundamental primitive for coordinating concurrent access to shared resources in distributed systems. Its correct implementation is critical for data consistency and preventing race conditions. This guide dissects common distributed locking patterns, their failure modes, and practical implementations using Redlock, PostgreSQL advisory locks, and etcd leases.
+
+<AudioPlayer src="/static/audio/distributed-locking-patterns-redis-postgres-etcd.mp3" title="Executive Audio Briefing" voice="Google Cloud en-US-Neural2-F" />
+
+
+## The Challenge of Distributed Locks
+
+Unlike mutexes or semaphores in a single process, distributed locks operate across network boundaries, introducing complexities like network partitions, node failures, and unpredictable message delays. A robust distributed lock must satisfy three core properties:
+
+1.  **Mutual Exclusion:** At most one client can hold the lock at any given time.
+2.  **Liveness (Deadlock-Free):** If a client acquires a lock and then crashes, it must eventually be possible for other clients to acquire the lock.
+3.  **Fault Tolerance:** The locking system itself must be resilient to failures of individual nodes.
+
+A fourth, often overlooked, property is **Fencing**. Fencing ensures that an old, slow, or crashed client that *thought* it acquired the lock but was subsequently revoked cannot interfere with the operations of the new, legitimate lock holder.
+
+## Redlock: A Multi-Instance Redis Approach
+
+Redlock, proposed by Salvatore Sanfilippo (creator of Redis), aims to achieve fault tolerance by requiring a majority of independent Redis instances to grant the lock.
+
+### Redlock Algorithm Overview
+
+1.  Client obtains the current timestamp in milliseconds.
+2.  Client attempts to acquire the lock in `N/2 + 1` Redis instances, using `SET key random_value NX PX expiry_time`. `NX` ensures the key is set only if it doesn't exist, `PX expiry_time` sets an expiration. `random_value` is a unique token for the client.
+3.  Client calculates the time elapsed since step 1.
+4.  If the lock was acquired in a majority of instances, AND the elapsed time is less than the lock's validity time (expiry\_time - time\_elapsed), the lock is considered acquired.
+5.  If the lock is not acquired (either not enough instances or validity time expired), the client attempts to release the lock on all instances it touched.
+
+### Critique and Fencing Tokens
+
+Martin Kleppmann's critique of Redlock highlights critical failure modes:
+
+*   **Clock Drift:** If clocks on Redis instances or clients drift significantly, the `expiry_time` can be misinterpreted, leading to multiple clients believing they hold the lock.
+*   **GC Pauses/Process Stalls:** A client holding a lock might experience a long garbage collection pause or process stall. During this stall, its lock might expire. When the client resumes, it might operate on the shared resource, unaware that another client has since acquired the lock and performed operations. This violates mutual exclusion.
+*   **Network Partitions:** A client might acquire a lock, then get partitioned from the majority of Redis instances. It might continue operating, while another client acquires the lock from the new majority.
+
+The core issue is that Redlock, by itself, does not provide **fencing**. A fencing token is a monotonically increasing number issued by the lock service each time a lock is granted. When a client acquires a lock, it receives this token. Any operation on the shared resource must include this token, and the resource itself must verify that the token is the latest one.
+
+#### Implementing Fencing with Redlock (Conceptual)
+
+While Redlock doesn't natively support fencing tokens, a robust implementation would require an external, strongly consistent counter or a modification to the Redis instances to provide such a token. This often pushes towards more complex, consensus-based systems.
+
+```typescript
+// Simplified Redlock client (conceptual, not production-ready without fencing)
+import { Redis } from 'ioredis';
+import { v4 as uuidv4 } from 'uuid';
+
+interface RedlockOptions {
+  lockKey: string;
+  resourceId: string;
+  ttlMs: number; // Time-to-live for the lock in milliseconds
+  retryDelayMs?: number;
+  maxRetries?: number;
+}
+
+class RedlockClient {
+  private redisClients: Redis[];
+  private quorum: number;
+
+  constructor(redisUrls: string[]) {
+    this.redisClients = redisUrls.map(url => new Redis(url));
+    this.quorum = Math.floor(redisUrls.length / 2) + 1;
+    if (this.quorum === 0) {
+      throw new Error("Redlock requires at least one Redis instance.");
+    }
+  }
+
+  /**
+   * Attempts to acquire a distributed lock using the Redlock algorithm.
+   * @returns A unique token if the lock is acquired, otherwise null.
+   */
+  public async acquireLock(options: RedlockOptions): Promise<string | null> {
+    const { lockKey, resourceId, ttlMs, retryDelayMs = 100, maxRetries = 5 } = options;
+    const value = uuidv4(); // Unique token for this lock attempt
+    let retries = 0;
+
+    while (retries < maxRetries) {
+      const startTime = Date.now();
+      let acquiredCount = 0;
+
+      const acquirePromises = this.redisClients.map(async (client) => {
+        try {
+          // SET key value NX PX ttlMs
+          // NX: Only set if the key does not already exist.
+          // PX: Set the specified expire time, in milliseconds.
+          const result = await client.set(lockKey, value, 'NX', 'PX', ttlMs);
+          return result === 'OK';
+        } catch (error) {
+          console.error(`Redis client error during acquire: ${error}`);
+          return false;
+        }
+      });
+
+      const results = await Promise.all(acquirePromises);
+      acquiredCount = results.filter(Boolean).length;
+
+      const elapsedTime = Date.now() - startTime;
+      const isValid = elapsedTime < ttlMs;
+
+      if (acquiredCount >= this.quorum && isValid) {
+        console.log(`Lock '${lockKey}' acquired by '${value}' on ${acquiredCount} instances.`);
+        return value; // Lock acquired successfully
+      } else {
+        // If not acquired, or validity time expired, release any locks we did get
+        await this.releaseLock(lockKey, value);
+        console.warn(`Failed to acquire lock '${lockKey}'. Acquired ${acquiredCount}/${this.quorum} instances. Retrying...`);
+        retries++;
+        await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+      }
+    }
+
+    console.error(`Failed to acquire lock '${lockKey}' after ${maxRetries} retries.`);
+    return null;
+  }
+
+  /**
+   * Releases a distributed lock.
+   * It's crucial to only release locks that match the client's unique value.
+   */
+  public async releaseLock(lockKey: string, value: string): Promise<void> {
+    // Lua script to ensure atomic check-and-delete
+    const luaScript = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+      else
+        return 0
+      end
+    `;
+
+    const releasePromises = this.redisClients.map(async (client) => {
+      try {
+        await client.eval(luaScript, 1, lockKey, value);
+      } catch (error) {
+        console.error(`Redis client error during release: ${error}`);
+      }
+    });
+
+    await Promise.all(releasePromises);
+    console.log(`Lock '${lockKey}' released by '${value}'.`);
+  }
+
+  public async disconnect(): Promise<void> {
+    await Promise.all(this.redisClients.map(client => client.quit()));
+  }
+}
+
+// Example Usage (requires running Redis instances)
+async function runRedlockExample() {
+  const redisUrls = ['redis://localhost:6379', 'redis://localhost:6380', 'redis://localhost:6381'];
+  const redlock = new RedlockClient(redisUrls);
+
+  const lockKey = 'my_critical_resource';
+  const resourceId = 'unique_resource_id_123';
+  const ttlMs = 5000; // 5 seconds
+
+  console.log('Attempting to acquire lock 1...');
+  const token1 = await redlock.acquireLock({ lockKey, resourceId, ttlMs });
+
+  if (token1) {
+    console.log(`Client 1 acquired lock with token: ${token1}. Performing critical operation...`);
+    // Simulate work
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    console.log('Client 1 finished critical operation. Releasing lock...');
+    await redlock.releaseLock(lockKey, token1);
+  } else {
+    console.log('Client 1 failed to acquire lock.');
+  }
+
+  console.log('\nAttempting to acquire lock 2 (should succeed after lock 1 is released)...');
+  const token2 = await redlock.acquireLock({ lockKey, resourceId, ttlMs });
+
+  if (token2) {
+    console.log(`Client 2 acquired lock with token: ${token2}. Performing critical operation...`);
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    await redlock.releaseLock(lockKey, token2);
+  } else {
+    console.log('Client 2 failed to acquire lock.');
+  }
+
+  await redlock.disconnect();
+}
+
+// To run this, you'd need 3 Redis instances running, e.g.:
+// docker run -p 6379:6379 --name redis1 -d redis
+// docker run -p 6380:6379 --name redis2 -d redis
+// docker run -p 6381:6379 --name redis3 -d redis
+// Then: node your_script.js
+// runRedlockExample();
+```
+
+## PostgreSQL Advisory Locks
+
+For systems already heavily reliant on PostgreSQL, advisory locks offer a simpler, transaction-aware, and highly efficient distributed locking mechanism. They are "advisory" because PostgreSQL does not enforce their use; it's up to the application to acquire and release them consistently.
+
+### Key Characteristics
+
+*   **Transaction-Scoped:** Locks are automatically released at the end of the transaction (commit or rollback). This is a powerful feature for ensuring liveness.
+*   **Session-Scoped:** Locks can also be acquired for the duration of a session, independent of transactions.
+*   **Lightweight:** They don't block table access or acquire row-level locks, making them very efficient.
+*   **Integer Keys:** Locks are identified by one or two `BIGINT` values.
+
+### Implementation
+
+```typescript
+import { Pool, PoolClient } from 'pg';
+
+interface AdvisoryLockOptions {
+  lockId: number; // A unique BIGINT identifier for the lock
+  timeoutMs?: number; // How long to wait for the lock (0 for non-blocking)
+}
+
+class PgAdvisoryLock {
+  private pool: Pool;
+
+  constructor(connectionString: string) {
+    this.pool = new Pool({ connectionString });
+  }
+
+  /**
+   * Acquires a transaction-level advisory lock.
+   * The lock is automatically released when the transaction commits or rolls back.
+   * @returns The PoolClient if the lock is acquired, otherwise null.
+   */
+  public async acquireTransactionLock(options: AdvisoryLockOptions): Promise<PoolClient | null> {
+    const { lockId, timeoutMs = 0 } = options;
+    const client = await this.pool.connect();
+
+    try {
+      await client.query('BEGIN'); // Start a transaction
+
+      let lockAcquired = false;
+      if (timeoutMs === 0) {
+        // Non-blocking attempt
+        const res = await client.query('SELECT pg_try_advisory_xact_lock($1)', [lockId]);
+        lockAcquired = res.rows[0].pg_try_advisory_xact_lock;
+      } else {
+        // Blocking attempt with timeout
+        // pg_advisory_xact_lock will block until acquired or connection reset.
+        // We simulate a timeout by running it in a separate promise and racing.
+        const acquirePromise = client.query('SELECT pg_advisory_xact_lock($1)', [lockId]);
+        const timeoutPromise = new Promise<void>(resolve => setTimeout(() => resolve(), timeoutMs));
+
+        await Promise.race([acquirePromise, timeoutPromise]);
+        // If acquirePromise resolved, lockAcquired is true. If timeoutPromise resolved first, it's false.
+        // This is a simplification; a more robust solution might involve a separate connection for the timeout check.
+        // For pg_advisory_xact_lock, it either succeeds or blocks indefinitely.
+        // pg_try_advisory_xact_lock is generally preferred for non-blocking or explicit retry logic.
+        // For a true blocking with timeout, one might need a loop with pg_try_advisory_xact_lock.
+        const res = await client.query('SELECT pg_try_advisory_xact_lock($1)', [lockId]); // Re-check after potential block
+        lockAcquired = res.rows[0].pg_try_advisory_xact_lock;
+      }
+
+      if (lockAcquired) {
+        console.log(`Transaction lock ${lockId} acquired.`);
+        return client; // Return the client to the caller for transaction operations
+      } else {
+        await client.query('ROLLBACK'); // Rollback if lock not acquired
+        client.release();
+        console.warn(`Failed to acquire transaction lock ${lockId}.`);
+        return null;
+      }
+    } catch (error) {
+      await client.query('ROLLBACK');
+      client.release();
+      console.error(`Error acquiring transaction lock ${lockId}: ${error}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Releases a transaction-level advisory lock by committing or rolling back the transaction.
+   * This method should be called by the client that acquired the lock.
+   */
+  public async releaseTransactionLock(client: PoolClient, success: boolean): Promise<void> {
+    try {
+      if (success) {
+        await client.query('COMMIT');
+        console.log('Transaction committed, lock released.');
+      } else {
+        await client.query('ROLLBACK');
+        console.log('Transaction rolled back, lock released.');
+      }
+    } catch (error) {
+      console.error(`Error releasing transaction lock: ${error}`);
+      await client.query('ROLLBACK'); // Ensure rollback on error
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Acquires a session-level advisory lock.
+   * The lock persists until explicitly released or the session ends.
+   * @returns true if lock is acquired, false otherwise.
+   */
+  public async acquireSessionLock(options: AdvisoryLockOptions): Promise<boolean> {
+    const { lockId, timeoutMs = 0 } = options;
+    const client = await this.pool.connect(); // New client for session lock
+
+    try {
+      let lockAcquired = false;
+      if (timeoutMs === 0) {
+        const res = await client.query('SELECT pg_try_advisory_lock($1)', [lockId]);
+        lockAcquired = res.rows[0].pg_try_advisory_lock;
+      } else {
+        // For session locks, pg_advisory_lock blocks.
+        // A timeout would require a separate mechanism or loop with pg_try_advisory_lock.
+        // For simplicity, we'll use pg_try_advisory_lock with retries for timeout simulation.
+        const startTime = Date.now();
+        while (Date.now() - startTime < timeoutMs) {
+          const res = await client.query('SELECT pg_try_advisory_lock($1)', [lockId]);
+          if (res.rows[0].pg_try_advisory_lock) {
+            lockAcquired = true;
+            break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 50)); // Small delay before retry
+        }
+      }
+
+      if (lockAcquired) {
+        console.log(`Session lock ${lockId} acquired.`);
+        // Store the client if you need to explicitly release it later
+        // For this example, we'll just return true and assume the caller manages the client.
+        // In a real app, you'd likely keep a map of lockId -> client.
+        return true;
+      } else {
+        client.release(); // Release client if lock not acquired
+        console.warn(`Failed to acquire session lock ${lockId}.`);
+        return false;
+      }
+    } catch (error) {
+      client.release();
+      console.error(`Error acquiring session lock ${lockId}: ${error}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Releases a session-level advisory lock.
+   * Requires the same client that acquired the lock.
+   */
+  public async releaseSessionLock(lockId: number, client: PoolClient): Promise<void> {
+    try {
+      await client.query('SELECT pg_advisory_unlock($1)', [lockId]);
+      console.log(`Session lock ${lockId} released.`);
+    } catch (error) {
+      console.error(`Error releasing session lock ${lockId}: ${error}`);
+    } finally {
+      client.release();
+    }
+  }
+
+  public async disconnect(): Promise<void> {
+    await this.pool.end();
+  }
+}
+
+// Example Usage (requires running PostgreSQL)
+async function runPgAdvisoryLockExample() {
+  const connectionString = 'postgresql://user:password@localhost:5432/mydatabase';
+  const pgLock = new PgAdvisoryLock(connectionString);
+  const lockId = 12345;
+
+  // --- Transaction-level lock example ---
+  console.log('\n--- Transaction-level lock ---');
+  let client1: PoolClient | null = null;
+  try {
+    client1 = await pgLock.acquireTransactionLock({ lockId, timeoutMs: 100 });
+    if (client1) {
+      console.log('Client 1 acquired transaction lock. Performing database operations...');
+      // Simulate database operation within the transaction
+      await client1.query('INSERT INTO some_table (data) VALUES ($1)', ['transactional_data_1']);
+      await new Promise(resolve => setTimeout(resolve, 1000)); // Simulate work
+      await pgLock.releaseTransactionLock(client1, true); // Commit and release
+    } else {
+      console.log('Client 1 failed to acquire transaction lock.');
+    }
+  } catch (error) {
+    console.error('Transaction example error:', error);
+    if (client1) await pgLock.releaseTransactionLock(client1, false); // Rollback
+  }
+
+  // --- Session-level lock example ---
+  console.log('\n--- Session-level lock ---');
+  let sessionClient: PoolClient | null = null;
+  try {
+    sessionClient = await pgLock.pool.connect(); // Get a client for the session lock
+    const acquired = await pgLock.acquireSessionLock({ lockId: lockId + 1, timeoutMs: 100 }); // Use a different lock ID
+
+    if (acquired) {
+      console.log('Client 1 acquired session lock. Performing operations...');
+      // Simulate work
+      await new Promise(resolve => setTimeout(resolve, 1500));
+
+      // Attempt to acquire the same session lock from another client (should fail)
+      console.log('Client 2 attempting to acquire the same session lock...');
+      const client2 = await pgLock.pool.connect();
+      const acquired2 = await pgLock.acquireSessionLock({ lockId: lockId + 1, timeoutMs: 100 });
+      if (!acquired2) {
+        console.log('Client 2 correctly failed to acquire the session lock.');
+      }
+      client2.release(); // Release client2 connection
+
+      await pgLock.releaseSessionLock(lockId + 1, sessionClient);
+    } else {
+      console.log('Client 1 failed to acquire session lock.');
+      if (sessionClient) sessionClient.release();
+    }
+  } catch (error) {
+    console.error('Session example error:', error);
+    if (sessionClient) sessionClient.release();
+  }
+
+  await pgLock.disconnect();
+}
+
+// To run this, you'd need a PostgreSQL instance running, e.g.:
+// docker run -p 5432:5432 --name pg-lock -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_DB=mydatabase -d postgres
+// Then: node your_script.js
+// runPgAdvisoryLockExample();
+```
+
+## etcd Leases for Distributed Coordination
+
+etcd is a distributed key-value store designed for highly available and consistent storage of configuration data and coordination services. Its core strength lies in its use of the Raft consensus algorithm, providing strong consistency and fault tolerance. etcd leases are a powerful primitive for distributed locking.
+
+### etcd Leases Overview
+
+An etcd lease is a time-to-live (TTL) mechanism associated with keys. When a key is attached to a lease, it expires and is automatically deleted if the lease expires. Clients can keep leases alive by periodically sending "keep-alive" requests. This provides a robust liveness guarantee: if a client crashes, its lease expires, and its locks are released.
+
+### Implementing Distributed Locks with etcd Leases
+
+1.  **Create a Lease:** The client requests a lease from etcd with a specified TTL.
+2.  **Acquire Lock:** The client attempts to create an ephemeral key (e.g., `/locks/my_resource`) associated with its lease, using a `CREATE` operation that fails if the key already exists. This is an atomic "compare-and-swap" (CAS) operation.
+3.  **Keep-Alive:** If the lock is acquired, the client periodically sends keep-alive requests for its lease.
+4.  **Release Lock:** The client explicitly deletes the key or lets the lease expire.
+
+etcd also provides **revision numbers** which can serve as natural fencing tokens. When a key is created, it gets a revision number. Subsequent modifications or deletions increment this revision. A client can acquire a lock, get its revision, and then pass this revision to the shared resource. The resource can then verify that the operation is being performed by the current lock holder by checking the revision.
+
+```typescript
+import { Etcd3, IOptions } from 'etcd3';
+
+interface EtcdLockOptions {
+  lockKey: string;
+  ttlSeconds: number; // Lease time-to-live in seconds
+  retryDelayMs?: number;
+  maxRetries?: number;
+}
+
+class EtcdDistributedLock {
+  private etcd: Etcd3;
+
+  constructor(etcdHosts: string | string[], options?: IOptions) {
+    this.etcd = new Etcd3({ hosts: etcdHosts, ...options });
+  }
+
+  /**
+   * Acquires a distributed lock using etcd leases and compare-and-swap.
+   * Returns the lease ID and the revision number (fencing token) if successful.
+   */
+  public async acquireLock(options: EtcdLockOptions): Promise<{ leaseId: string; revision: number } | null> {
+    const { lockKey, ttlSeconds, retryDelayMs = 100, maxRetries = 10 } = options;
+    const clientValue = Math.random().toString(36).substring(2, 15); // Unique client identifier
+
+    let retries = 0;
+    while (retries < maxRetries) {
+      try {
+        // 1. Create a lease
+        const lease = this.etcd.lease(ttlSeconds);
+        const leaseId = lease.id;
+
+        // 2. Attempt to acquire the lock using a transaction (compare-and-swap)
+        // Ensure the key does not exist, then create it with our value and lease.
+        const transactionResult = await this.etcd.txn()
+          .if(this.etcd.op(lockKey).not.exists())
+          .then(this.etcd.op(lockKey).put(clientValue).withLease(leaseId))
+          .commit();
+
+        if (transactionResult.succeeded) {
+          // Lock acquired. Start keep-alive.
+          lease.on('lost', () => {
+            console.error(`Lease ${leaseId} for lock ${lockKey} lost!`);
+            // In a real application, this would trigger recovery or error handling.
+          });
+          lease.on('expired', () => {
+            console.warn(`Lease ${leaseId} for lock ${lockKey} expired!`);
+          });
+          lease.on('keepalive established', () => {
+            // console.log(`Keep-alive established for lease ${leaseId}`);
+          });
+          lease.on('keepalive error', (err) => {
+            console.error(`Keep-alive error for lease ${leaseId}: ${err}`);
+          });
+
+          // Get the revision number for fencing
+          const getResult = await this.etcd.get(lockKey).string();
+          if (getResult) {
+            const revision = getResult.modRevision;
+            console.log(`Lock '${lockKey}' acquired by client '${clientValue}' with lease ${leaseId}, revision ${revision}`);
+            return { leaseId, revision };
+          } else {
+            // This should ideally not happen if transaction succeeded, but defensive check.
+            console.error(`Failed to get revision for lock ${lockKey} after acquiring.`);
+            await this.releaseLock(lockKey, leaseId); // Clean up
+            return null;
+          }
+        } else {
+          // Lock already held by another client
+          console.warn(`Lock '${lockKey}' already held. Retrying...`);
+          await lease.revoke(); // Revoke our unused lease
+          retries++;
+          await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+        }
+      } catch (error) {
+        console.error(`Error acquiring lock '${lockKey}': ${error}`);
+        retries++;
+        await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+      }
+    }
+
+    console.error(`Failed to acquire lock '${lockKey}' after ${maxRetries} retries.`);
+    return null;
+  }
+
+  /**
+   * Releases a distributed lock by revoking its lease.
+   * This will automatically delete the associated key.
+   */
+  public async releaseLock(lockKey: string, leaseId: string): Promise<void> {
+    try {
+      // Revoking the lease automatically deletes all keys associated with it.
+      await this.etcd.lease.revoke(leaseId);
+      console.log(`Lock '${lockKey}' with lease ${leaseId} released.`);
+    } catch (error) {
+      console.error(`Error releasing lock '${lockKey}' with lease ${leaseId}: ${error}`);
+    }
+  }
+
+  /**
+   * Verifies the fencing token (revision) for an operation.
+   * The resource being protected should call this before performing an operation.
+   */
+  public async verifyFencingToken(lockKey: string, expectedRevision: number): Promise<boolean> {
+    try {
+      const getResult = await this.etcd.get(lockKey).string();
+      if (!getResult) {
+        console.warn(`Fencing check failed: Lock key '${lockKey}' does not exist.`);
+        return false;
+      }
+      if (getResult.modRevision !== expectedRevision) {
+        console.warn(`Fencing check failed: Expected revision ${expectedRevision}, got ${getResult.modRevision}.`);
+        return false;
+      }
+      return true;
+    } catch (error) {
+      console.error(`Error during fencing token verification for '${lockKey}': ${error}`);
+      return false;
+    }
+  }
+
+  public async disconnect(): Promise<void> {
+    await this.etcd.close();
+  }
+}
+
+// Example Usage (requires running etcd)
+async function runEtcdLockExample() {
+  const etcdHosts = ['localhost:2379']; // Or an array of hosts for a cluster
+  const etcdLock = new EtcdDistributedLock(etcdHosts);
+
+  const lockKey = '/app/resource/processor_lock';
+  const ttlSeconds = 5; // Lease expires in 5 seconds if not kept alive
+
+  console.log('Attempting to acquire lock 1...');
+  const lockInfo1 = await etcdLock.acquireLock({ lockKey, ttlSeconds });
+
+  if (lockInfo1) {
+    console.log(`Client 1 acquired lock with lease ${lockInfo1.leaseId}, revision ${lockInfo1.revision}.`);
+    // Simulate critical operation with fencing check
+    const isFenced = await etcdLock.verifyFencingToken(lockKey, lockInfo1.revision);
+    if (isFenced) {
+      console.log('Fencing token verified. Performing critical operation...');
+      await new Promise(resolve => setTimeout(resolve, 3000)); // Simulate work
+      console.log('Client 1 finished critical operation. Releasing lock...');
+      await etcdLock.releaseLock(lockKey, lockInfo1.leaseId);
+    } else {
+      console.error('Fencing check failed for client 1. Aborting operation.');
+      await etcdLock.releaseLock(lockKey, lockInfo1.leaseId); // Ensure release
+    }
+  } else {
+    console.log('Client 1 failed to acquire lock.');
+  }
+
+  console.log('\nAttempting to acquire lock 2 (should succeed after lock 1 is released)...');
+  const lockInfo2 = await etcdLock.acquireLock({ lockKey, ttlSeconds });
+
+  if (lockInfo2) {
+    console.log(`Client 2 acquired lock with lease ${lockInfo2.leaseId}, revision ${lockInfo2.revision}.`);
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    await etcdLock.releaseLock(lockKey, lockInfo2.leaseId);
+  } else {
+    console.log('Client 2 failed to acquire lock.');
+  }
+
+  await etcdLock.disconnect();
+}
+
+// To run this, you'd need an etcd instance running, e.g.:
+// docker run -p 2379:2379 -p 2380:2380 --name etcd-single -d quay.io/coreos/etcd:latest etcd -advertise-client-urls http://0.0.0.0:2379 -listen-client-urls http://0.0.0.0:2379
+// Then: node your_script.js
+// runEtcdLockExample();
+```
+
+## Architectural Comparison
+
+| Feature               | Redlock (Redis)                                | PostgreSQL Advisory Locks                               | etcd Leases                                            |
+|-----------------------|------------------------------------------------|---------------------------------------------------------|--------------------------------------------------------|
+| **Consistency Model** | Eventual (multi-instance Redis)                | Strong (PostgreSQL's ACID guarantees)                   | Strong (Raft consensus)                                |
+| **Fault Tolerance**   | Majority quorum of Redis instances             | PostgreSQL cluster (e.g., streaming replication)        | Majority quorum of etcd nodes                          |
+| **Fencing Support**   | Not native; requires external mechanism        | Not native; can be simulated with application logic     | Native via revision numbers                            |
+| **Liveness Guarantee**| TTL-based expiration                           | Transaction/session end, or explicit unlock             | Lease TTL with keep-alives                             |
+| **Overhead**          | Multiple network round-trips to Redis instances| Single database connection/transaction                  | Network round-trips to etcd cluster                    |
+| **Complexity**        | Moderate (client-side quorum logic)            | Low (SQL functions)                                     | Moderate (etcd client, lease management)               |
+| **Use Case**          | High-throughput, low-latency, non-critical locks | Database-centric applications, transaction-bound work   | Critical coordination, leader election, configuration  |
+| **Dependencies**      | Redis cluster                                  | PostgreSQL database                                     | etcd cluster                                           |
+
+## Production Gotchas & Troubleshooting
+
+1.  **Clock Synchronization (Redlock):**
+    *   **Gotcha:** Significant clock skew between Redis instances or between clients and Redis can lead to premature lock expiration or locks being held longer than intended, violating mutual exclusion.
+    *   **Fix:** Implement NTP or PTP for strict clock synchronization across all nodes. While Redlock's `validity_time` attempts to mitigate this, it's not a complete solution. For high-assurance systems, avoid Redlock.
+
+2.  **GC Pauses/Process Stalls (All):**
+    *   **Gotcha:** A client holding a lock experiences a long GC pause. Its lock expires, another client acquires it, and the first client resumes, operating on stale state or conflicting with the new lock holder.
+    *   **Fix:** Implement **fencing tokens**. For etcd, use revision numbers. For PostgreSQL, you might use a `version` column in a dedicated lock table, incremented on each lock acquisition. For Redlock, this is a fundamental weakness without external coordination. Additionally, monitor application pause times and tune JVM/runtime settings.
+
+3.  **Network Partitions (All):**
+    *   **Gotcha:** A client acquires a lock, then gets partitioned from the majority of the locking service. It believes it still holds the lock, while a new lock is granted in the healthy partition.
+    *   **Fix:** This is where the consensus algorithm (Raft in etcd) or quorum-based approaches (Redlock) are designed to help. However, fencing is still crucial. The partitioned client, even if it *thinks* it has the lock, must be prevented from acting by the resource it's trying to protect.
+
+4.  **Lease/TTL Management (Redlock, etcd):**
+    *   **Gotcha:** Incorrectly setting TTLs or failing to send keep-alives can lead to locks expiring prematurely or being held indefinitely.
+    *   **Fix:** Choose TTLs carefully, considering network latency and expected operation duration. Implement robust keep-alive loops with error handling and retry logic. Ensure the client releases the lock explicitly when done, even if the lease is active.
+
+5.  **PostgreSQL Transaction Isolation:**
+    *   **Gotcha:** Using `pg_advisory_lock` (session-level) instead of `pg_advisory_xact_lock` (transaction-level) can lead to locks persisting beyond a transaction's scope, causing deadlocks or unexpected behavior if not explicitly released.
+    *   **Fix:** Always prefer `pg_advisory_xact_lock` for operations that are naturally transactional. If using session-level locks, ensure explicit `pg_advisory_unlock` calls in `finally` blocks or similar cleanup mechanisms.
+
+6.  **Resource Exhaustion (PostgreSQL):**
+    *   **Gotcha:** Excessive use of advisory locks can consume connection pool resources, especially if clients block waiting for locks.
+    *   **Fix:** Use `pg_try_advisory_xact_lock` for non-blocking attempts and implement client-side retry logic with backoff. Monitor connection pool usage and tune `max_connections`.
+
+## Frequently Asked Questions
+
+### Q1: When should I use Redlock versus etcd or PostgreSQL advisory locks?
+
+**A1:** Use Redlock only if you have a strong requirement for low-latency, high-throughput locking and are willing to accept its known safety limitations (especially regarding fencing and clock drift) or implement complex external fencing mechanisms. It's best suited for non-critical, "best-effort" locks where occasional violations of mutual exclusion are tolerable. For strong consistency and safety, especially with fencing, etcd or PostgreSQL advisory locks are superior. Choose PostgreSQL if your shared resource is primarily the database itself and you need transaction-bound locks. Choose etcd for broader distributed coordination, leader election, and configuration management where a dedicated, strongly consistent key-value store is appropriate.
+
+### Q2: How do fencing tokens truly prevent stale clients from causing harm?
+
+**A2:** Fencing tokens work by requiring the *resource being protected* to verify the token. When a client acquires a lock, it receives a unique, monotonically increasing token (e.g., etcd's revision number). When the client attempts to modify the shared resource, it must present this token. The resource (e.g., a storage service, a message queue) then checks if the presented token is the *latest* valid token for that resource. If an older token is presented (meaning another client has since acquired the lock with a higher token), the operation is rejected. This prevents stale clients, even if they mistakenly believe they hold the lock, from corrupting data.
+
+### Q3: Can I use a single Redis instance for distributed locking?
+
+**A3:** No, absolutely not for production systems requiring any level of fault tolerance. A single Redis instance is a single point of failure. If it crashes, all locks are lost, and clients might proceed concurrently, leading to data corruption. Redlock attempts to mitigate this with a quorum of instances, but even then, it has limitations. For any serious distributed locking, a fault-tolerant backend (like a Redis cluster with Redlock, a PostgreSQL cluster, or an etcd cluster) is mandatory.
+
+### Q4: What are the performance implications of distributed locks?
+
+**A4:** Distributed locks inherently introduce latency due to network round-trips and coordination overhead.
+*   **Redlock:** Can be fast for acquisition if Redis instances are nearby, but involves multiple network calls.
+*   **PostgreSQL Advisory Locks:** Very fast if the database connection is already established and the database is not under heavy load. Transaction-level locks are particularly efficient as they are tied to existing transactions.
+*   **etcd Leases:** Involves network calls to the etcd cluster, which uses Raft consensus, adding some latency compared to a single Redis instance. However, etcd is optimized for this and provides strong guarantees.
+
+The performance impact depends heavily on the frequency of lock acquisition/release, network latency, and the load on the underlying locking service. Design your system to minimize the critical sections protected by distributed locks.
+
+### Q5: What happens if a client crashes *while* holding a lock?
+
+**A5:** This is a primary concern for distributed locks and is addressed by their liveness guarantees:
+*   **Redlock:** The lock will eventually expire due to its TTL. The `random_value` ensures that if the client restarts and tries to release the lock, it only releases its *own* lock, not a new one acquired by another client.
+*   **PostgreSQL Advisory Locks:** If it's a transaction-level lock (`pg_advisory_xact_lock`), the lock is automatically released when the client's database connection is terminated (e.g., due to a crash), causing the transaction to roll back. If it's a session-level lock (`pg_advisory_lock`), it's released when the session ends.
+*   **etcd Leases:** The lease associated with the lock key will expire if the client crashes and stops sending keep-alives. Once the lease expires, etcd automatically deletes the lock key, making the lock available to other clients. This is a very robust mechanism.
+
+In all cases, the lock is eventually released, preventing deadlocks. However, fencing is still needed to prevent the crashed client from causing harm if it recovers and tries to operate with a stale lock.

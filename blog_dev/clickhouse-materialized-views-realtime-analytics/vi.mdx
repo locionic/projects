@@ -1,0 +1,245 @@
+---
+title: "ClickHouse Materialized Views & ReplacingMergeTree: Phân tích thời gian thực dưới một giây"
+images: ['/static/images/clickhouse-materialized-views-realtime-analytics.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["clickhouse", "database", "analytics", "backend", "performance"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về materialized views và replacingmergetree của ClickHouse: phân tích thời gian thực dưới một giây với kiến trúc cấp độ sản xuất và ví dụ mã."
+---
+
+ClickHouse vượt trội trong các tác vụ phân tích thời gian thực. Để đạt được độ trễ truy vấn dưới một giây trên các luồng dữ liệu có cardinality cao, khối lượng lớn, thường cần đến việc tổng hợp trước (pre-aggregation) và khử trùng lặp hiệu quả. Hướng dẫn này trình bày chi tiết kiến trúc và cách triển khai Materialized Views của ClickHouse với các engine `AggregatingMergeTree` và `ReplacingMergeTree` để xây dựng một pipeline phân tích thời gian thực mạnh mẽ.
+
+<AudioPlayer src="/static/audio/clickhouse-materialized-views-realtime-analytics-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Tổng quan kiến trúc: Tổng hợp và khử trùng lặp luồng dữ liệu
+
+Vấn đề cốt lõi được giải quyết là nhu cầu về các số liệu tổng hợp theo thời gian thực từ một luồng sự kiện, nơi các sự kiện có thể đến không theo thứ tự hoặc bị trùng lặp. Giải pháp của chúng tôi bao gồm:
+
+1.  **Bảng sự kiện thô (Raw Event Table)**: Một bảng chỉ thêm (append-only) lưu trữ tất cả các sự kiện đến. Đây là nguồn dữ liệu đáng tin cậy.
+2.  **Lớp khử trùng lặp (Deduplication Layer)**: Một bảng `ReplacingMergeTree` để đảm bảo tính bất biến của sự kiện (event idempotency), xử lý các sự kiện đến muộn hoặc được phát lại.
+3.  **Materialized View để tổng hợp (Materialized View for Aggregation)**: Một bảng `AggregatingMergeTree`, được điền bởi một Materialized View, để tính toán trước các tổng hợp. Bảng này lưu trữ các tổng hợp có trạng thái (stateful aggregates), giúp giảm đáng kể thời gian truy vấn.
+
+Cách tiếp cận phân lớp này cung cấp cả tính toàn vẹn dữ liệu và hiệu suất truy vấn.
+
+## Nhập sự kiện thô với `ReplacingMergeTree`
+
+Đầu tiên, hãy định nghĩa một bảng sự kiện thô. Mặc dù một `MergeTree` đơn giản có thể đủ, `ReplacingMergeTree` là rất quan trọng để nhập dữ liệu bất biến, đặc biệt khi xử lý việc phát lại sự kiện hoặc ngữ nghĩa phân phối ít nhất một lần (at-least-once delivery semantics) từ các hàng đợi tin nhắn như Kafka.
+
+```sql
+CREATE TABLE IF NOT EXISTS events_raw (
+    event_id UUID,
+    user_id String,
+    event_type LowCardinality(String),
+    event_time DateTime64(3),
+    value Float64,
+    _version UInt64 DEFAULT 1 -- Version column for ReplacingMergeTree
+) ENGINE = ReplacingMergeTree(_version)
+ORDER BY (event_id, event_time)
+PRIMARY KEY (event_id);
+```
+
+-   `ReplacingMergeTree(_version)`: Engine này đảm bảo rằng đối với bất kỳ khóa `ORDER BY` nào (ở đây là `event_id, event_time`), chỉ hàng có `_version` tối đa được giữ lại trong quá trình hợp nhất. Nếu `_version` bị bỏ qua, hàng cuối cùng theo thứ tự chèn sẽ được giữ lại.
+-   `ORDER BY (event_id, event_time)`: Định nghĩa khóa sắp xếp. `ReplacingMergeTree` sử dụng khóa này để xác định các hàng "trùng lặp".
+-   `PRIMARY KEY (event_id)`: Tối ưu hóa việc tra cứu điểm (point lookups) và quét phạm vi (range scans) trên `event_id`.
+
+Hãy chèn một số dữ liệu mẫu, bao gồm một `event_id` trùng lặp với phiên bản cao hơn.
+
+```sql
+INSERT INTO events_raw (event_id, user_id, event_type, event_time, value, _version) VALUES
+('a0000000-0000-0000-0000-000000000001', 'user1', 'page_view', '2023-10-26 10:00:00.000', 1.0, 1),
+('a0000000-0000-0000-0000-000000000002', 'user1', 'click', '2023-10-26 10:00:05.000', 0.5, 1),
+('a0000000-0000-0000-0000-000000000003', 'user2', 'page_view', '2023-10-26 10:00:10.000', 1.0, 1),
+('a0000000-0000-0000-0000-000000000001', 'user1', 'page_view', '2023-10-26 10:00:00.000', 1.2, 2); -- Duplicate event_id, higher version
+```
+
+Để quan sát việc khử trùng lặp, chúng ta cần buộc hợp nhất hoặc đợi các quá trình hợp nhất nền.
+
+```sql
+OPTIMIZE TABLE events_raw FINAL;
+
+SELECT event_id, user_id, value, _version FROM events_raw ORDER BY event_id;
+```
+
+Kết quả:
+```
+┌─event_id─────────────────────────────┬─user_id─┬─value─┬─_version─┐
+│ a0000000-0000-0000-0000-000000000001 │ user1   │   1.2 │        2 │
+│ a0000000-0000-0000-0000-000000000002 │ user1   │   0.5 │        1 │
+│ a0000000-0000-0000-0000-000000000003 │ user2   │   1.0 │        1 │
+└──────────────────────────────────────┴─────────┴───────┴──────────┘
+```
+Lưu ý `event_id` `a0000000-0000-0000-0000-000000000001` hiện có `value` 1.2 và `_version` 2, thể hiện việc khử trùng lặp.
+
+## Materialized Views cho tổng hợp thời gian thực
+
+Materialized Views trong ClickHouse không phải là các ảnh chụp nhanh được tính toán trước như trong RDBMS truyền thống. Thay vào đó, chúng là các *trigger* thực thi một truy vấn `SELECT` trên dữ liệu mới được chèn vào bảng nguồn và ghi kết quả vào một bảng đích. Điều này làm cho chúng trở nên lý tưởng cho việc tổng hợp liên tục, tăng dần.
+
+### `AggregatingMergeTree` cho các tổng hợp có trạng thái
+
+Bảng đích cho Materialized View của chúng ta sẽ sử dụng engine `AggregatingMergeTree`. Engine này lưu trữ *trạng thái* của các hàm tổng hợp, chứ không phải giá trị cuối cùng của chúng. Khi các phần dữ liệu được hợp nhất, các trạng thái này được kết hợp bằng cách sử dụng các hàm `*Merge`.
+
+Định nghĩa bảng tổng hợp:
+
+```sql
+CREATE TABLE IF NOT EXISTS events_agg_mv (
+    event_date Date,
+    event_type LowCardinality(String),
+    user_id String,
+    total_value AggregateFunction(sum, Float64),
+    unique_users AggregateFunction(uniqHLL12, String),
+    event_count AggregateFunction(count)
+) ENGINE = AggregatingMergeTree()
+ORDER BY (event_date, event_type, user_id);
+```
+
+-   `AggregateFunction(sum, Float64)`: Kiểu dữ liệu đặc biệt này lưu trữ trạng thái trung gian của hàm tổng hợp `sum`.
+-   `uniqHLL12`: Một thuật toán đếm số lượng riêng biệt gần đúng có hiệu suất cao, phù hợp với dữ liệu có cardinality cao.
+-   `ORDER BY (event_date, event_type, user_id)`: Định nghĩa khóa tổng hợp. Tất cả các hàng có cùng khóa sẽ được hợp nhất và trạng thái tổng hợp của chúng được kết hợp.
+
+### Tạo Materialized View
+
+Bây giờ, hãy tạo Materialized View điền dữ liệu vào `events_agg_mv` từ `events_raw`.
+
+```sql
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_events_agg
+TO events_agg_mv
+AS SELECT
+    toDate(event_time) AS event_date,
+    event_type,
+    user_id,
+    sumState(value) AS total_value,
+    uniqHLL12State(user_id) AS unique_users,
+    countState() AS event_count
+FROM events_raw
+GROUP BY event_date, event_type, user_id;
+```
+
+-   `TO events_agg_mv`: Chỉ định bảng đích.
+-   `sumState(value)`, `uniqHLL12State(user_id)`, `countState()`: Đây là các phiên bản "trạng thái" của các hàm tổng hợp. Chúng trả về trạng thái trung gian của quá trình tổng hợp, mà `AggregatingMergeTree` lưu trữ.
+
+Hãy chèn thêm dữ liệu vào `events_raw` và quan sát hiệu ứng của Materialized View.
+
+```sql
+INSERT INTO events_raw (event_id, user_id, event_type, event_time, value, _version) VALUES
+('a0000000-0000-0000-0000-000000000004', 'user1', 'page_view', '2023-10-26 10:00:15.000', 1.0, 1),
+('a0000000-0000-0000-0000-000000000005', 'user2', 'click', '2023-10-26 10:00:20.000', 0.8, 1),
+('a0000000-0000-0000-0000-000000000006', 'user1', 'page_view', '2023-10-27 11:00:00.000', 1.0, 1);
+```
+
+Truy vấn bảng tổng hợp. Lưu ý việc sử dụng các hàm `*Merge` để hoàn tất các tổng hợp.
+
+```sql
+SELECT
+    event_date,
+    event_type,
+    user_id,
+    sumMerge(total_value) AS final_total_value,
+    uniqHLL12Merge(unique_users) AS final_unique_users,
+    countMerge(event_count) AS final_event_count
+FROM events_agg_mv
+GROUP BY event_date, event_type, user_id
+ORDER BY event_date, event_type, user_id;
+```
+
+Kết quả:
+```
+┌─event_date─┬─event_type─┬─user_id─┬─final_total_value─┬─final_unique_users─┬─final_event_count─┐
+│ 2023-10-26 │ click      │ user1   │               0.5 │                  1 │                 1 │
+│ 2023-10-26 │ click      │ user2   │               0.8 │                  1 │                 1 │
+│ 2023-10-26 │ page_view  │ user1   │               2.2 │                  1 │                 2 │
+│ 2023-10-26 │ page_view  │ user2   │               1.0 │                  1 │                 1 │
+│ 2023-10-27 │ page_view  │ user1   │               1.0 │                  1 │                 1 │
+└────────────┴────────────┴─────────┴───────────────────┴────────────────────┴───────────────────┘
+```
+
+Các tổng hợp được cập nhật chính xác theo thời gian thực. `ReplacingMergeTree` trên `events_raw` đảm bảo rằng nếu một sự kiện được gửi lại với phiên bản cao hơn, Materialized View sẽ xử lý sự kiện đã cập nhật và `AggregatingMergeTree` sẽ phản ánh chính xác sự thay đổi sau các lần hợp nhất tiếp theo.
+
+### So sánh: Normal View vs. Materialized View
+
+| Tính năng           | Normal View (ví dụ: `CREATE VIEW`) | Materialized View (ví dụ: `CREATE MATERIALIZED VIEW`) |
+|:--------------------|:----------------------------------|:-----------------------------------------------------|
+| Lưu trữ dữ liệu     | Không lưu trữ dữ liệu, truy vấn được thực thi theo yêu cầu | Dữ liệu được tính toán trước và lưu trữ trong bảng đích |
+| Hiệu suất truy vấn  | Phụ thuộc vào các bảng cơ sở, có thể chậm đối với các tổng hợp phức tạp | Cực kỳ nhanh đối với dữ liệu đã được tổng hợp trước, dưới một giây |
+| Độ tươi mới của dữ liệu | Luôn theo thời gian thực          | Theo thời gian thực (khi dữ liệu được chèn vào bảng nguồn) |
+| Sử dụng tài nguyên  | Lưu trữ thấp, CPU/IO truy vấn cao  | Lưu trữ cao, CPU/IO truy vấn thấp                     |
+| Trường hợp sử dụng  | Bí danh đơn giản, truy vấn ad-hoc phức tạp | Bảng điều khiển thời gian thực, báo cáo cố định, phân tích khối lượng lớn |
+
+## Tối ưu hóa truy vấn phân tích dưới 50ms
+
+Để đạt được độ trễ dưới 50ms, cần xem xét cẩn thận thiết kế bảng, các mẫu truy vấn và cấu hình ClickHouse.
+
+1.  **Khóa `AggregatingMergeTree` `ORDER BY`**: Mệnh đề `ORDER BY` trong `events_agg_mv` là rất quan trọng. Nó phải khớp với các mệnh đề `GROUP BY` và `WHERE` phổ biến của các truy vấn phân tích của bạn. Ví dụ, nếu bạn thường xuyên truy vấn theo `event_date` và `event_type`, thì chúng phải là các cột dẫn đầu trong `ORDER BY`.
+2.  **`PRIMARY KEY`**: Đối với `AggregatingMergeTree`, `PRIMARY KEY` thường là tiền tố của khóa `ORDER BY`. Nó giúp cắt bớt các phần dữ liệu một cách nhanh chóng.
+3.  **Kiểu dữ liệu `LowCardinality`**: Sử dụng `LowCardinality(String)` cho các cột có số lượng giá trị riêng biệt hạn chế (ví dụ: `event_type`). Điều này giúp giảm đáng kể dung lượng lưu trữ và cải thiện hiệu suất truy vấn nhờ mã hóa từ điển.
+4.  **`DateTime64` vs `DateTime`**: `DateTime64` cung cấp độ chính xác mili giây, thường cần thiết cho các luồng sự kiện. Đảm bảo các hàm `toDate()` hoặc `toStartOfHour()` của bạn phù hợp với mức độ chi tiết tổng hợp mong muốn.
+5.  **Từ khóa `FINAL`**: Khi truy vấn `AggregatingMergeTree` hoặc `ReplacingMergeTree`, `SELECT ... FROM table FINAL` đảm bảo tất cả các quá trình hợp nhất được hoàn thành và bạn nhận được kết quả tổng hợp/khử trùng lặp hoàn chỉnh. Tuy nhiên, `FINAL` có thể chậm vì nó buộc các quá trình hợp nhất. Đối với các bảng điều khiển thời gian thực, bạn có thể chấp nhận dữ liệu hơi cũ và bỏ qua `FINAL`, dựa vào các quá trình hợp nhất nền. Đối với các báo cáo quan trọng, `FINAL` là cần thiết.
+6.  **`index_granularity`**: Cài đặt này (mặc định 8192) xác định số hàng trong một khối dữ liệu để lập chỉ mục. Điều chỉnh nó có thể ảnh hưởng đến hiệu suất, nhưng mặc định thường phù hợp.
+7.  **Phần cứng**: RAM đủ, SSD NVMe nhanh và lõi CPU là tối quan trọng đối với hiệu suất của ClickHouse.
+8.  **Bảng phân tán (Distributed Tables)**: Đối với các tập dữ liệu rất lớn, hãy sử dụng bảng `Distributed` trên `AggregatingMergeTree` để mở rộng theo chiều ngang.
+
+## Những vấn đề và cách khắc phục trong môi trường sản xuất
+
+1.  **Độ trễ của Materialized View**:
+    *   **Triệu chứng**: `events_agg_mv` không cập nhật nhanh chóng, hoặc các truy vấn trên đó hiển thị dữ liệu cũ.
+    *   **Nguyên nhân**: Tốc độ nhập dữ liệu cao vào `events_raw` kết hợp với logic MV phức tạp hoặc hạn chế tài nguyên. Materialized Views xử lý dữ liệu đồng bộ khi chèn. Nếu truy vấn MV chậm, nó có thể chặn các thao tác chèn.
+    *   **Cách khắc phục**:
+        *   Đơn giản hóa truy vấn `SELECT` của MV.
+        *   Đảm bảo `events_raw` có `ORDER BY` và `PRIMARY KEY` phù hợp để xử lý MV hiệu quả.
+        *   Mở rộng tài nguyên ClickHouse (CPU, RAM, IO).
+        *   Cân nhắc sử dụng Materialized View không đồng bộ (bằng cách bỏ qua `TO target_table` và để MV tạo bảng `.` riêng, sau đó tạo một bảng `AggregatingMergeTree` riêng và chèn vào đó từ bảng `.` thông qua một quy trình riêng biệt hoặc một MV khác). Điều này tách rời việc nhập dữ liệu khỏi tổng hợp nhưng làm tăng độ phức tạp. Đối với hầu hết các trường hợp, MV đồng bộ được ưu tiên vì sự đơn giản và đảm bảo thời gian thực.
+
+2.  **`ReplacingMergeTree` không khử trùng lặp**:
+    *   **Triệu chứng**: Các `event_id` trùng lặp vẫn tồn tại ngay cả sau `OPTIMIZE TABLE FINAL`.
+    *   **Nguyên nhân**: Khóa `ORDER BY` không chính xác. `ReplacingMergeTree` khử trùng lặp dựa trên khóa `ORDER BY`. Nếu `event_id` không phải là một phần của khóa `ORDER BY`, hoặc nếu cột `_version` không được sử dụng đúng cách, việc khử trùng lặp sẽ không xảy ra như mong đợi.
+    *   **Cách khắc phục**: Xác minh `ORDER BY` bao gồm định danh duy nhất (ví dụ: `event_id`) và cột phiên bản (ví dụ: `_version`) được điền và chỉ định chính xác trong định nghĩa engine.
+
+3.  **Hiệu suất truy vấn `AggregatingMergeTree`**:
+    *   **Triệu chứng**: Các truy vấn trên `events_agg_mv` chậm, ngay cả với các hàm `*Merge`.
+    *   **Nguyên nhân**:
+        *   Mệnh đề `GROUP BY` trong truy vấn không khớp với khóa `ORDER BY` của `events_agg_mv`. Điều này buộc ClickHouse phải đọc nhiều dữ liệu hơn mức cần thiết.
+        *   Quá nhiều giá trị riêng biệt trong các cột `GROUP BY`, dẫn đến số lượng lớn các phần dữ liệu nhỏ hoặc sử dụng bộ nhớ cao trong quá trình hợp nhất.
+        *   Sử dụng `FINAL` không cần thiết.
+    *   **Cách khắc phục**:
+        *   Tái cấu trúc `events_agg_mv` `ORDER BY` để khớp với các mẫu truy vấn phổ biến.
+        *   Đảm bảo `PRIMARY KEY` là tiền tố của `ORDER BY`.
+        *   Tránh `FINAL` trừ khi thực sự cần thiết cho tính đúng đắn.
+        *   Cân nhắc tổng hợp trước thêm nếu các tổng hợp trung gian vẫn quá chi tiết.
+
+4.  **Tiêu thụ dung lượng đĩa**:
+    *   **Triệu chứng**: Các bảng `AggregatingMergeTree` tiêu thụ quá nhiều dung lượng đĩa.
+    *   **Nguyên nhân**: Trạng thái `AggregateFunction` có thể lớn hơn giá trị cuối cùng, đặc biệt đối với các hàm như `uniqHLL12State` hoặc `groupArrayState`. Ngoài ra, nếu khóa `ORDER BY` có cardinality cao, nó có thể dẫn đến nhiều phần dữ liệu nhỏ.
+    *   **Cách khắc phục**:
+        *   Xem xét các hàm tổng hợp. `uniqHLL12` tiết kiệm không gian cho các lượt đếm riêng biệt. `groupArrayState` có thể rất lớn.
+        *   Đảm bảo khóa `ORDER BY` được chọn để cân bằng giữa mức độ chi tiết tổng hợp và kích thước phần dữ liệu.
+        *   Thực hiện chính sách TTL (Time-To-Live) trên `events_raw` và `events_agg_mv` để tự động xóa dữ liệu cũ.
+
+```sql
+-- Example TTL for events_raw (delete raw data after 30 days)
+ALTER TABLE events_raw MODIFY TTL event_time + INTERVAL 30 DAY;
+
+-- Example TTL for events_agg_mv (delete aggregates after 365 days)
+ALTER TABLE events_agg_mv MODIFY TTL event_date + INTERVAL 365 DAY;
+```
+
+## Các câu hỏi thường gặp
+
+1.  **Tôi có thể sửa đổi Materialized View sau khi tạo không?**
+    Không, Materialized Views không thể được sửa đổi trực tiếp. Bạn phải `DROP` và `CREATE` chúng lại. Đây là lý do tại sao việc thiết kế MV cẩn thận là rất quan trọng. Nếu lược đồ bảng đích thay đổi, bạn cũng phải xóa và tạo lại MV.
+
+2.  **Điều gì xảy ra nếu dữ liệu bị xóa khỏi bảng nguồn của Materialized View?**
+    Materialized Views chỉ phản ứng với các thao tác `INSERT`. Các thao tác `DELETE` hoặc `UPDATE` trên bảng nguồn sẽ *không* tự động lan truyền đến bảng đích của Materialized View. Nếu bạn cần xử lý việc xóa, bạn thường sẽ triển khai cơ chế "xóa mềm" (ví dụ: một cờ `is_deleted`) và lọc nó trong các truy vấn của bạn, hoặc sử dụng thiết lập `CollapsingMergeTree` hoặc `VersionedCollapsingMergeTree` phức tạp hơn.
+
+3.  **`ReplacingMergeTree` xử lý các thao tác chèn đồng thời với cùng khóa `ORDER BY` như thế nào?**
+    `ReplacingMergeTree` xử lý các thao tác chèn đồng thời bằng cách áp dụng logic thay thế trong quá trình hợp nhất. Nếu hai thao tác chèn với cùng khóa `ORDER BY` nhưng giá trị `_version` khác nhau đến đồng thời, chúng ban đầu sẽ tồn tại trong các phần dữ liệu riêng biệt. Khi các phần này được hợp nhất, hàng có `_version` cao nhất sẽ được giữ lại. Điều này đảm bảo tính nhất quán cuối cùng.
+
+4.  **Khi nào tôi nên sử dụng `AggregatingMergeTree` so với `MergeTree` thông thường với `GROUP BY`?**
+    Sử dụng `AggregatingMergeTree` khi bạn cần liên tục tổng hợp dữ liệu theo thời gian thực và truy vấn các tổng hợp đó thường xuyên. Nó tính toán trước và lưu trữ trạng thái tổng hợp, giúp truy vấn nhanh hơn đáng kể. Sử dụng `MergeTree` thông thường với `GROUP BY` cho các tổng hợp ad-hoc trên dữ liệu thô khi hiệu suất thời gian thực không quan trọng, hoặc khi các khóa tổng hợp rất động và không thể định nghĩa trước. `AggregatingMergeTree` dành cho các mẫu tổng hợp cố định, đã biết.
+
+5.  **Materialized Views có phù hợp với tất cả các loại tổng hợp không?**
+    Materialized Views phù hợp nhất cho các tổng hợp có tính *cộng dồn* hoặc có thể được biểu diễn bằng trạng thái `AggregateFunction`. Điều này bao gồm `sum`, `count`, `min`, `max`, `uniqHLL12`, `avg` (sử dụng `sumState` và `countState`), v.v. Các tổng hợp yêu cầu truy cập vào tất cả các hàng thô (ví dụ: `quantile`, `median` mà không có hỗ trợ `AggregateFunction` cụ thể) hoặc các hàm cửa sổ phức tạp thường không phù hợp để tổng hợp trước trực tiếp bằng Materialized View và tốt hơn nên chạy trên dữ liệu thô hoặc một tổng hợp chi tiết hơn.

@@ -1,0 +1,259 @@
+---
+title: "eBPF & Cilium trong Kubernetes: Định tuyến thông lượng cao, Chính sách mạng & Khả năng quan sát Hubble"
+images: ['/static/images/ebpf-cilium-kubernetes-networking-observability.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["kubernetes", "ebpf", "networking", "cloud", "devops"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về eBPF & Cilium trong Kubernetes: định tuyến thông lượng cao, chính sách mạng & khả năng quan sát Hubble với kiến trúc cấp độ sản xuất và các ví dụ mã."
+---
+
+Mạng Kubernetes, vốn phụ thuộc vào `kube-proxy` và `iptables`, có những hạn chế cố hữu về khả năng mở rộng, hiệu suất và khả năng quan sát. Chi phí duyệt chuỗi `iptables`, cùng với việc `kube-proxy` sử dụng proxy userspace cho `NodePort` và `ExternalIPs`, gây ra độ trễ và sự phức tạp. eBPF, viết tắt của Berkeley Packet Filter mở rộng, mang đến một sự thay đổi mô hình bằng cách cho phép xử lý gói tin cấp kernel có thể lập trình mà không cần sửa đổi mã nguồn kernel hoặc tải các module kernel. Cilium tận dụng eBPF để cung cấp mạng hiệu suất cao, các chính sách bảo mật mạnh mẽ và khả năng quan sát sâu sắc trong Kubernetes.
+
+Hướng dẫn này trình bày chi tiết các lợi thế kiến trúc của việc triển khai Cilium với eBPF trong Kubernetes, tập trung vào việc thay thế `kube-proxy`, tối ưu hóa đường dẫn dữ liệu với XDP, thực thi các chính sách L7 và tận dụng Hubble để có khả năng hiển thị mạng toàn diện.
+
+<AudioPlayer src="/static/audio/ebpf-cilium-kubernetes-networking-observability-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Các nguyên tắc cơ bản của eBPF cho mạng Kubernetes
+
+Các chương trình eBPF thực thi trong một máy ảo được đóng hộp cát bên trong kernel Linux. Chúng có thể được gắn vào nhiều điểm hook khác nhau, bao gồm giao diện mạng (ingress/egress), các lệnh gọi hệ thống và tracepoint. Đối với mạng, tiện ích chính của eBPF xuất phát từ khả năng thao tác trực tiếp các gói mạng trong đường dẫn dữ liệu của kernel, bỏ qua các lớp ngăn xếp mạng truyền thống.
+
+Cilium sử dụng eBPF để:
+1.  **Thay thế `kube-proxy`**: Bằng cách gắn các chương trình eBPF vào các giao diện mạng, Cilium xử lý cân bằng tải Service trực tiếp trong kernel, loại bỏ chi phí `iptables` và proxy userspace của `kube-proxy`. Điều này bao gồm các Service `ClusterIP`, `NodePort`, `ExternalIPs` và `LoadBalancer`.
+2.  **Thực hiện các chính sách mạng**: Các chương trình eBPF thực thi các chính sách mạng L3/L4 và L7 với chi phí tối thiểu, trực tiếp tại các điểm ingress/egress của gói tin.
+3.  **Tăng tốc đường dẫn dữ liệu**: Các tính năng như XDP (eXpress Data Path) cho phép các chương trình eBPF xử lý gói tin ngay cả trước ngăn xếp mạng của kernel, cho phép chuyển tiếp gói tin có độ trễ cực thấp và giảm thiểu DDoS.
+4.  **Cung cấp khả năng quan sát**: Các chương trình eBPF có thể xuất siêu dữ liệu phong phú về các luồng mạng, cho phép các công cụ như Hubble cung cấp thông tin chi tiết sâu sắc về lưu lượng mạng.
+
+## Tìm hiểu sâu về kiến trúc: Đường dẫn dữ liệu eBPF của Cilium
+
+Cilium hoạt động như một plugin CNI (Container Network Interface). Khi một Pod được lên lịch, Cilium cấu hình giao diện mạng của nó và gắn các chương trình eBPF.
+
+### Thay thế `kube-proxy`
+
+Chế độ thay thế `kube-proxy` của Cilium hoạt động bằng cách cài đặt các chương trình eBPF trên các giao diện mạng của mỗi node. Các chương trình này chặn lưu lượng truy cập đến các Kubernetes Service.
+
+Đối với các Service `ClusterIP`, chương trình eBPF thực hiện NAT (Network Address Translation) và cân bằng tải trực tiếp trong kernel. Khi một Pod khởi tạo kết nối đến một IP Service, chương trình eBPF trên giao diện của node gốc sẽ ghi lại IP đích thành IP và cổng của một Pod backend, sau đó chuyển tiếp gói tin. Điều này xảy ra hoàn toàn trong kernel, tránh các chuyển đổi ngữ cảnh sang userspace.
+
+Đối với các Service `NodePort`, chương trình eBPF được gắn vào giao diện mạng của host chặn lưu lượng truy cập đến trên `NodePort`. Sau đó, nó thực hiện NAT đến một Pod backend, tương tự như `ClusterIP`, nhưng bắt nguồn từ giao diện bên ngoài của host.
+
+```bash
+# Example: Verify Cilium's kube-proxy replacement status
+# This command checks if Cilium is managing kube-proxy functionality.
+cilium status --verbose | grep KubeProxyReplacement
+
+# Expected output indicating full replacement:
+# KubeProxyReplacement:   Enabled (strict)
+```
+
+### Tích hợp XDP (eXpress Data Path)
+
+XDP cho phép các chương trình eBPF chạy ở điểm sớm nhất có thể trong đường dẫn nhận của trình điều khiển mạng, ngay cả trước khi gói tin được cấp phát cấu trúc `sk_buff` (socket buffer). Điều này cho phép xử lý gói tin hiệu suất cực cao, lý tưởng cho các trường hợp sử dụng như giảm thiểu DDoS, cân bằng tải và chuyển tiếp gói tin thông lượng cao.
+
+Cilium có thể tận dụng XDP để tối ưu hóa đường dẫn dữ liệu nhất định, đặc biệt đối với lưu lượng `NodePort` và `HostPort`, và để tăng tốc lưu lượng ingress đến các Service. Bằng cách loại bỏ các gói tin không mong muốn hoặc chuyển tiếp các gói tin mong muốn trực tiếp từ lớp XDP, có thể tiết kiệm đáng kể chu kỳ CPU.
+
+```yaml
+# Example CiliumDaemonSet configuration snippet for enabling XDP
+# This would be part of your Cilium installation YAML.
+# Note: XDP requires specific network driver support.
+apiVersion: helm.toolkit.fluxcd.io/v2beta1
+kind: HelmRelease
+metadata:
+  name: cilium
+  namespace: kube-system
+spec:
+  chart:
+    spec:
+      chart: cilium
+      version: 1.15.x # Use your desired Cilium version
+      sourceRef:
+        kind: HelmRepository
+        name: cilium
+        namespace: flux-system
+  interval: 1m
+  values:
+    kubeProxyReplacement: strict
+    bpf:
+      masquerade: true
+      tproxy: false # TPROXY is for L7, not directly XDP
+      # Enable XDP for NodePort if your kernel and NIC support it
+      # This can significantly reduce latency for NodePort traffic.
+      nodePort:
+        enabled: true
+        mode: xdp
+    # ... other Cilium configurations
+```
+
+### Cân bằng tải cấp Socket (Sockmap)
+
+Ngoài cân bằng tải cấp gói tin truyền thống, Cilium có thể sử dụng tính năng `sockmap` của eBPF để cân bằng tải cấp socket. `sockmap` cho phép các chương trình eBPF chuyển hướng các kết nối TCP *trước khi* chúng được thiết lập hoàn toàn trong ngăn xếp mạng của kernel. Điều này đặc biệt có lợi cho các Service có tốc độ kết nối cao, vì nó tránh được chi phí xử lý bắt tay TCP đầy đủ trên socket nhận ban đầu trước khi chuyển hướng.
+
+Một chương trình eBPF `sockmap` có thể chặn các lệnh gọi `connect()` hoặc `accept()` và chuyển hướng socket đến một socket cục bộ khác hoặc thậm chí là socket của một node khác, cân bằng tải các kết nối một cách hiệu quả ở giai đoạn rất sớm. Điều này khác với DNAT `iptables` của `kube-proxy`, hoạt động trên các gói tin sau khi quá trình bắt tay TCP đã bắt đầu.
+
+### Các chính sách mạng L7 không có Sidecar
+
+Việc thực thi chính sách L7 truyền thống trong Kubernetes thường dựa vào các proxy sidecar (ví dụ: Envoy trong một mesh Istio). Mặc dù mạnh mẽ, các sidecar gây ra chi phí tài nguyên (CPU, bộ nhớ) và độ trễ do bước nhảy bổ sung. Cilium có thể thực thi các chính sách L7 cho các giao thức phổ biến như HTTP, Kafka và DNS trực tiếp bằng eBPF.
+
+Cilium đạt được điều này bằng cách gắn các chương trình eBPF vào các lệnh gọi hệ thống `sendmsg()` và `recvmsg()` của socket. Các chương trình này có thể kiểm tra tải trọng lớp ứng dụng (ví dụ: tiêu đề HTTP, tên chủ đề Kafka) và thực thi các chính sách dựa trên nội dung đó. Điều này được thực hiện mà không yêu cầu một quy trình proxy userspace riêng biệt cho mỗi Pod.
+
+```yaml
+# Example: CiliumNetworkPolicy for L7 HTTP enforcement
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-http-get-to-api
+spec:
+  endpointSelector:
+    matchLabels:
+      app: backend-api
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    toPorts:
+    - ports:
+      - port: "8080"
+        protocol: TCP
+      rules:
+        http:
+        - method: "GET"
+          path: "/api/v1/data"
+        - method: "POST"
+          path: "/api/v1/submit"
+          headers:
+          - "Content-Type: application/json" # Example: enforce header presence
+```
+
+Chính sách này cho phép các Pod `frontend` thực hiện các yêu cầu `GET` đến `/api/v1/data` và các yêu cầu `POST` đến `/api/v1/submit` trên cổng `8080` của các Pod `backend-api`. Bất kỳ phương thức hoặc đường dẫn HTTP nào khác sẽ bị chương trình eBPF từ chối.
+
+## Khả năng quan sát của Hubble
+
+Hubble là một nền tảng quan sát mạng và bảo mật phân tán được xây dựng trên Cilium và eBPF. Nó cung cấp khả năng hiển thị sâu sắc về các luồng mạng, các quyết định thực thi chính sách và các yêu cầu DNS trong cụm Kubernetes.
+
+Hubble tận dụng khả năng của eBPF để xuất siêu dữ liệu luồng trực tiếp từ kernel. Dữ liệu này bao gồm IP nguồn/đích, cổng, giao thức, danh tính Pod/Service/Namespace của Kubernetes và thậm chí cả chi tiết giao thức L7 (ví dụ: phương thức HTTP, đường dẫn, mã trạng thái).
+
+### Các thành phần của Hubble
+
+*   **Hubble Agent**: Chạy dưới dạng chương trình eBPF trên mỗi node, thu thập dữ liệu luồng.
+*   **Hubble Relay**: Một dịch vụ gRPC tổng hợp dữ liệu luồng từ tất cả các Hubble Agent.
+*   **Hubble CLI**: Một công cụ dòng lệnh để truy vấn Hubble Relay.
+*   **Hubble UI**: Một giao diện đồ họa dựa trên web để trực quan hóa các luồng mạng và chính sách.
+
+### Thiết lập Hubble
+
+Hubble thường được bật trong quá trình cài đặt Cilium.
+
+```yaml
+# Example: Enabling Hubble in Cilium HelmRelease
+apiVersion: helm.toolkit.fluxcd.io/v2beta1
+kind: HelmRelease
+metadata:
+  name: cilium
+  namespace: kube-system
+spec:
+  chart:
+    spec:
+      chart: cilium
+      version: 1.15.x
+      sourceRef:
+        kind: HelmRepository
+        name: cilium
+        namespace: flux-system
+  interval: 1m
+  values:
+    hubble:
+      enabled: true
+      listenAddress: ":4244" # Default gRPC port for Hubble Relay
+      ui:
+        enabled: true
+        service:
+          type: ClusterIP # Or LoadBalancer for external access
+    # ... other Cilium configurations
+```
+
+Sau khi cài đặt, bạn có thể truy cập Hubble UI thông qua port-forwarding hoặc một Service `LoadBalancer`.
+
+```bash
+# Port-forward to Hubble UI
+kubectl port-forward -n kube-system svc/hubble-ui 8080:80
+
+# Then open http://localhost:8080 in your browser.
+
+# Using Hubble CLI to observe flows
+# First, install the Hubble CLI:
+# curl -L --remote-name-all https://github.com/cilium/hubble/releases/latest/download/hubble-linux-amd64.tar.gz{,.sha256sum}
+# sha256sum --check hubble-linux-amd64.tar.gz.sha256sum
+# sudo tar -C /usr/local/bin -xvf hubble-linux-amd64.tar.gz
+# rm hubble-linux-amd64.tar.gz{,.sha256sum}
+
+# Then, connect to Hubble Relay and observe flows:
+hubble observe
+
+# Filter by namespace and HTTP status code
+hubble observe --namespace default --protocol http --http-status 2xx
+
+# Observe DNS queries
+hubble observe --type dns
+```
+
+Hubble cung cấp khả năng hiển thị độ trễ ở mức micro giây, hiển thị chính xác nơi các gói tin bị mất hoặc bị trì hoãn, và các chính sách mạng nào đang được thực thi. Điều này vô cùng quý giá để gỡ lỗi các tương tác microservice phức tạp.
+
+## So sánh kiến trúc: `kube-proxy` so với Cilium eBPF
+
+| Tính năng | `kube-proxy` (chế độ `iptables`) | Cilium (chế độ eBPF) |
+|---|---|---|
+| **Cân bằng tải** | Các quy tắc DNAT `iptables`, proxy userspace cho `NodePort` | Các chương trình eBPF của Kernel, ghi lại gói tin trực tiếp |
+| **Hiệu suất** | Chi phí duyệt chuỗi `iptables`, chuyển đổi ngữ cảnh userspace | Kernel-native, chi phí tối thiểu, tăng tốc XDP |
+| **Khả năng mở rộng** | Bùng nổ quy tắc `iptables` với nhiều Service/Endpoint | Mở rộng tốt với các bản đồ eBPF, tra cứu thời gian không đổi |
+| **Các chính sách mạng** | Chỉ L3/L4, các quy tắc `iptables` | L3/L4 và L7 (HTTP, Kafka, DNS) với eBPF |
+| **Khả năng quan sát** | Hạn chế, dựa vào nhật ký `conntrack` và `iptables` | Khả năng hiển thị luồng sâu, thời gian thực với Hubble (L3-L7) |
+| **Sử dụng tài nguyên** | Daemon `kube-proxy`, chi phí kernel `iptables` | Daemon Cilium agent, các chương trình eBPF trong kernel |
+| **Bỏ qua Kernel** | Không | Có, với XDP cho các trường hợp sử dụng cụ thể |
+| **Bảo mật** | Tường lửa L3/L4 cơ bản | Thực thi chính sách L3/L4/L7 nâng cao, dựa trên danh tính |
+
+## Những vấn đề và cách khắc phục sự cố trong môi trường sản xuất
+
+1.  **Khả năng tương thích phiên bản Kernel**: Các tính năng eBPF phát triển nhanh chóng. Đảm bảo phiên bản kernel của bạn (thường là 4.9+ cho eBPF cơ bản, 5.x+ cho các tính năng nâng cao như `sockmap`, XDP) tương thích với phiên bản Cilium của bạn.
+    *   **Triệu chứng**: Các pod Cilium không khởi động được, `cilium status` hiển thị lỗi liên quan đến việc tải chương trình eBPF.
+    *   **Cách khắc phục**: Kiểm tra ghi chú phát hành của Cilium để biết các yêu cầu kernel tối thiểu. Nâng cấp kernel nếu cần, hoặc sử dụng phiên bản Cilium cũ hơn nếu không thể nâng cấp kernel.
+    *   **Lệnh**: `uname -r` để kiểm tra phiên bản kernel.
+
+2.  **Hỗ trợ trình điều khiển giao diện mạng cho XDP**: XDP yêu cầu các trình điều khiển card mạng cụ thể hỗ trợ API XDP. Không phải tất cả các trình điều khiển đều có khả năng XDP.
+    *   **Triệu chứng**: Các tính năng liên quan đến XDP trong Cilium (ví dụ: `nodePort.mode: xdp`) không kích hoạt hoặc gây ra sự cố mạng.
+    *   **Cách khắc phục**: Xác minh hỗ trợ trình điều khiển. `ethtool -i <interface>` có thể hiển thị thông tin trình điều khiển. Tham khảo nhật ký `cilium-health` để biết các lỗi liên quan đến XDP. Nếu không được hỗ trợ, hãy quay lại chế độ `generic` hoặc `native` XDP nếu có, hoặc tắt XDP cho giao diện đó.
+
+3.  **Xung đột `kube-proxy`**: Nếu `kube-proxy` không bị tắt hoặc xóa hoàn toàn, nó có thể xung đột với cân bằng tải Service dựa trên eBPF của Cilium.
+    *   **Triệu chứng**: Kết nối không liên tục đến các Service, cân bằng tải không chính xác, các quy tắc `iptables` xung đột với Cilium.
+    *   **Cách khắc phục**: Đảm bảo `kube-proxy` bị tắt hoặc xóa hoàn toàn khỏi cụm của bạn. Đối với `kops`, `kubeadm` hoặc các cụm được quản lý bởi nhà cung cấp đám mây, có các cờ hoặc cấu hình cụ thể để đạt được điều này.
+        *   Đối với `kubeadm`: `kubeadm init --config=kubeadm-config.yaml` với `kubeProxy.disabled: true` trong `KubeProxyConfiguration`.
+        *   Đối với `kops`: Đặt `kubeProxy.enabled: false` trong thông số kỹ thuật cụm của bạn.
+        *   Đối với các cụm hiện có: Mở rộng triển khai `kube-proxy` xuống 0 bản sao và đảm bảo không có `DaemonSet` nào tạo lại nó.
+
+4.  **Cấu hình sai chính sách L7**: Các chính sách L7 không chính xác có thể dẫn đến các sự cố kết nối ứng dụng khó gỡ lỗi nếu không có Hubble.
+    *   **Triệu chứng**: Các ứng dụng không thể giao tiếp, lỗi HTTP 403, đặt lại kết nối Kafka, nhưng kết nối L3/L4 dường như ổn.
+    *   **Cách khắc phục**: Sử dụng `hubble observe --protocol http` (hoặc `kafka`, `dns`) để xem các quyết định thực thi chính sách. Tìm các luồng `VERDICT: DENIED` và `PolicyName` liên quan. Điều chỉnh các quy tắc `CiliumNetworkPolicy` cho phù hợp. Đảm bảo `toPorts` và `rules` khớp với kỳ vọng của ứng dụng.
+
+5.  **Cạn kiệt bản đồ eBPF**: Trong các cụm rất lớn với nhiều Service, Endpoint và chính sách, các bản đồ eBPF có thể đạt đến giới hạn kích thước của chúng.
+    *   **Triệu chứng**: Các chính sách hoặc Service mới không áp dụng được, nhật ký Cilium agent hiển thị lỗi về bản đồ eBPF đầy.
+    *   **Cách khắc phục**: Cilium có các cơ chế nội bộ để quản lý kích thước bản đồ. Đảm bảo bạn đang sử dụng phiên bản Cilium gần đây. Cân nhắc tối ưu hóa các chính sách mạng của bạn để giảm độ phức tạp. Đối với các trường hợp cực đoan, hãy điều chỉnh cấu hình `bpf.map.size` của Cilium (thận trọng, vì điều này tiêu tốn bộ nhớ kernel).
+
+## Các câu hỏi thường gặp
+
+1.  **Cilium có thể thay thế hoàn toàn `kube-proxy` không?**
+    Có, Cilium có thể thay thế hoàn toàn `kube-proxy` cho các Service `ClusterIP`, `NodePort`, `ExternalIPs` và `LoadBalancer` bằng cách triển khai tất cả chức năng cân bằng tải và NAT trực tiếp trong kernel bằng eBPF. Đây là mô hình triển khai được khuyến nghị để đạt hiệu suất và khả năng quan sát.
+
+2.  **Các yêu cầu kernel tối thiểu cho các tính năng eBPF nâng cao của Cilium là gì?**
+    Đối với chức năng eBPF cơ bản và thay thế `kube-proxy`, kernel Linux 4.9+ thường là đủ. Đối với các tính năng nâng cao như XDP, `sockmap` và một số thực thi chính sách L7, kernel 5.x hoặc mới hơn (ví dụ: 5.4+ cho `sockmap`, 5.10+ cho các tính năng XDP cụ thể) thường được yêu cầu hoặc rất khuyến nghị để đạt hiệu suất và độ ổn định tối ưu. Luôn tham khảo ghi chú phát hành của Cilium để biết khả năng tương thích phiên bản kernel chính xác.
+
+3.  **Cilium xử lý các chính sách L7 mà không cần proxy sidecar như thế nào?**
+    Cilium gắn các chương trình eBPF vào các lệnh gọi hệ thống `sendmsg()` và `recvmsg()` của các socket ứng dụng. Các chương trình này sau đó có thể kiểm tra tải trọng lớp ứng dụng (ví dụ: tiêu đề HTTP, tên chủ đề Kafka) và thực thi các chính sách dựa trên nội dung, tất cả trong ngữ cảnh kernel. Điều này tránh được chi phí tài nguyên và độ trễ do các proxy sidecar userspace gây ra.
+
+4.  **Tác động hiệu suất của việc bật Hubble là gì?**
+    Việc thu thập dữ liệu của Hubble dựa vào các chương trình eBPF xuất siêu dữ liệu luồng từ kernel. Quá trình này được tối ưu hóa cao và có tác động hiệu suất tối thiểu đến mặt phẳng dữ liệu. Mức tiêu thụ tài nguyên chính đến từ các thành phần Hubble Relay và UI, tổng hợp và trực quan hóa dữ liệu. Đối với các cụm có lưu lượng truy cập cao, hãy đảm bảo Hubble Relay có đủ tài nguyên CPU và bộ nhớ.
+
+5.  **Cilium có tương thích với các plugin CNI khác không?**
+    Không, Cilium tự nó là một plugin CNI và được thiết kế để trở thành CNI duy nhất trong một cụm Kubernetes. Nó quản lý tất cả các khía cạnh của mạng Pod, quản lý địa chỉ IP và thực thi chính sách mạng. Cố gắng chạy Cilium cùng với một CNI khác sẽ dẫn đến xung đột và mạng không hoạt động.

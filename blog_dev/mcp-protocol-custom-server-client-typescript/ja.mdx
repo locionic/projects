@@ -1,0 +1,499 @@
+---
+title: "TypeScriptでカスタムMCPサーバーとクライアントを構築する：ツール、リソース、プロンプトアーキテクチャ"
+images: ['/static/images/mcp-protocol-custom-server-client-typescript.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["ai", "mcp", "typescript", "architecture", "llm"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "TypeScriptでカスタムMCPサーバーとクライアントを構築するためのツール、リソース、プロンプトアーキテクチャを、本番環境レベルのアーキテクチャとコード例で網羅的に解説するガイドです。"
+---
+
+Model Context Protocol (MCP) は、大規模言語モデル（LLM）が外部ツールと連携し、動的リソースにアクセスし、構造化されたコンテキストを受け取るための標準化されたインターフェースを定義します。このドキュメントでは、TypeScript を使用してカスタム MCP サーバーとクライアントを構築する方法を、`@modelcontextprotocol/sdk`、トランスポートメカニズム、セキュリティ、プロンプトアーキテクチャに焦点を当てて詳しく説明します。
+
+<AudioPlayer src="/static/audio/mcp-protocol-custom-server-client-typescript-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+## MCP トランスポートの理解: Stdio vs. SSE
+
+MCP は複数のトランスポート層をサポートしています。カスタム実装の主要なメカニズムは、Stdio と Server-Sent Events (SSE) です。それぞれに明確な利点と運用上の特性があります。
+
+### Stdio トランスポート
+
+Stdio（標準入出力）は、同期的なリクエスト/レスポンスメカニズムです。ローカル実行環境、CLI ツール、または単一の永続的なプロセスが LLM との対話を管理するシナリオに最適です。クライアントは `stdin` 経由で JSON-RPC リクエストを送信し、サーバーは `stdout` 経由で応答します。
+
+**利点:**
+*   ローカル開発とデバッグがシンプル。
+*   単発の対話におけるオーバーヘッドが低い。
+*   プロセス実行モデルとの直接統合。
+
+**欠点:**
+*   同時リクエストに対するスケーラビリティが限られている。
+*   大規模なオーケストレーションなしでは、Web ベースまたは分散システムには不向き。
+*   プロセスライフサイクル管理のため、エラー処理がより複雑になる可能性がある。
+
+### SSE トランスポート
+
+SSE（Server-Sent Events）は、HTTP 経由で単方向のイベントストリーミングメカニズムを提供します。Web ベースのクライアント、長期間の接続、継続的な更新や非同期ツール実行を必要とするシナリオに適しています。クライアントは HTTP 接続を確立し、サーバーがイベントをプッシュします。
+
+**利点:**
+*   複数の同時クライアントに対してスケーラブル。
+*   Web 環境のネイティブサポート。
+*   非同期イベント配信。ストリーミングツール出力やリソース更新に適している。
+*   HTTP に固有の堅牢なエラー処理と再接続メカニズム。
+
+**欠点:**
+*   HTTP サーバーインフラストラクチャが必要。
+*   基本的なローカルユースケースの場合、Stdio よりもセットアップが複雑。
+*   単方向。クライアントからサーバーへの通信には、別途 HTTP リクエスト（例: POST）が必要。
+
+## `@modelcontextprotocol/sdk` を使用したカスタム MCP サーバーの構築
+
+`@modelcontextprotocol/sdk` は、TypeScript で MCP サーバーとクライアントを実装するための基本的なコンポーネントを提供します。ここでは、ツールと動的リソースを公開するサーバーの構築に焦点を当てます。
+
+### コアサーバーアーキテクチャ
+
+MCP サーバーは通常、以下を含みます。
+1.  **トランスポート層:** 受信リクエストと送信レスポンスの処理（Stdio または SSE）。
+2.  **ツールハンドラー:** LLM から要求された特定の操作を実行する関数。
+3.  **リソースプロバイダー:** 動的データまたはスキーマを LLM に公開するメカニズム。
+4.  **セキュリティと検証:** リクエストが認証され、入力がサニタイズされていることを確認。
+
+基本的な SSE ベースの MCP サーバーを構築してみましょう。
+
+```typescript
+// src/server.ts
+import {
+  createMCPSSEServer,
+  MCPTool,
+  MCPResource,
+  MCPContext,
+  MCPError,
+  MCPErrorCode,
+} from '@modelcontextprotocol/sdk';
+import express from 'express';
+import bodyParser from 'body-parser';
+import cors from 'cors';
+import { z } from 'zod'; // For schema validation
+
+// --- 1. Define Tool Handlers ---
+// Tools are functions the LLM can call. They must have a schema for arguments.
+
+// Tool: `searchWeb`
+const searchWebArgsSchema = z.object({
+  query: z.string().describe('The search query to execute.'),
+  numResults: z.number().int().min(1).max(10).optional().default(3).describe('Number of search results to return.'),
+});
+
+const searchWebTool: MCPTool<typeof searchWebArgsSchema> = {
+  name: 'searchWeb',
+  description: 'Performs a web search and returns relevant results.',
+  argsSchema: searchWebArgsSchema,
+  handler: async (args, context: MCPContext) => {
+    console.log(`[Tool] searchWeb called with query: "${args.query}", results: ${args.numResults}`);
+    // In a real scenario, this would call an external search API.
+    // For demonstration, we return mock data.
+    const mockResults = [
+      { title: `Result 1 for "${args.query}"`, url: `https://example.com/search/${args.query}/1` },
+      { title: `Result 2 for "${args.query}"`, url: `https://example.com/search/${args.query}/2` },
+      { title: `Result 3 for "${args.query}"`, url: `https://example.com/search/${args.query}/3` },
+    ];
+    return mockResults.slice(0, args.numResults);
+  },
+};
+
+// Tool: `createFile`
+const createFileArgsSchema = z.object({
+  path: z.string().describe('The full path including filename where the file should be created.'),
+  content: z.string().describe('The content to write into the file.'),
+  overwrite: z.boolean().optional().default(false).describe('Whether to overwrite the file if it already exists.'),
+});
+
+const createFileTool: MCPTool<typeof createFileArgsSchema> = {
+  name: 'createFile',
+  description: 'Creates a new file with specified content at a given path.',
+  argsSchema: createFileArgsSchema,
+  handler: async (args, context: MCPContext) => {
+    console.log(`[Tool] createFile called: ${args.path}, overwrite: ${args.overwrite}`);
+    // Simulate file system interaction. In production, use `fs.promises`.
+    if (!args.overwrite && args.path.includes('existing-file.txt')) { // Mock existing file
+      throw new MCPError(MCPErrorCode.RESOURCE_CONFLICT, `File already exists at ${args.path}. Set overwrite to true.`);
+    }
+    return { success: true, message: `File '${args.path}' created/updated.` };
+  },
+};
+
+// --- 2. Define Dynamic Resources ---
+// Resources provide structured data or schemas that the LLM can query.
+
+// Resource: `projectFiles`
+const projectFilesResource: MCPResource = {
+  name: 'projectFiles',
+  description: 'Lists files and directories within the current project context.',
+  schema: {
+    type: 'array',
+    items: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Name of the file or directory.' },
+        type: { type: 'string', enum: ['file', 'directory'], description: 'Type of the entry.' },
+        size: { type: 'number', description: 'Size in bytes (for files).' },
+        lastModified: { type: 'string', format: 'date-time', description: 'Last modification timestamp.' },
+      },
+      required: ['name', 'type'],
+    },
+  },
+  // The `get` method is called when the LLM requests this resource.
+  get: async (context: MCPContext) => {
+    console.log('[Resource] projectFiles requested.');
+    // In a real application, this would scan the project directory.
+    return [
+      { name: 'src/', type: 'directory', lastModified: new Date().toISOString() },
+      { name: 'src/server.ts', type: 'file', size: 4096, lastModified: new Date().toISOString() },
+      { name: 'package.json', type: 'file', size: 1024, lastModified: new Date().toISOString() },
+      { name: 'README.md', type: 'file', size: 2048, lastModified: new Date().toISOString() },
+    ];
+  },
+};
+
+// --- 3. Initialize MCP SSE Server ---
+const app = express();
+app.use(cors()); // Enable CORS for web clients
+app.use(bodyParser.json()); // Parse JSON request bodies
+
+const mcpServer = createMCPSSEServer({
+  tools: [searchWebTool, createFileTool],
+  resources: [projectFilesResource],
+  // Optional: Implement an authentication/authorization middleware
+  // This example uses a simple token check.
+  authenticate: async (token: string | undefined) => {
+    if (token === 'my-secret-api-key') {
+      return { userId: 'dev-user', roles: ['admin'] }; // Return user context
+    }
+    throw new MCPError(MCPErrorCode.UNAUTHENTICATED, 'Invalid or missing authentication token.');
+  },
+  // Optional: Custom error handler for tool/resource execution
+  onError: (error: Error) => {
+    console.error('MCP Server Error:', error);
+    // You might want to log this to a monitoring system.
+  },
+});
+
+// Mount the MCP server routes
+app.use('/mcp', mcpServer.router);
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`MCP SSE Server listening on http://localhost:${PORT}/mcp`);
+  console.log(`Tools available: ${mcpServer.getToolNames().join(', ')}`);
+  console.log(`Resources available: ${mcpServer.getResourceNames().join(', ')}`);
+});
+
+// To run this:
+// 1. npm init -y
+// 2. npm install @modelcontextprotocol/sdk express body-parser cors zod
+// 3. ts-node src/server.ts (or compile and run with node)
+```
+
+### ツールハンドラーの公開
+
+ツールハンドラーは、LLM から提供された引数に基づいてロジックを実行する非同期関数です。`argsSchema` プロパティは、通常 `zod` を使用して定義され、入力検証と LLM がツールのパラメーターを理解するために不可欠です。
+
+```typescript
+// Example tool handler structure
+const myTool: MCPTool<typeof myArgsSchema> = {
+  name: 'myTool',
+  description: 'Does something useful.',
+  argsSchema: myArgsSchema,
+  handler: async (args, context) => {
+    // `args` is type-safe due to `myArgsSchema`
+    // `context` contains information about the current MCP session (e.g., authentication)
+    console.log('Tool called with:', args);
+    // Perform operations, e.g., API calls, file system access
+    return { status: 'success', data: 'some result' };
+  },
+};
+```
+
+### 動的リソーススキーマの定義
+
+リソースにより、LLM は動的情報をクエリできます。`schema` プロパティは、`get` メソッドによって返されるデータの構造を記述します。このスキーマは LLM に提供され、LLM がリソースを効果的に理解し、クエリできるようにします。
+
+```typescript
+// Example resource structure
+const myResource: MCPResource = {
+  name: 'myResource',
+  description: 'Provides dynamic data.',
+  schema: {
+    type: 'object',
+    properties: {
+      id: { type: 'string' },
+      value: { type: 'number' },
+    },
+    required: ['id', 'value'],
+  },
+  get: async (context) => {
+    // Fetch or generate dynamic data
+    return [{ id: 'item1', value: 123 }, { id: 'item2', value: 456 }];
+  },
+};
+```
+
+## LLM クライアントとの統合: Claude Code、Cursor、およびカスタムエージェント
+
+MCP の強みは、その相互運用性にあります。
+
+### Claude Code と Cursor の統合
+
+Anthropic の Claude Code と Cursor IDE は、MCP サーバーを利用するように設計されています。MCP サーバー（特に SSE サーバー）を起動すると、これらのクライアントはエンドポイントに接続するように構成できます。公開されたツールとリソースを自動的に検出し、IDE コンテキスト内で LLM が使用できるようにします。
+
+たとえば、Cursor では、設定で MCP エンドポイントを `http://localhost:3000/mcp` に設定できます。IDE は MCP クライアントとして機能し、LLM リクエストをサーバーに転送し、結果を表示します。
+
+### カスタムエージェントランタイム
+
+カスタムエージェントランタイムには、`@modelcontextprotocol/sdk` クライアントを使用します。
+
+```typescript
+// src/client.ts
+import { createMCPClient, MCPClientOptions } from '@modelcontextprotocol/sdk';
+
+async function runMCPClient() {
+  const clientOptions: MCPClientOptions = {
+    // For SSE, specify the base URL of your MCP server
+    // For Stdio, you'd pass `process.stdin` and `process.stdout`
+    transport: {
+      type: 'sse',
+      baseUrl: 'http://localhost:3000/mcp',
+      headers: {
+        'Authorization': 'Bearer my-secret-api-key', // Include authentication token
+      },
+    },
+    // Optional: Logger for debugging
+    logger: console,
+  };
+
+  const client = createMCPClient(clientOptions);
+
+  try {
+    // --- 1. Get available tools and resources ---
+    const tools = await client.getTools();
+    console.log('Available Tools:', tools.map(t => t.name));
+
+    const resources = await client.getResources();
+    console.log('Available Resources:', resources.map(r => r.name));
+
+    // --- 2. Call a tool ---
+    console.log('\nCalling searchWeb tool...');
+    const searchResults = await client.callTool('searchWeb', { query: 'MCP protocol best practices', numResults: 2 });
+    console.log('Search Results:', searchResults);
+
+    // --- 3. Get a resource ---
+    console.log('\nGetting projectFiles resource...');
+    const projectFiles = await client.getResource('projectFiles');
+    console.log('Project Files:', projectFiles);
+
+    // --- 4. Handle errors ---
+    console.log('\nCalling createFile tool with conflict...');
+    try {
+      await client.callTool('createFile', { path: 'existing-file.txt', content: 'new content' });
+    } catch (error: any) {
+      console.error('Error calling createFile:', error.message);
+    }
+
+    console.log('\nCalling createFile tool with overwrite...');
+    const createResult = await client.callTool('createFile', { path: 'new-file.txt', content: 'Hello, MCP!', overwrite: true });
+    console.log('Create File Result:', createResult);
+
+  } catch (error) {
+    console.error('MCP Client Error:', error);
+  }
+}
+
+runMCPClient();
+
+// To run this:
+// 1. Ensure the server (src/server.ts) is running.
+// 2. npm install @modelcontextprotocol/sdk
+// 3. ts-node src/client.ts
+```
+
+## コンテキストプロンプトテンプレート
+
+MCP はプロンプトテンプレートを直接定義しませんが、LLM が効果的なプロンプトを構築するために必要な構造化情報を提供します。LLM は以下を受け取ります。
+*   **ツールスキーマ:** 各ツールの JSON スキーマ定義。`name`、`description`、`argsSchema` を含む。
+*   **リソーススキーマ:** 各リソースの JSON スキーマ定義。`name`、`description`、およびそのデータの構造を含む。
+*   **リソースデータ:** リソースが LLM によって `get` されたときに返される実際のデータ。
+
+MCP を使用する LLM の適切に設計されたプロンプトテンプレートは、次のようになります（概念的、LLM 固有の構文）。
+
+```
+You are an AI assistant with access to the following tools and resources:
+
+<tools>
+{{#each tools}}
+<tool_code>
+{
+  "name": "{{this.name}}",
+  "description": "{{this.description}}",
+  "parameters": {{json this.argsSchema}}
+}
+</tool_code>
+{{/each}}
+</tools>
+
+<resources>
+{{#each resources}}
+<resource_code>
+{
+  "name": "{{this.name}}",
+  "description": "{{this.description}}",
+  "schema": {{json this.schema}}
+}
+</resource_code>
+{{/each}}
+</resources>
+
+<context>
+{{#if currentResourceData}}
+<resource_data name="{{currentResourceData.name}}">
+{{json currentResourceData.data}}
+</resource_data>
+{{/if}}
+</context>
+
+Your goal is to assist the user by leveraging these capabilities.
+If you need to perform an action, use the `<call_tool>` tag.
+If you need to retrieve information, use the `<get_resource>` tag.
+If you have retrieved information from a resource, it will appear in the `<context>` block.
+
+User: {{user_query}}
+```
+
+このテンプレートは、MCP サーバーの機能を動的に注入し、LLM が利用可能なアクションとデータ構造について推論できるようにします。
+
+## セキュリティ境界と入力サニタイズ
+
+LLM にツールを公開する場合、セキュリティは最も重要です。
+
+1.  **認証と認可:**
+    *   **認証:** API キー、OAuth トークン、または JWT を使用してクライアントの ID を検証します。`createMCPSSEServer` の `authenticate` 関数がそのエントリポイントです。
+    *   **認可:** 認証されたユーザーのロールまたは権限に基づいて、特定のツールまたはリソースへのアクセスを制限します。このロジックは、ツール/リソースの `handler` またはミドルウェア内に配置されます。
+
+    ```typescript
+    // Example: Authorization within a tool handler
+    const restrictedTool: MCPTool<typeof someSchema> = {
+      name: 'restrictedAction',
+      description: 'Only for admins.',
+      argsSchema: someSchema,
+      handler: async (args, context: MCPContext) => {
+        if (!context.user || !context.user.roles.includes('admin')) {
+          throw new MCPError(MCPErrorCode.PERMISSION_DENIED, 'Only administrators can perform this action.');
+        }
+        // ... execute admin action
+      },
+    };
+    ```
+
+2.  **入力検証（スキーマ強制）:**
+    *   ツールの `argsSchema` とリソースの `schema` は重要です。`@modelcontextprotocol/sdk` は、これらのスキーマに対して受信引数を自動的に検証します。
+    *   厳密な型、範囲、パターンを定義するために、`zod` や `Joi` のような堅牢なスキーマ検証ライブラリを使用します。
+
+3.  **出力サニタイズ:**
+    *   ツールまたはリソースによって返されるデータに、明示的に意図され、許可されていない限り、機密情報が含まれていないことを確認します。
+    *   不正な当事者に公開されたり、意図しない方法で使用されたりする可能性がある場合は、LLM に返す前にデータをフィルタリングまたは編集します。
+
+4.  **最小特権:**
+    *   必要なアクションのみを実行するようにツールを設計します。何でもできる「神」ツールを作成することは避けてください。
+    *   ツールが外部システム（データベース、API、ファイルシステム）と連携する場合、サーバープロセスに付与される基盤となる資格情報または権限が可能な限り制限されていることを確認します。
+
+5.  **レート制限と不正使用防止:**
+    *   サービス拒否攻撃や、誤動作するエージェントによる過剰なリソース消費を防ぐために、MCP サーバーのエンドポイントにレート制限を実装します。
+    *   異常なパターンがないかツール使用状況を監視します。
+
+## 本番環境での落とし穴とトラブルシューティング
+
+### 1. `MCPError: UNAUTHENTICATED` または `PERMISSION_DENIED`
+
+**障害モード:** クライアントが認証または権限エラーを受け取る。
+**修正:**
+*   **認証:** クライアントリクエストの `Authorization` ヘッダーが、`authenticate` 関数で予期されるトークンと一致することを確認します。トークンが正しく渡されていることを確認します。
+*   **認可:** ツール/リソースハンドラー内の `context.user` オブジェクトを確認します。ユーザーが要求されたアクションに必要なロールまたは権限を持っていることを確認します。`authenticate` とハンドラー関数のロジックをデバッグします。
+
+### 2. `MCPError: INVALID_ARGUMENTS`
+
+**障害モード:** 引数の不一致によりツール呼び出しが失敗する。
+**修正:**
+*   LLM が `argsSchema` に準拠しない引数を提供しました。
+*   **サーバー側:** `zod` スキーマ定義を再確認します。必要なフィールドはすべて存在しますか？型は正しいですか（文字列、数値、ブール値）？`min`/`max` の制約に違反していませんか？
+*   **クライアント側（LLM）:** カスタムエージェントを構築している場合、エージェントのツール呼び出しロジックがスキーマに従って引数を正しく抽出し、フォーマットしていることを確認します。IDE を使用している場合、LLM が引数を幻覚している可能性があります。プロンプトまたはツール記述を改善してください。
+
+### 3. `MCPError: TOOL_EXECUTION_FAILED` または `RESOURCE_GET_FAILED`
+
+**障害モード:** ツール/リソースハンドラーロジックが未処理の例外をスローする。
+**修正:**
+*   **サーバー側:** ツールおよびリソースハンドラー内に堅牢な `try...catch` ブロックを実装します。特定のエラー（例: 外部 API からのネットワークエラー、ファイルシステムエラー）をキャッチし、意味のある `MCPError` コードまたはメッセージを返します。
+*   **ロギング:** `createMCPSSEServer` の `onError` コールバックがこれらのエラーを効果的にログに記録していることを確認します。構造化ロガーを使用します。
+
+### 4. SSE 接続の切断またはイベントなし
+
+**障害モード:** クライアントがイベントを受信しない、または接続が不安定。
+**修正:**
+*   **CORS:** クライアントが異なるオリジンにある場合、Express サーバーで `cors()` ミドルウェアが有効になっていることを確認します。
+*   **プロキシ/ファイアウォール:** プロキシまたはファイアウォールが、長期間の HTTP 接続または SSE イベントストリームを妨害していないか確認します。
+*   **サーバーハートビート:** `@modelcontextprotocol/sdk` は SSE ハートビートを処理しますが、サーバーが非アクティブと見なされてロードバランサーまたはコンテナオーケストレーターによって積極的に終了されていないことを確認します。
+*   **クライアント再接続:** クライアント側の SSE 実装（または SDK のクライアント）に堅牢な自動再接続ロジックがあることを確認します。
+
+### 5. Stdio でのパフォーマンス低下
+
+**障害モード:** Stdio トランスポートでの応答の遅延またはブロッキング動作。
+**修正:**
+*   Stdio はプロセスごとに本質的に同期です。並行性が必要な場合は、複数のサーバープロセスを管理するか（例: PM2 のようなプロセス管理ツールを使用）、SSE に切り替える必要があります。
+*   ツールハンドラーが真に非同期であり、イベントループをブロックしないことを確認します。
+
+## アーキテクチャとトランスポートの比較
+
+| 機能             | Stdio トランスポート                               | SSE トランスポート                                       |
+|---------------------|-----------------------------------------------|-----------------------------------------------------|
+| **通信**   | 双方向（リクエスト/レスポンス）              | 単方向（サーバーからクライアントへのストリーム）            |
+| **プロトコル**        | stdin/stdout 経由の JSON-RPC                    | HTTP/1.1 (event-stream)                             |
+| **並行性**     | プロセスごとに単一のリクエスト                    | 複数の同時クライアント                         |
+| **スケーラビリティ**     | 低（プロセス管理が必要）             | 高（標準的な HTTP サーバーのスケーリング）                 |
+| **ユースケース**        | ローカル CLI ツール、単一プロセスエージェント        | Web クライアント、分散エージェント、ストリーミング更新  |
+| **セットアップの複雑さ**| 低（基本的なプロセス I/O）                       | 中（HTTP サーバー、ルーティング、CORS）               |
+| **エラー処理**  | プロセス終了コード、JSON-RPC エラー           | HTTP ステータスコード、SSE イベントエラー、クライアント再接続 |
+| **認証**  | 帯域外（例: 環境変数）     | HTTP ヘッダー（ベアラートークン、クッキー）               |
+| **ネットワークオーバーヘッド**| 低（生の JSON）                                | 中（HTTP ヘッダー、フレーミング）                    |
+
+## よくある質問
+
+### 1. Anthropic の Claude 以外の LLM でも MCP を使用できますか？
+
+はい。Anthropic が MCP を開拓しましたが、このプロトコルはオープンであり、相互運用性のために設計されています。ツール/リソース定義の JSON スキーマを解析でき、HTTP リクエスト（SSE の場合）またはプロセス I/O（Stdio の場合）を管理できる LLM またはエージェントランタイムであれば、MCP サーバーと統合できます。MCP が提供するスキーマを効果的に利用するには、LLM のプロンプトエンジニアリングを適応させる必要があります。
+
+### 2. 長時間実行されるツール実行をどのように処理しますか？
+
+長時間実行されるツールの場合、`handler` は操作が開始されたことを示すステータスを迅速に返し、その後、別のメカニズム（例: Webhook、ポーリング、または別の SSE チャネル）を使用して、完了または進行状況をクライアント/LLM に通知するのが理想的です。現在の MCP 仕様は、ハンドラーの戻り値が最終結果となる同期ツール実行を主にサポートしています。真に非同期で長時間実行されるタスクの場合、以下を検討してください。
+    *   タスクを開始し、`job_id` を返すツール。
+    *   LLM がポーリングできる別のツール `getJobStatus(job_id)`。
+    *   または、クライアントがサポートしている場合は、別の SSE ストリームを介して更新をプッシュします。
+
+### 3. `MCPErrorCode` 以外のカスタムエラーコードを定義することは可能ですか？
+
+`MCPErrorCode` 列挙型は標準的なエラーセットを提供します。技術的には `MCPError` 内でカスタムエラーメッセージを返すことができますが、プロトコルの一貫性を維持するためには、内部アプリケーションエラーを最も近い `MCPErrorCode` にマッピングするのが一般的にベストプラクティスです。真に固有のエラー条件が発生した場合は、詳細なメッセージとともに `MCPErrorCode.INTERNAL_ERROR` を使用できます。
+
+### 4. MCP セッション内の複数のツール呼び出し間で状態をどのように管理しますか？
+
+ツールおよびリソースハンドラーに渡される `MCPContext` オブジェクトは、この目的のために設計されています。セッション固有のデータをこれにアタッチできます。SSE の場合、サーバーはクライアントごとに接続を維持するため、その接続に状態を関連付けることができます。Stdio の場合、プロセスが短命であれば、状態管理は通常外部で行われるか、後続のリクエストで明示的に渡されます。たとえば、`context` に `session_id` を保存し、それを使用してバックエンドストアからデータを取得することができます。
+
+### 5. MCP サーバーの API をバージョン管理するためのベストプラクティスは何ですか？
+
+MCP サーバーのツールとリソースは、他の API と同様に扱います。
+*   **スキーマの進化:** 後方互換性を維持するために、スキーマに加算的な変更（例: オプションフィールドの追加）を加えます。
+*   **新しいツール/リソース:** 既存のクライアントを壊すことなく、新しいツールまたはリソースを導入します。
+*   **破壊的変更:** 破壊的変更（例: ツールの名前変更、必須フィールドの削除）の場合、以下を検討します。
+    *   異なるベースパス（例: `/mcp/v1`、`/mcp/v2`）にサーバーの新しいバージョンをデプロイする。
+    *   コンテンツネゴシエーションを使用する（MCP ではあまり一般的ではない）。
+    *   明確な非推奨警告を提供する。

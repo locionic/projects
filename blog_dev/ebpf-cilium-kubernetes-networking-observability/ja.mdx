@@ -1,0 +1,259 @@
+---
+title: "KubernetesにおけるeBPFとCilium: 高スループットルーティング、ネットワークポリシー、Hubble可観測性"
+images: ['/static/images/ebpf-cilium-kubernetes-networking-observability.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["kubernetes", "ebpf", "networking", "cloud", "devops"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "KubernetesにおけるeBPFとCiliumについて、高スループットルーティング、ネットワークポリシー、Hubble可観測性を本番環境レベルのアーキテクチャとコード例で網羅的に解説するガイド。"
+---
+
+Kubernetesのネットワーキングは、従来`kube-proxy`と`iptables`に依存していましたが、スケーラビリティ、パフォーマンス、可観測性において本質的な限界を抱えています。`iptables`チェーンのトラバースオーバーヘッドと、`kube-proxy`による`NodePort`および`ExternalIPs`のユーザー空間プロキシは、レイテンシーと複雑さを増大させます。拡張Berkeley Packet FilterであるeBPFは、カーネルソースコードの変更やカーネルモジュールのロードなしに、プログラム可能なカーネルレベルのパケット処理を可能にすることで、パラダイムシフトをもたらします。CiliumはeBPFを活用し、Kubernetes内で高性能なネットワーキング、堅牢なセキュリティポリシー、および詳細な可観測性を提供します。
+
+このガイドでは、KubernetesにCiliumをeBPFと共にデプロイする際のアーキテクチャ上の利点を詳しく説明します。特に、`kube-proxy`の置き換え、XDPによるデータパスの最適化、L7ポリシーの適用、および包括的なネットワーク可視化のためのHubbleの活用に焦点を当てます。
+
+<AudioPlayer src="/static/audio/ebpf-cilium-kubernetes-networking-observability-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+## KubernetesネットワーキングのためのeBPFの基礎
+
+eBPFプログラムは、Linuxカーネル内のサンドボックス化された仮想マシンで実行されます。これらは、ネットワークインターフェース（イングレス/エグレス）、システムコール、トレースポイントなど、さまざまなフックポイントにアタッチできます。ネットワーキングにおいて、eBPFの主な有用性は、カーネルのデータパスでネットワークパケットを直接操作できる能力にあり、従来のネットワークスタック層をバイパスします。
+
+CiliumはeBPFを利用して以下を実現します。
+1.  **`kube-proxy`の置き換え**: eBPFプログラムをネットワークインターフェースにアタッチすることで、CiliumはServiceのロードバランシングをカーネル内で直接処理し、`iptables`のオーバーヘッドと`kube-proxy`のユーザー空間プロキシを排除します。これには、`ClusterIP`、`NodePort`、`ExternalIPs`、および`LoadBalancer` Serviceが含まれます。
+2.  **ネットワークポリシーの実装**: eBPFプログラムは、L3/L4およびL7ネットワークポリシーを、パケットのイングレス/エグレスポイントで直接、最小限のオーバーヘッドで適用します。
+3.  **データパスの高速化**: XDP（eXpress Data Path）のような機能により、eBPFプログラムはカーネルのネットワークスタックよりもさらに前の段階でパケットを処理できるため、超低レイテンシーのパケット転送とDDoS緩和が可能になります。
+4.  **可観測性の提供**: eBPFプログラムは、ネットワークフローに関する豊富なメタデータをエクスポートでき、Hubbleのようなツールがネットワークトラフィックに関する深い洞察を提供することを可能にします。
+
+## アーキテクチャの詳細: CiliumのeBPFデータパス
+
+CiliumはCNI（Container Network Interface）プラグインとして動作します。Podがスケジュールされると、Ciliumはそのネットワークインターフェースを設定し、eBPFプログラムをアタッチします。
+
+### `kube-proxy`の置き換え
+
+Ciliumの`kube-proxy`置き換えモードは、各ノードのネットワークインターフェースにeBPFプログラムをインストールすることで動作します。これらのプログラムは、Kubernetes Service宛てのトラフィックを傍受します。
+
+`ClusterIP` Serviceの場合、eBPFプログラムはNAT（Network Address Translation）とロードバランシングをカーネル内で直接実行します。PodがService IPへの接続を開始すると、発信元ノードのインターフェース上のeBPFプログラムは、宛先IPをバックエンドPodのIPとポートに書き換え、パケットを転送します。これは完全にカーネル内で発生し、ユーザー空間へのコンテキストスイッチを回避します。
+
+`NodePort` Serviceの場合、ホストのネットワークインターフェースにアタッチされたeBPFプログラムは、`NodePort`上の着信トラフィックを傍受します。その後、`ClusterIP`と同様にバックエンドPodへのNATを実行しますが、ホストの外部インターフェースから発信されます。
+
+```bash
+# Example: Verify Cilium's kube-proxy replacement status
+# This command checks if Cilium is managing kube-proxy functionality.
+cilium status --verbose | grep KubeProxyReplacement
+
+# Expected output indicating full replacement:
+# KubeProxyReplacement:   Enabled (strict)
+```
+
+### XDP (eXpress Data Path) の統合
+
+XDPにより、eBPFプログラムはネットワークドライバーの受信パスの可能な限り早い段階で実行できます。これは、パケットが`sk_buff`（ソケットバッファ）構造に割り当てられる前です。これにより、DDoS緩和、ロードバランシング、高スループットのパケット転送などのユースケースに理想的な、非常に高性能なパケット処理が可能になります。
+
+Ciliumは、特定のデータパス最適化、特に`NodePort`および`HostPort`トラフィック、およびServiceへのイングレストラフィックの高速化のためにXDPを活用できます。不要なパケットをドロップしたり、必要なパケットをXDP層から直接転送したりすることで、大幅なCPUサイクルを節約できます。
+
+```yaml
+# Example CiliumDaemonSet configuration snippet for enabling XDP
+# This would be part of your Cilium installation YAML.
+# Note: XDP requires specific network driver support.
+apiVersion: helm.toolkit.fluxcd.io/v2beta1
+kind: HelmRelease
+metadata:
+  name: cilium
+  namespace: kube-system
+spec:
+  chart:
+    spec:
+      chart: cilium
+      version: 1.15.x # Use your desired Cilium version
+      sourceRef:
+        kind: HelmRepository
+        name: cilium
+        namespace: flux-system
+  interval: 1m
+  values:
+    kubeProxyReplacement: strict
+    bpf:
+      masquerade: true
+      tproxy: false # TPROXY is for L7, not directly XDP
+      # Enable XDP for NodePort if your kernel and NIC support it
+      # This can significantly reduce latency for NodePort traffic.
+      nodePort:
+        enabled: true
+        mode: xdp
+    # ... other Cilium configurations
+```
+
+### ソケットレベルのロードバランシング (Sockmap)
+
+従来のパケットレベルのロードバランシングを超えて、CiliumはeBPFの`sockmap`機能を利用してソケットレベルのロードバランシングを行うことができます。`sockmap`により、eBPFプログラムはカーネルのネットワークスタックでTCP接続が完全に確立される*前*にリダイレクトできます。これは、高接続レートのServiceにとって特に有益であり、リダイレクト前に最初の受信ソケットで完全なTCPハンドシェイク処理のオーバーヘッドを回避します。
+
+`sockmap` eBPFプログラムは、`connect()`または`accept()`呼び出しを傍受し、ソケットを別のローカルソケット、あるいは別のノードのソケットにリダイレクトすることで、非常に早い段階で接続を効果的にロードバランシングできます。これは、TCPハンドシェイクが開始された後にパケットを操作する`kube-proxy`の`iptables` DNATとは異なります。
+
+### サイドカーなしのL7ネットワークポリシー
+
+Kubernetesにおける従来のL7ポリシー適用は、多くの場合、サイドカープロキシ（例：IstioメッシュのEnvoy）に依存しています。これらは強力ですが、サイドカーは追加のホップによるリソースオーバーヘッド（CPU、メモリ）とレイテンシーを発生させます。Ciliumは、HTTP、Kafka、DNSなどの一般的なプロトコルに対して、eBPFを使用してL7ポリシーを直接適用できます。
+
+Ciliumは、ソケットの`sendmsg()`および`recvmsg()`システムコールにeBPFプログラムをアタッチすることでこれを実現します。これらのプログラムは、アプリケーション層のペイロード（例：HTTPヘッダー、Kafkaトピック名）を検査し、そのコンテンツに基づいてポリシーを適用できます。これは、Podごとに個別のユーザー空間プロキシプロセスを必要とせずに実行されます。
+
+```yaml
+# Example: CiliumNetworkPolicy for L7 HTTP enforcement
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-http-get-to-api
+spec:
+  endpointSelector:
+    matchLabels:
+      app: backend-api
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    toPorts:
+    - ports:
+      - port: "8080"
+        protocol: TCP
+      rules:
+        http:
+        - method: "GET"
+          path: "/api/v1/data"
+        - method: "POST"
+          path: "/api/v1/submit"
+          headers:
+          - "Content-Type: application/json" # Example: enforce header presence
+```
+
+このポリシーにより、`frontend` Podは`GET`リクエストを`/api/v1/data`に、`POST`リクエストを`/api/v1/submit`のポート`8080`にある`backend-api` Podに対して行うことができます。その他のHTTPメソッドやパスは、eBPFプログラムによって拒否されます。
+
+## Hubbleの可観測性
+
+Hubbleは、CiliumとeBPFの上に構築された分散ネットワークおよびセキュリティ可観測性プラットフォームです。Kubernetesクラスター内のネットワークフロー、ポリシー適用決定、およびDNSリクエストに関する深い可視性を提供します。
+
+Hubbleは、eBPFがカーネルから直接フローメタデータをエクスポートする能力を活用しています。このデータには、送信元/宛先IP、ポート、プロトコル、Kubernetes Pod/Service/Namespace ID、さらにはL7プロトコルの詳細（例：HTTPメソッド、パス、ステータスコード）が含まれます。
+
+### Hubbleのコンポーネント
+
+*   **Hubble Agent**: 各ノードでeBPFプログラムとして実行され、フローデータを収集します。
+*   **Hubble Relay**: すべてのHubble Agentからフローデータを集約するgRPCサービスです。
+*   **Hubble CLI**: Hubble Relayにクエリを実行するためのコマンドラインツールです。
+*   **Hubble UI**: ネットワークフローとポリシーを視覚化するためのウェブベースのグラフィカルインターフェースです。
+
+### Hubbleのセットアップ
+
+Hubbleは通常、Ciliumのインストール中に有効化されます。
+
+```yaml
+# Example: Enabling Hubble in Cilium HelmRelease
+apiVersion: helm.toolkit.fluxcd.io/v2beta1
+kind: HelmRelease
+metadata:
+  name: cilium
+  namespace: kube-system
+spec:
+  chart:
+    spec:
+      chart: cilium
+      version: 1.15.x
+      sourceRef:
+        kind: HelmRepository
+        name: cilium
+        namespace: flux-system
+  interval: 1m
+  values:
+    hubble:
+      enabled: true
+      listenAddress: ":4244" # Default gRPC port for Hubble Relay
+      ui:
+        enabled: true
+        service:
+          type: ClusterIP # Or LoadBalancer for external access
+    # ... other Cilium configurations
+```
+
+インストール後、ポートフォワーディングまたは`LoadBalancer` Serviceを介してHubble UIにアクセスできます。
+
+```bash
+# Port-forward to Hubble UI
+kubectl port-forward -n kube-system svc/hubble-ui 8080:80
+
+# Then open http://localhost:8080 in your browser.
+
+# Using Hubble CLI to observe flows
+# First, install the Hubble CLI:
+# curl -L --remote-name-all https://github.com/cilium/hubble/releases/latest/download/hubble-linux-amd64.tar.gz{,.sha256sum}
+# sha256sum --check hubble-linux-amd64.tar.gz.sha256sum
+# sudo tar -C /usr/local/bin -xvf hubble-linux-amd64.tar.gz
+# rm hubble-linux-amd64.tar.gz{,.sha256sum}
+
+# Then, connect to Hubble Relay and observe flows:
+hubble observe
+
+# Filter by namespace and HTTP status code
+hubble observe --namespace default --protocol http --http-status 2xx
+
+# Observe DNS queries
+hubble observe --type dns
+```
+
+Hubbleはマイクロ秒レベルのレイテンシー可視性を提供し、パケットがどこでドロップまたは遅延しているか、どのネットワークポリシーが適用されているかを正確に示します。これは、複雑なマイクロサービス間の相互作用をデバッグする上で非常に貴重です。
+
+## アーキテクチャ比較: `kube-proxy` vs. Cilium eBPF
+
+| 機能 | `kube-proxy` (`iptables`モード) | Cilium (eBPFモード) |
+|---|---|---|
+| **ロードバランシング** | `iptables` DNATルール、`NodePort`のユーザー空間プロキシ | カーネルeBPFプログラム、直接パケット書き換え |
+| **パフォーマンス** | `iptables`チェーントラバースオーバーヘッド、ユーザー空間コンテキストスイッチ | カーネルネイティブ、最小限のオーバーヘッド、XDP高速化 |
+| **スケーラビリティ** | 多数のService/Endpointによる`iptables`ルールの爆発 | eBPFマップでうまくスケーリング、定数時間ルックアップ |
+| **ネットワークポリシー** | L3/L4のみ、`iptables`ルール | L3/L4およびL7 (HTTP, Kafka, DNS) をeBPFで |
+| **可観測性** | 限定的、`conntrack`と`iptables`ログに依存 | Hubbleによる詳細なリアルタイムフロー可視性 (L3-L7) |
+| **リソース使用量** | `kube-proxy`デーモン、`iptables`カーネルオーバーヘッド | Ciliumエージェントデーモン、カーネル内のeBPFプログラム |
+| **カーネルバイパス** | なし | あり、特定のユースケースでXDPを使用 |
+| **セキュリティ** | 基本的なL3/L4ファイアウォール | 高度なL3/L4/L7ポリシー適用、IDベース |
+
+## 本番環境での注意点とトラブルシューティング
+
+1.  **カーネルバージョンの互換性**: eBPFの機能は急速に進化しています。カーネルバージョン（基本的なeBPFには通常4.9以降、`sockmap`、XDPなどの高度な機能には5.x以降）がCiliumのバージョンと互換性があることを確認してください。
+    *   **症状**: Cilium Podが起動せず、`cilium status`にeBPFプログラムのロードに関するエラーが表示される。
+    *   **修正**: Ciliumのリリースノートで最小カーネル要件を確認してください。必要であればカーネルをアップグレードするか、カーネルのアップグレードが不可能な場合は古いCiliumバージョンを使用してください。
+    *   **コマンド**: カーネルバージョンを確認するには`uname -r`。
+
+2.  **XDPのネットワークインターフェースドライバーサポート**: XDPは、XDP APIをサポートする特定のネットワークカードドライバーを必要とします。すべてのドライバーがXDP対応ではありません。
+    *   **症状**: CiliumのXDP関連機能（例: `nodePort.mode: xdp`）がアクティブにならない、またはネットワークの問題を引き起こす。
+    *   **修正**: ドライバーのサポートを確認してください。`ethtool -i <interface>`でドライバー情報を表示できます。XDP関連のエラーについては`cilium-health`ログを参照してください。サポートされていない場合は、利用可能な場合は`generic`または`native` XDPモードにフォールバックするか、そのインターフェースのXDPを無効にしてください。
+
+3.  **`kube-proxy`の競合**: `kube-proxy`が完全に無効化または削除されていない場合、CiliumのeBPFベースのServiceロードバランシングと競合する可能性があります。
+    *   **症状**: Serviceへの断続的な接続、誤ったロードバランシング、`iptables`ルールとCiliumの競合。
+    *   **修正**: `kube-proxy`がクラスターから完全に無効化または削除されていることを確認してください。`kops`、`kubeadm`、またはクラウドプロバイダー管理のクラスターの場合、これを実現するための特定のフラグまたは設定があります。
+        *   `kubeadm`の場合: `KubeProxyConfiguration`で`kubeadm init --config=kubeadm-config.yaml`を`kubeProxy.disabled: true`に設定する。
+        *   `kops`の場合: クラスター仕様で`kubeProxy.enabled: false`を設定する。
+        *   既存のクラスターの場合: `kube-proxy`デプロイメントを0レプリカにスケールダウンし、`DaemonSet`が再作成しないことを確認する。
+
+4.  **L7ポリシーの誤設定**: 不適切なL7ポリシーは、Hubbleなしではデバッグが難しいアプリケーション接続の問題を引き起こす可能性があります。
+    *   **症状**: アプリケーションが通信に失敗する、HTTP 403エラー、Kafka接続のリセットが発生するが、L3/L4接続は正常に見える。
+    *   **修正**: `hubble observe --protocol http`（または`kafka`、`dns`）を使用してポリシー適用決定を確認してください。`VERDICT: DENIED`フローと関連する`PolicyName`を探してください。それに応じて`CiliumNetworkPolicy`ルールを調整してください。`toPorts`と`rules`がアプリケーションの期待と一致していることを確認してください。
+
+5.  **eBPFマップの枯渇**: 非常に大規模なクラスターで多数のService、Endpoint、およびポリシーがある場合、eBPFマップがサイズ制限に達する可能性があります。
+    *   **症状**: 新しいポリシーやServiceが適用されず、CiliumエージェントのログにeBPFマップが満杯であるというエラーが表示される。
+    *   **修正**: Ciliumにはマップサイズを管理するための内部メカニズムがあります。最新のCiliumバージョンを使用していることを確認してください。複雑さを軽減するためにネットワークポリシーを最適化することを検討してください。極端なケースでは、Ciliumの`bpf.map.size`設定を調整してください（ただし、これはカーネルメモリを消費するため注意が必要です）。
+
+## よくある質問
+
+1.  **Ciliumは`kube-proxy`を完全に置き換えることができますか？**
+    はい、CiliumはeBPFを使用してすべてのロードバランシングとNAT機能をカーネル内で直接実装することで、`kube-proxy`、`ClusterIP`、`NodePort`、および`ExternalIPs` Serviceに対して`LoadBalancer`を完全に置き換えることができます。これは、パフォーマンスと可観測性のために推奨されるデプロイメントモデルです。
+
+2.  **Ciliumの高度なeBPF機能には、最低限どのカーネル要件が必要ですか？**
+    基本的なeBPF機能と`kube-proxy`の置き換えには、Linuxカーネル4.9以降で一般的に十分です。XDP、`sockmap`、および特定のL7ポリシー適用などの高度な機能には、カーネル5.x以降（例：`sockmap`には5.4以降、特定のXDP機能には5.10以降）が、最適なパフォーマンスと安定性のために必要または強く推奨されることがよくあります。正確なカーネルバージョンの互換性については、常にCiliumのリリースノートを参照してください。
+
+3.  **CiliumはサイドカープロキシなしでL7ポリシーをどのように処理しますか？**
+    Ciliumは、アプリケーションソケットの`sendmsg()`および`recvmsg()`システムコールにeBPFプログラムをアタッチします。これらのプログラムは、アプリケーション層のペイロード（例：HTTPヘッダー、Kafkaトピック名）を検査し、そのコンテンツに基づいてポリシーを適用できます。これらはすべてカーネルコンテキスト内で実行され、ユーザー空間サイドカープロキシによって導入されるリソースオーバーヘッドとレイテンシーを回避します。
+
+4.  **Hubbleを有効にすることによるパフォーマンスへの影響はどのくらいですか？**
+    Hubbleのデータ収集は、カーネルからフローメタデータをエクスポートするeBPFプログラムに依存しています。このプロセスは高度に最適化されており、データプレーンへのパフォーマンス影響は最小限です。主なリソース消費は、データを集約して視覚化するHubble RelayおよびUIコンポーネントから発生します。トラフィックの多いクラスターでは、Hubble Relayに十分なCPUとメモリリソースが確保されていることを確認してください。
+
+5.  **Ciliumは他のCNIプラグインと互換性がありますか？**
+    いいえ、Cilium自体がCNIプラグインであり、Kubernetesクラスター内で唯一のCNIとして設計されています。Podのネットワーキング、IPアドレス管理、およびネットワークポリシーの適用に関するすべての側面を管理します。Ciliumを他のCNIと並行して実行しようとすると、競合が発生し、ネットワークが機能しなくなります。

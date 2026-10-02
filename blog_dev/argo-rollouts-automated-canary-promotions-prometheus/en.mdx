@@ -1,0 +1,493 @@
+---
+title: 'Argo Rollouts & Prometheus: Automated Progressive Delivery & Analysis Templates'
+images: ['/static/images/argo-rollouts-automated-canary-promotions-prometheus.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["kubernetes", "devops", "ci-cd", "cloud", "observability"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Intermediate"
+programmingLanguage: "TypeScript"
+summary: 'Comprehensive guide covering argo rollouts & prometheus: automated progressive delivery & analysis templates with production-grade architecture and code examples.'
+---
+
+Automated progressive delivery in Kubernetes necessitates robust control planes for traffic management and comprehensive observability for automated analysis. This guide details the integration of Argo Rollouts with Prometheus for automated canary deployments, leveraging Gateway API for traffic shifting and AnalysisTemplates for SLO validation. We will configure step-based rollouts, demonstrate automated rollback on SLO violations, and integrate Slack notifications.
+
+<AudioPlayer src="/static/audio/argo-rollouts-automated-canary-promotions-prometheus.mp3" title="Executive Audio Briefing" voice="Google Cloud en-US-Neural2-F" />
+
+
+## Architecture Overview
+
+The core components for this setup are:
+
+1.  **Argo Rollouts**: Orchestrates the progressive delivery strategy (canary, blue/green).
+2.  **Kubernetes Gateway API**: Manages ingress traffic, providing fine-grained control over routing and traffic splitting. We'll use Envoy as the data plane.
+3.  **Prometheus**: Collects metrics from the application and infrastructure, serving as the data source for SLO validation.
+4.  **Argo Rollouts AnalysisTemplates**: Defines queries against Prometheus to evaluate SLIs (Service Level Indicators) and determine rollout health.
+5.  **Slack Webhooks**: For real-time notifications on rollout events.
+
+The workflow is as follows: A new application version is deployed via a `Rollout` resource. Argo Rollouts creates a canary replica set and directs a small percentage of traffic to it using Gateway API. AnalysisTemplates continuously query Prometheus for SLIs like error rate and latency. If SLIs meet predefined thresholds, traffic is incrementally shifted. If SLIs degrade, the rollout is automatically aborted and rolled back.
+
+## Prerequisites
+
+Ensure you have a Kubernetes cluster (v1.22+) with:
+
+*   Argo Rollouts installed.
+*   Prometheus and Grafana installed (e.g., via kube-prometheus-stack).
+*   Gateway API CRDs installed and an Envoy-based Gateway controller (e.g., Istio, Contour, or a standalone Envoy Gateway implementation). For simplicity, we'll assume a basic Envoy Gateway setup.
+*   `kubectl` configured.
+
+## Setting up the Application and Gateway API
+
+We'll use a simple NGINX application that can be configured to return errors for demonstration purposes.
+
+First, define the `Deployment` and `Service` for our application. Note that Argo Rollouts will manage the `Deployment` lifecycle, so we define a standard `Deployment` manifest which Argo Rollouts will convert into a `Rollout` resource.
+
+```yaml
+# app.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: canary-app
+  labels:
+    app: canary-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: canary-app
+  template:
+    metadata:
+      labels:
+        app: canary-app
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.23.3 # Initial stable version
+        ports:
+        - containerPort: 80
+        env:
+        - name: ERROR_RATE
+          value: "0" # Simulate no errors initially
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: canary-app-stable
+spec:
+  selector:
+    app: canary-app
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: canary-app-canary
+spec:
+  selector:
+    app: canary-app
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+```
+
+Apply these: `kubectl apply -f app.yaml`
+
+Next, configure Gateway API to manage traffic. We'll create a `Gateway` and an `HTTPRoute` that initially points all traffic to the stable service.
+
+```yaml
+# gateway-api.yaml
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: Gateway
+metadata:
+  name: my-gateway
+spec:
+  gatewayClassName: envoy # Replace with your GatewayClass name
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: HTTPRoute
+metadata:
+  name: canary-app-route
+spec:
+  parentRefs:
+  - name: my-gateway
+  hostnames:
+  - "canary.example.com" # Replace with your domain
+  rules:
+  - backendRefs:
+    - name: canary-app-stable
+      port: 80
+      weight: 100
+```
+
+Apply these: `kubectl apply -f gateway-api.yaml`
+
+## Argo Rollouts Configuration
+
+Now, define the `Rollout` resource. This will replace our `Deployment` and instruct Argo Rollouts on the canary strategy.
+
+```yaml
+# rollout.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: canary-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: canary-app
+  template:
+    metadata:
+      labels:
+        app: canary-app
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.23.3 # Initial stable version
+        ports:
+        - containerPort: 80
+        env:
+        - name: ERROR_RATE
+          value: "0"
+  strategy:
+    canary:
+      canaryService: canary-app-canary
+      stableService: canary-app-stable
+      trafficRouting:
+        gatewayAPI:
+          httpRoute: canary-app-route
+          # The controllerName is crucial for Argo Rollouts to find the correct Gateway API controller.
+          # This typically matches the 'controllerName' field in your GatewayClass.
+          # For Envoy Gateway, it might be "gateway.envoyproxy.io/gatewayclass-controller" or similar.
+          # Consult your GatewayClass definition.
+          controllerName: "gateway.envoyproxy.io/gatewayclass-controller" # Adjust as per your Gateway API setup
+      steps:
+      - setWeight: 10 # Send 10% traffic to canary
+      - pause: {} # Manual pause for initial observation
+      - analysis:
+          templates:
+          - templateName: canary-app-analysis
+          args:
+          - name: service
+            value: "canary-app-canary" # Target the canary service for analysis
+      - setWeight: 50 # Send 50% traffic to canary
+      - pause: { duration: 60s } # Automatic pause for 60 seconds
+      - analysis:
+          templates:
+          - templateName: canary-app-analysis
+          args:
+          - name: service
+            value: "canary-app-canary"
+      - setWeight: 100 # Send 100% traffic to canary
+      - pause: { duration: 60s }
+      - analysis:
+          templates:
+          - templateName: canary-app-analysis
+          args:
+          - name: service
+            value: "canary-app-canary"
+      - promote: {} # Promote canary to stable
+      - pause: { duration: 30s } # Final pause before full promotion
+```
+
+Apply this: `kubectl apply -f rollout.yaml`
+
+Argo Rollouts will now take control of the `canary-app` deployment. You can observe its status with `kubectl argo rollouts get rollout canary-app`.
+
+## Prometheus AnalysisTemplates
+
+We need to define `AnalysisTemplate` resources that Argo Rollouts will use to query Prometheus. These templates will check for HTTP error rates and p99 latency.
+
+First, ensure your application exposes metrics that Prometheus can scrape. For NGINX, you might use an NGINX exporter or instrument your application directly. For this example, we'll assume a generic `http_requests_total` counter and `http_request_duration_seconds` histogram are available, labeled by `service` and `status_code`.
+
+```yaml
+# analysis-template.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: canary-app-analysis
+spec:
+  args:
+  - name: service
+  metrics:
+  - name: error-rate
+    interval: 30s # How often to run the query
+    failureLimit: 1 # Fail if this many checks fail
+    successCondition: "result[0] < 0.01" # Error rate < 1%
+    # Prometheus query for 5xx errors over the last 5 minutes
+    # We use `sum(rate(...))` to get the rate of errors and total requests.
+    # The `service` label is passed as an argument to target the correct service.
+    # `{{args.service}}` is how arguments are referenced in AnalysisTemplates.
+    # This query calculates the percentage of 5xx errors.
+    prometheus:
+      address: http://prometheus-kube-prometheus-stack.monitoring:9090 # Adjust Prometheus service address
+      query: |
+        sum(rate(http_requests_total{service="{{args.service}}", status_code=~"5.."}[5m]))
+        /
+        sum(rate(http_requests_total{service="{{args.service}}", status_code!~"4.."}[5m]))
+  - name: p99-latency
+    interval: 30s
+    failureLimit: 1
+    successCondition: "result[0] < 0.5" # p99 latency < 500ms
+    # Prometheus query for p99 latency over the last 5 minutes
+    # `histogram_quantile` is used for percentile calculations from histograms.
+    prometheus:
+      address: http://prometheus-kube-prometheus-stack.monitoring:9090 # Adjust Prometheus service address
+      query: |
+        histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{service="{{args.service}}"}[5m])) by (le))
+```
+
+Apply this: `kubectl apply -f analysis-template.yaml`
+
+## Demonstrating Automated Rollback
+
+To demonstrate automated rollback, we'll update the `Rollout` to a new image version that introduces errors.
+
+First, let's simulate traffic to generate metrics. You can use `hey` or `curl` in a loop:
+
+```bash
+# Get the IP/hostname of your Gateway
+GATEWAY_IP=$(kubectl get svc -n envoy-gateway-system envoy-gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}') # Adjust namespace/service name
+while true; do curl -s -H "Host: canary.example.com" http://$GATEWAY_IP/ > /dev/null; sleep 0.1; done
+```
+
+Now, update the `Rollout` to a new image. We'll use a custom NGINX image that returns 500 errors based on an environment variable.
+
+```dockerfile
+# Dockerfile for error-injecting NGINX
+FROM nginx:1.23.3
+COPY default.conf /etc/nginx/conf.d/default.conf
+# default.conf will check for ERROR_RATE env var and return 500 for a percentage of requests
+```
+
+`default.conf`:
+```nginx
+server {
+    listen 80;
+    location / {
+        set $error_rate $env_ERROR_RATE;
+        if ($error_rate = "") {
+            set $error_rate "0";
+        }
+
+        # Generate a random number between 0 and 99
+        set $random_num "";
+        perl_set $random_num 'int(rand(100))';
+
+        # If random_num is less than ERROR_RATE, return 500
+        if ($random_num < $error_rate) {
+            return 500 "Internal Server Error\n";
+        }
+
+        return 200 "Hello from NGINX!\n";
+    }
+}
+```
+
+Build and push this image (e.g., `myregistry/nginx-error:1.24.0`).
+
+Now, update the `Rollout` to use this new image and set `ERROR_RATE` to `20` (20% errors).
+
+```yaml
+# rollout-update.yaml (partial update)
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: canary-app
+spec:
+  template:
+    spec:
+      containers:
+      - name: nginx
+        image: myregistry/nginx-error:1.24.0 # New image with potential errors
+        env:
+        - name: ERROR_RATE
+          value: "20" # Introduce 20% errors
+```
+
+Apply this update: `kubectl apply -f rollout-update.yaml --field-manager=kubectl-client-side-apply`
+
+Observe the rollout status: `kubectl argo rollouts get rollout canary-app`.
+Argo Rollouts will deploy the new canary, shift 10% traffic, and then the `analysis` step will begin. Prometheus will scrape metrics from the canary. The `error-rate` metric in the `AnalysisTemplate` will detect the 20% error rate, which violates `result[0] < 0.01`. Argo Rollouts will then automatically abort the rollout and roll back to the stable version.
+
+You will see output similar to:
+```
+Name:            canary-app
+Namespace:       default
+Status:          Degraded
+Strategy:        Canary
+  Step:          1/8
+  Message:       Rollout is in Degraded state due to failed AnalysisRun
+  SetWeight:     10%
+  ActualWeight:  10%
+  ...
+  AnalysisRun:   canary-app-canary-app-analysis-xxxx
+    Status:      Failed
+    Message:     Metric 'error-rate' success condition was not met
+```
+
+## Slack Alerting Webhooks
+
+Integrate Slack notifications for rollout events. This requires configuring a Slack webhook and then creating a Kubernetes Secret for it.
+
+1.  Create a Slack Incoming Webhook URL.
+2.  Store it in a Kubernetes Secret:
+
+```yaml
+# slack-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: argo-rollouts-slack-webhook
+stringData:
+  url: "https://example.com/api/slack-webhook-placeholder" # Replace with your Slack webhook URL
+```
+
+Apply this: `kubectl apply -f slack-secret.yaml`
+
+Now, configure Argo Rollouts to use this webhook for notifications. This is typically done via the `argocd-notifications-cm` ConfigMap if you're using Argo CD Notifications, or directly in the `Rollout` spec if using a custom notification controller. For simplicity, we'll assume a basic notification setup that can consume a webhook.
+
+A more robust solution involves Argo CD Notifications, which can be configured to send alerts for `Rollout` events.
+
+```yaml
+# Example of Argo CD Notifications ConfigMap entry (if using Argo CD)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-notifications-cm
+  namespace: argocd # Or your Argo CD namespace
+data:
+  service.slack: |
+    token: $argo-rollouts-slack-webhook:url # Reference the secret
+  template.rollout-status: |
+    message: |
+      Rollout {{.app.metadata.name}} status: {{.rollout.status.phase}}
+      {{if .rollout.status.message}}Message: {{.rollout.status.message}}{{end}}
+      {{if .rollout.status.canary.currentStepIndex}}Current Step: {{.rollout.status.canary.currentStepIndex}}/{{len .rollout.spec.strategy.canary.steps}}{{end}}
+      {{if .rollout.status.canary.trafficRouting.gatewayAPI.currentWeight}}Traffic Weight: {{.rollout.status.canary.trafficRouting.gatewayAPI.currentWeight}}%{{end}}
+    slack:
+      attachments:
+      - title: Rollout Details
+        title_link: {{.context.argocdUrl}}/applications/{{.app.metadata.name}}
+        color: "{{if eq .rollout.status.phase "Succeeded"}}#00FF00{{else if eq .rollout.status.phase "Failed"}}#FF0000{{else}}#FFFF00{{end}}"
+        fields:
+        - title: Application
+          value: {{.app.metadata.name}}
+          short: true
+        - title: Namespace
+          value: {{.app.metadata.namespace}}
+          short: true
+        - title: Status
+          value: {{.rollout.status.phase}}
+          short: true
+        - title: Revision
+          value: {{.rollout.status.currentRevision}}
+          short: true
+  trigger.on-rollout-status-change: |
+    - when: rollout.status.phase != rollout.status.previousPhase
+      send: [rollout-status]
+```
+
+This `ConfigMap` would be applied to the Argo CD namespace. Then, in your `Rollout` manifest, you would add annotations to enable notifications:
+
+```yaml
+# rollout.yaml (with notification annotations)
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: canary-app
+  annotations:
+    notifications.argoproj.io/subscribe.on-rollout-status-change.slack: "true"
+    # Or specify a channel: notifications.argoproj.io/subscribe.on-rollout-status-change.slack: "#my-channel"
+spec:
+  # ... rest of your rollout spec
+```
+
+## Architecture & Tradeoffs Comparison
+
+| Feature             | Argo Rollouts + Gateway API + Prometheus | Istio + Kiali + Prometheus | Flagger + Linkerd + Prometheus |
+|---------------------|------------------------------------------|----------------------------|--------------------------------|
+| **Traffic Control** | Gateway API (Envoy, NGINX, etc.)         | Istio VirtualService/Gateway | Linkerd SMI/TrafficSplit       |
+| **Observability**   | Prometheus + AnalysisTemplates           | Prometheus + Kiali         | Prometheus + Grafana           |
+| **Complexity**      | Moderate (Gateway API setup)             | High (Full Service Mesh)   | Moderate (Linkerd setup)       |
+| **Data Plane**      | External (Envoy Gateway, NGINX Ingress)  | Envoy Proxy (Sidecar)      | Linkerd Proxy (Sidecar)        |
+| **Resource Usage**  | Lower (No sidecars for app)              | Higher (Sidecars for all)  | Moderate (Sidecars for app)    |
+| **Flexibility**     | High (Choose any Gateway API impl)       | High (Rich mesh features)  | Good (SMI standard)            |
+| **Learning Curve**  | Moderate                                 | High                       | Moderate                       |
+| **Use Case**        | External traffic, fine-grained control   | Internal/External, advanced mesh | Internal traffic, simple mesh |
+
+This table highlights that while Istio offers a comprehensive service mesh, the Argo Rollouts + Gateway API approach provides a powerful, yet potentially lighter-weight, solution for progressive delivery focused on ingress traffic, especially when leveraging a dedicated Envoy Gateway. Flagger with Linkerd is another strong contender, particularly for internal service-to-service canary deployments.
+
+## Production Gotchas & Troubleshooting
+
+1.  **Prometheus Scrape Configuration**:
+    *   **Gotcha**: Prometheus isn't scraping metrics from your application pods, especially the canary.
+    *   **Fix**: Ensure your `ServiceMonitor` or `PodMonitor` resources correctly target your application pods, including those created by Argo Rollouts (which will have labels like `rollouts-pod-template-hash`). Verify `prometheus.yml` has the correct scrape configurations. Use `kubectl -n <prometheus-namespace> port-forward svc/prometheus-kube-prometheus-stack 9090` and check the Prometheus UI under "Status" -> "Targets".
+
+2.  **Gateway API Traffic Shifting Issues**:
+    *   **Gotcha**: Traffic is not shifting correctly between stable and canary services, or the `HTTPRoute` isn't being updated.
+    *   **Fix**:
+        *   Verify your `GatewayClass` and `Gateway` are correctly configured and the controller is running.
+        *   Check Argo Rollouts logs (`kubectl logs -f -n argo-rollouts deploy/argo-rollouts`) for errors related to Gateway API updates.
+        *   Inspect the `HTTPRoute` resource directly (`kubectl get httproute canary-app-route -o yaml`) to see if Argo Rollouts is attempting to modify its `backendRefs` weights.
+        *   Ensure the `controllerName` in your `Rollout`'s `trafficRouting.gatewayAPI` section exactly matches the `controllerName` defined in your `GatewayClass`. This is a common misconfiguration.
+
+3.  **AnalysisTemplate Query Failures**:
+    *   **Gotcha**: Analysis runs fail with "no data" or "query error" even when metrics exist.
+    *   **Fix**:
+        *   **Prometheus Address**: Double-check the `address` in your `AnalysisTemplate`'s `prometheus` section. It must be the correct service name and port for your Prometheus instance within the cluster (e.g., `http://prometheus-kube-prometheus-stack.monitoring:9090`).
+        *   **Query Syntax**: Test your Prometheus queries directly in the Prometheus UI. Ensure they return valid data for both stable and canary services. Pay close attention to label matching (`service="{{args.service}}"`).
+        *   **Time Range**: Ensure the `interval` and the time window in your Prometheus query (e.g., `[5m]`) are appropriate for your traffic volume and metric generation rate. If traffic is sparse, a longer window might be needed.
+
+4.  **Rollout Stuck in Pause**:
+    *   **Gotcha**: Rollout is stuck at a `pause: {}` step indefinitely.
+    *   **Fix**: This is expected for manual pauses. To proceed, use `kubectl argo rollouts promote canary-app`. For automated pauses, ensure the `duration` is set correctly and that no other conditions are preventing progression (e.g., a preceding `analysis` step that is still running or failed).
+
+5.  **Resource Limits**:
+    *   **Gotcha**: Argo Rollouts controller or Prometheus pods are crashing or performing poorly.
+    *   **Fix**: Review resource requests and limits for `argo-rollouts` deployment and Prometheus components. Increase CPU/memory if necessary, especially in busy clusters or with many rollouts/metrics.
+
+## Frequently Asked Questions
+
+1.  **Can I use other ingress controllers besides Envoy Gateway with Gateway API?**
+    Yes. The beauty of Gateway API is its abstraction. As long as your ingress controller implements the Gateway API specification (e.g., NGINX Gateway Fabric, Contour, Istio), Argo Rollouts can integrate with it. You just need to ensure the `controllerName` in your `Rollout` matches your `GatewayClass`.
+
+2.  **How do I handle database schema migrations with canary deployments?**
+    Database schema migrations are complex with canaries. The general approach is to make migrations backward-compatible, allowing both the old and new application versions to run simultaneously against the same database schema. This often involves a two-step migration:
+    1.  Add new columns/tables, but keep old ones. Deploy new app version.
+    2.  Once new app is fully promoted, remove old columns/tables in a subsequent migration.
+    Alternatively, use a blue/green strategy for database changes, or a separate, highly controlled migration process.
+
+3.  **What if my application doesn't expose Prometheus metrics?**
+    You must instrument your application to expose metrics in the Prometheus format. For HTTP services, common metrics include request counts, durations, and status codes. Libraries exist for most languages (e.g., `prom-client` for Node.js, `prometheus_client` for Python, `micrometer` for Java). If direct instrumentation isn't feasible, consider using a sidecar proxy (like Envoy or Linkerd) that can automatically collect HTTP metrics, or an NGINX ingress controller that exposes metrics.
+
+4.  **How can I make my `AnalysisTemplate` more robust, e.g., handle low traffic scenarios?**
+    For low traffic, `rate()` queries can return `NaN` or zero, leading to false positives/negatives.
+    *   **`irate()` vs `rate()`**: `irate()` is more sensitive to spikes but can be noisy. `rate()` smooths over time. Choose based on sensitivity needs.
+    *   **`unless` operator**: Use `unless` to prevent division by zero or to handle cases where no requests are observed. For example, `(sum(rate(http_requests_total{...}[5m])) by (service) unless sum(rate(http_requests_total{...}[5m])) by (service) == 0)`.
+    *   **Minimum Request Threshold**: Add a separate metric check in your `AnalysisTemplate` to ensure a minimum number of requests have been processed by the canary before evaluating SLIs. E.g., `successCondition: "result[0] > 100"` for a `sum(increase(http_requests_total{...}[5m]))` query.
+    *   **`absent_over_time()`**: Can be used to detect if a metric has disappeared, which might indicate a problem.
+
+5.  **Can I use multiple `AnalysisTemplate`s in a single `Rollout` step?**
+    Yes, you can specify multiple `templates` within an `analysis` block in a `Rollout` step. Argo Rollouts will run all specified analyses concurrently, and the step will only succeed if *all* analyses succeed. This allows for comprehensive validation across different SLIs.
+
+```yaml
+      - analysis:
+          templates:
+          - templateName: canary-app-error-rate-analysis
+          - templateName: canary-app-p99-latency-analysis
+          args:
+          - name: service
+            value: "canary-app-canary"
+```
+This concludes the guide on implementing automated progressive delivery with Argo Rollouts, Gateway API, and Prometheus. By following these patterns, you can establish a robust and reliable deployment pipeline that automatically validates new releases against critical SLOs.

@@ -1,0 +1,493 @@
+---
+title: "Argo Rollouts & Prometheus: Phân phối lũy tiến tự động & Mẫu phân tích"
+images: ['/static/images/argo-rollouts-automated-canary-promotions-prometheus.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["kubernetes", "devops", "ci-cd", "cloud", "observability"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Intermediate"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về Argo Rollouts & Prometheus: phân phối lũy tiến tự động và các mẫu phân tích với kiến trúc cấp độ sản xuất và ví dụ mã."
+---
+
+Việc triển khai phân phối lũy tiến tự động trong Kubernetes đòi hỏi các mặt phẳng điều khiển mạnh mẽ để quản lý lưu lượng truy cập và khả năng quan sát toàn diện để phân tích tự động. Hướng dẫn này trình bày chi tiết việc tích hợp Argo Rollouts với Prometheus để triển khai canary tự động, tận dụng Gateway API để chuyển đổi lưu lượng truy cập và AnalysisTemplates để xác thực SLO. Chúng ta sẽ cấu hình các bản triển khai theo từng bước, trình diễn việc khôi phục tự động khi vi phạm SLO và tích hợp thông báo Slack.
+
+<AudioPlayer src="/static/audio/argo-rollouts-automated-canary-promotions-prometheus-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Tổng quan kiến trúc
+
+Các thành phần cốt lõi cho thiết lập này là:
+
+1.  **Argo Rollouts**: Điều phối chiến lược phân phối lũy tiến (canary, blue/green).
+2.  **Kubernetes Gateway API**: Quản lý lưu lượng truy cập vào, cung cấp khả năng kiểm soát chi tiết về định tuyến và phân chia lưu lượng truy cập. Chúng ta sẽ sử dụng Envoy làm mặt phẳng dữ liệu.
+3.  **Prometheus**: Thu thập các chỉ số từ ứng dụng và cơ sở hạ tầng, đóng vai trò là nguồn dữ liệu để xác thực SLO.
+4.  **Argo Rollouts AnalysisTemplates**: Định nghĩa các truy vấn chống lại Prometheus để đánh giá SLI (Service Level Indicators) và xác định tình trạng triển khai.
+5.  **Slack Webhooks**: Để nhận thông báo theo thời gian thực về các sự kiện triển khai.
+
+Quy trình làm việc như sau: Một phiên bản ứng dụng mới được triển khai thông qua tài nguyên `Rollout`. Argo Rollouts tạo một tập hợp bản sao canary và chuyển một phần nhỏ lưu lượng truy cập đến đó bằng cách sử dụng Gateway API. AnalysisTemplates liên tục truy vấn Prometheus để tìm các SLI như tỷ lệ lỗi và độ trễ. Nếu SLI đáp ứng các ngưỡng được xác định trước, lưu lượng truy cập sẽ được chuyển dần dần. Nếu SLI xuống cấp, bản triển khai sẽ tự động bị hủy bỏ và khôi phục.
+
+## Điều kiện tiên quyết
+
+Đảm bảo bạn có một cụm Kubernetes (v1.22+) với:
+
+*   Argo Rollouts đã được cài đặt.
+*   Prometheus và Grafana đã được cài đặt (ví dụ: thông qua kube-prometheus-stack).
+*   CRD của Gateway API đã được cài đặt và một bộ điều khiển Gateway dựa trên Envoy (ví dụ: Istio, Contour hoặc triển khai Envoy Gateway độc lập). Để đơn giản, chúng ta sẽ giả định một thiết lập Envoy Gateway cơ bản.
+*   `kubectl` đã được cấu hình.
+
+## Thiết lập ứng dụng và Gateway API
+
+Chúng ta sẽ sử dụng một ứng dụng NGINX đơn giản có thể được cấu hình để trả về lỗi cho mục đích trình diễn.
+
+Đầu tiên, định nghĩa `Deployment` và `Service` cho ứng dụng của chúng ta. Lưu ý rằng Argo Rollouts sẽ quản lý vòng đời `Deployment`, vì vậy chúng ta định nghĩa một manifest `Deployment` tiêu chuẩn mà Argo Rollouts sẽ chuyển đổi thành tài nguyên `Rollout`.
+
+```yaml
+# app.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: canary-app
+  labels:
+    app: canary-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: canary-app
+  template:
+    metadata:
+      labels:
+        app: canary-app
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.23.3 # Initial stable version
+        ports:
+        - containerPort: 80
+        env:
+        - name: ERROR_RATE
+          value: "0" # Simulate no errors initially
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: canary-app-stable
+spec:
+  selector:
+    app: canary-app
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: canary-app-canary
+spec:
+  selector:
+    app: canary-app
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+```
+
+Áp dụng các điều này: `kubectl apply -f app.yaml`
+
+Tiếp theo, cấu hình Gateway API để quản lý lưu lượng truy cập. Chúng ta sẽ tạo một `Gateway` và một `HTTPRoute` ban đầu trỏ tất cả lưu lượng truy cập đến dịch vụ ổn định.
+
+```yaml
+# gateway-api.yaml
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: Gateway
+metadata:
+  name: my-gateway
+spec:
+  gatewayClassName: envoy # Replace with your GatewayClass name
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: HTTPRoute
+metadata:
+  name: canary-app-route
+spec:
+  parentRefs:
+  - name: my-gateway
+  hostnames:
+  - "canary.example.com" # Replace with your domain
+  rules:
+  - backendRefs:
+    - name: canary-app-stable
+      port: 80
+      weight: 100
+```
+
+Áp dụng các điều này: `kubectl apply -f gateway-api.yaml`
+
+## Cấu hình Argo Rollouts
+
+Bây giờ, định nghĩa tài nguyên `Rollout`. Điều này sẽ thay thế `Deployment` của chúng ta và hướng dẫn Argo Rollouts về chiến lược canary.
+
+```yaml
+# rollout.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: canary-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: canary-app
+  template:
+    metadata:
+      labels:
+        app: canary-app
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.23.3 # Initial stable version
+        ports:
+        - containerPort: 80
+        env:
+        - name: ERROR_RATE
+          value: "0"
+  strategy:
+    canary:
+      canaryService: canary-app-canary
+      stableService: canary-app-stable
+      trafficRouting:
+        gatewayAPI:
+          httpRoute: canary-app-route
+          # The controllerName is crucial for Argo Rollouts to find the correct Gateway API controller.
+          # This typically matches the 'controllerName' field in your GatewayClass.
+          # For Envoy Gateway, it might be "gateway.envoyproxy.io/gatewayclass-controller" or similar.
+          # Consult your GatewayClass definition.
+          controllerName: "gateway.envoyproxy.io/gatewayclass-controller" # Adjust as per your Gateway API setup
+      steps:
+      - setWeight: 10 # Send 10% traffic to canary
+      - pause: {} # Manual pause for initial observation
+      - analysis:
+          templates:
+          - templateName: canary-app-analysis
+          args:
+          - name: service
+            value: "canary-app-canary" # Target the canary service for analysis
+      - setWeight: 50 # Send 50% traffic to canary
+      - pause: { duration: 60s } # Automatic pause for 60 seconds
+      - analysis:
+          templates:
+          - templateName: canary-app-analysis
+          args:
+          - name: service
+            value: "canary-app-canary"
+      - setWeight: 100 # Send 100% traffic to canary
+      - pause: { duration: 60s }
+      - analysis:
+          templates:
+          - templateName: canary-app-analysis
+          args:
+          - name: service
+            value: "canary-app-canary"
+      - promote: {} # Promote canary to stable
+      - pause: { duration: 30s } # Final pause before full promotion
+```
+
+Áp dụng điều này: `kubectl apply -f rollout.yaml`
+
+Argo Rollouts bây giờ sẽ kiểm soát việc triển khai `canary-app`. Bạn có thể quan sát trạng thái của nó bằng `kubectl argo rollouts get rollout canary-app`.
+
+## Prometheus AnalysisTemplates
+
+Chúng ta cần định nghĩa các tài nguyên `AnalysisTemplate` mà Argo Rollouts sẽ sử dụng để truy vấn Prometheus. Các mẫu này sẽ kiểm tra tỷ lệ lỗi HTTP và độ trễ p99.
+
+Đầu tiên, đảm bảo ứng dụng của bạn hiển thị các chỉ số mà Prometheus có thể thu thập. Đối với NGINX, bạn có thể sử dụng một exporter NGINX hoặc trực tiếp đo lường ứng dụng của mình. Đối với ví dụ này, chúng ta sẽ giả định một bộ đếm `http_requests_total` chung và biểu đồ `http_request_duration_seconds` có sẵn, được gắn nhãn bởi `service` và `status_code`.
+
+```yaml
+# analysis-template.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: canary-app-analysis
+spec:
+  args:
+  - name: service
+  metrics:
+  - name: error-rate
+    interval: 30s # How often to run the query
+    failureLimit: 1 # Fail if this many checks fail
+    successCondition: "result[0] < 0.01" # Error rate < 1%
+    # Prometheus query for 5xx errors over the last 5 minutes
+    # We use `sum(rate(...))` to get the rate of errors and total requests.
+    # The `service` label is passed as an argument to target the correct service.
+    # `{{args.service}}` is how arguments are referenced in AnalysisTemplates.
+    # This query calculates the percentage of 5xx errors.
+    prometheus:
+      address: http://prometheus-kube-prometheus-stack.monitoring:9090 # Adjust Prometheus service address
+      query: |
+        sum(rate(http_requests_total{service="{{args.service}}", status_code=~"5.."}[5m]))
+        /
+        sum(rate(http_requests_total{service="{{args.service}}", status_code!~"4.."}[5m]))
+  - name: p99-latency
+    interval: 30s
+    failureLimit: 1
+    successCondition: "result[0] < 0.5" # p99 latency < 500ms
+    # Prometheus query for p99 latency over the last 5 minutes
+    # `histogram_quantile` is used for percentile calculations from histograms.
+    prometheus:
+      address: http://prometheus-kube-prometheus-stack.monitoring:9090 # Adjust Prometheus service address
+      query: |
+        histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{service="{{args.service}}"}[5m])) by (le))
+```
+
+Áp dụng điều này: `kubectl apply -f analysis-template.yaml`
+
+## Trình diễn khôi phục tự động
+
+Để trình diễn khôi phục tự động, chúng ta sẽ cập nhật `Rollout` lên một phiên bản hình ảnh mới có lỗi.
+
+Đầu tiên, hãy mô phỏng lưu lượng truy cập để tạo ra các chỉ số. Bạn có thể sử dụng `hey` hoặc `curl` trong một vòng lặp:
+
+```bash
+# Get the IP/hostname of your Gateway
+GATEWAY_IP=$(kubectl get svc -n envoy-gateway-system envoy-gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}') # Adjust namespace/service name
+while true; do curl -s -H "Host: canary.example.com" http://$GATEWAY_IP/ > /dev/null; sleep 0.1; done
+```
+
+Bây giờ, cập nhật `Rollout` lên một hình ảnh mới. Chúng ta sẽ sử dụng một hình ảnh NGINX tùy chỉnh trả về lỗi 500 dựa trên một biến môi trường.
+
+```dockerfile
+# Dockerfile for error-injecting NGINX
+FROM nginx:1.23.3
+COPY default.conf /etc/nginx/conf.d/default.conf
+# default.conf will check for ERROR_RATE env var and return 500 for a percentage of requests
+```
+
+`default.conf`:
+```nginx
+server {
+    listen 80;
+    location / {
+        set $error_rate $env_ERROR_RATE;
+        if ($error_rate = "") {
+            set $error_rate "0";
+        }
+
+        # Generate a random number between 0 and 99
+        set $random_num "";
+        perl_set $random_num 'int(rand(100))';
+
+        # If random_num is less than ERROR_RATE, return 500
+        if ($random_num < $error_rate) {
+            return 500 "Internal Server Error\n";
+        }
+
+        return 200 "Hello from NGINX!\n";
+    }
+}
+```
+
+Xây dựng và đẩy hình ảnh này (ví dụ: `myregistry/nginx-error:1.24.0`).
+
+Bây giờ, cập nhật `Rollout` để sử dụng hình ảnh mới này và đặt `ERROR_RATE` thành `20` (20% lỗi).
+
+```yaml
+# rollout-update.yaml (partial update)
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: canary-app
+spec:
+  template:
+    spec:
+      containers:
+      - name: nginx
+        image: myregistry/nginx-error:1.24.0 # New image with potential errors
+        env:
+        - name: ERROR_RATE
+          value: "20" # Introduce 20% errors
+```
+
+Áp dụng bản cập nhật này: `kubectl apply -f rollout-update.yaml --field-manager=kubectl-client-side-apply`
+
+Quan sát trạng thái triển khai: `kubectl argo rollouts get rollout canary-app`.
+Argo Rollouts sẽ triển khai canary mới, chuyển 10% lưu lượng truy cập, và sau đó bước `analysis` sẽ bắt đầu. Prometheus sẽ thu thập các chỉ số từ canary. Chỉ số `error-rate` trong `AnalysisTemplate` sẽ phát hiện tỷ lệ lỗi 20%, vi phạm `result[0] < 0.01`. Argo Rollouts sau đó sẽ tự động hủy bỏ triển khai và khôi phục về phiên bản ổn định.
+
+Bạn sẽ thấy đầu ra tương tự như:
+```
+Name:            canary-app
+Namespace:       default
+Status:          Degraded
+Strategy:        Canary
+  Step:          1/8
+  Message:       Rollout is in Degraded state due to failed AnalysisRun
+  SetWeight:     10%
+  ActualWeight:  10%
+  ...
+  AnalysisRun:   canary-app-canary-app-analysis-xxxx
+    Status:      Failed
+    Message:     Metric 'error-rate' success condition was not met
+```
+
+## Webhook cảnh báo Slack
+
+Tích hợp thông báo Slack cho các sự kiện triển khai. Điều này yêu cầu cấu hình webhook Slack và sau đó tạo một Kubernetes Secret cho nó.
+
+1.  Tạo URL Webhook đến của Slack.
+2.  Lưu trữ nó trong một Kubernetes Secret:
+
+```yaml
+# slack-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: argo-rollouts-slack-webhook
+stringData:
+  url: "https://example.com/api/slack-webhook-placeholder" # Replace with your Slack webhook URL
+```
+
+Áp dụng điều này: `kubectl apply -f slack-secret.yaml`
+
+Bây giờ, cấu hình Argo Rollouts để sử dụng webhook này cho các thông báo. Điều này thường được thực hiện thông qua ConfigMap `argocd-notifications-cm` nếu bạn đang sử dụng Argo CD Notifications, hoặc trực tiếp trong spec `Rollout` nếu sử dụng bộ điều khiển thông báo tùy chỉnh. Để đơn giản, chúng ta sẽ giả định một thiết lập thông báo cơ bản có thể sử dụng webhook.
+
+Một giải pháp mạnh mẽ hơn liên quan đến Argo CD Notifications, có thể được cấu hình để gửi cảnh báo cho các sự kiện `Rollout`.
+
+```yaml
+# Example of Argo CD Notifications ConfigMap entry (if using Argo CD)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-notifications-cm
+  namespace: argocd # Or your Argo CD namespace
+data:
+  service.slack: |
+    token: $argo-rollouts-slack-webhook:url # Reference the secret
+  template.rollout-status: |
+    message: |
+      Rollout {{.app.metadata.name}} status: {{.rollout.status.phase}}
+      {{if .rollout.status.message}}Message: {{.rollout.status.message}}{{end}}
+      {{if .rollout.status.canary.currentStepIndex}}Current Step: {{.rollout.status.canary.currentStepIndex}}/{{len .rollout.spec.strategy.canary.steps}}{{end}}
+      {{if .rollout.status.canary.trafficRouting.gatewayAPI.currentWeight}}Traffic Weight: {{.rollout.status.canary.trafficRouting.gatewayAPI.currentWeight}}%{{end}}
+    slack:
+      attachments:
+      - title: Rollout Details
+        title_link: {{.context.argocdUrl}}/applications/{{.app.metadata.name}}
+        color: "{{if eq .rollout.status.phase "Succeeded"}}#00FF00{{else if eq .rollout.status.phase "Failed"}}#FF0000{{else}}#FFFF00{{end}}"
+        fields:
+        - title: Application
+          value: {{.app.metadata.name}}
+          short: true
+        - title: Namespace
+          value: {{.app.metadata.namespace}}
+          short: true
+        - title: Status
+          value: {{.rollout.status.phase}}
+          short: true
+        - title: Revision
+          value: {{.rollout.status.currentRevision}}
+          short: true
+  trigger.on-rollout-status-change: |
+    - when: rollout.status.phase != rollout.status.previousPhase
+      send: [rollout-status]
+```
+
+`ConfigMap` này sẽ được áp dụng cho không gian tên Argo CD. Sau đó, trong manifest `Rollout` của bạn, bạn sẽ thêm các chú thích để bật thông báo:
+
+```yaml
+# rollout.yaml (with notification annotations)
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: canary-app
+  annotations:
+    notifications.argoproj.io/subscribe.on-rollout-status-change.slack: "true"
+    # Or specify a channel: notifications.argoproj.io/subscribe.on-rollout-status-change.slack: "#my-channel"
+spec:
+  # ... rest of your rollout spec
+```
+
+## So sánh kiến trúc & đánh đổi
+
+| Tính năng           | Argo Rollouts + Gateway API + Prometheus | Istio + Kiali + Prometheus | Flagger + Linkerd + Prometheus |
+|---------------------|------------------------------------------|----------------------------|--------------------------------|
+| **Kiểm soát lưu lượng** | Gateway API (Envoy, NGINX, v.v.)         | Istio VirtualService/Gateway | Linkerd SMI/TrafficSplit       |
+| **Khả năng quan sát** | Prometheus + AnalysisTemplates           | Prometheus + Kiali         | Prometheus + Grafana           |
+| **Độ phức tạp**     | Trung bình (thiết lập Gateway API)       | Cao (Full Service Mesh)    | Trung bình (thiết lập Linkerd) |
+| **Mặt phẳng dữ liệu** | Bên ngoài (Envoy Gateway, NGINX Ingress) | Envoy Proxy (Sidecar)      | Linkerd Proxy (Sidecar)        |
+| **Sử dụng tài nguyên** | Thấp hơn (Không có sidecar cho ứng dụng) | Cao hơn (Sidecar cho tất cả) | Trung bình (Sidecar cho ứng dụng) |
+| **Tính linh hoạt**  | Cao (Chọn bất kỳ triển khai Gateway API nào) | Cao (Tính năng mesh phong phú) | Tốt (tiêu chuẩn SMI)           |
+| **Đường cong học tập** | Trung bình                               | Cao                        | Trung bình                     |
+| **Trường hợp sử dụng** | Lưu lượng truy cập bên ngoài, kiểm soát chi tiết | Nội bộ/Bên ngoài, mesh nâng cao | Lưu lượng truy cập nội bộ, mesh đơn giản |
+
+Bảng này nhấn mạnh rằng trong khi Istio cung cấp một service mesh toàn diện, cách tiếp cận Argo Rollouts + Gateway API cung cấp một giải pháp mạnh mẽ, nhưng có thể nhẹ hơn, để phân phối lũy tiến tập trung vào lưu lượng truy cập vào, đặc biệt khi tận dụng một Envoy Gateway chuyên dụng. Flagger với Linkerd là một đối thủ mạnh khác, đặc biệt đối với các triển khai canary từ dịch vụ đến dịch vụ nội bộ.
+
+## Những điều cần lưu ý & khắc phục sự cố trong sản xuất
+
+1.  **Cấu hình Prometheus Scrape**:
+    *   **Vấn đề**: Prometheus không thu thập các chỉ số từ các pod ứng dụng của bạn, đặc biệt là canary.
+    *   **Khắc phục**: Đảm bảo các tài nguyên `ServiceMonitor` hoặc `PodMonitor` của bạn nhắm mục tiêu chính xác các pod ứng dụng của bạn, bao gồm cả những pod được tạo bởi Argo Rollouts (sẽ có các nhãn như `rollouts-pod-template-hash`). Xác minh `prometheus.yml` có cấu hình scrape chính xác. Sử dụng `kubectl -n <prometheus-namespace> port-forward svc/prometheus-kube-prometheus-stack 9090` và kiểm tra giao diện người dùng Prometheus trong "Status" -> "Targets".
+
+2.  **Sự cố chuyển đổi lưu lượng Gateway API**:
+    *   **Vấn đề**: Lưu lượng truy cập không chuyển đổi chính xác giữa các dịch vụ ổn định và canary, hoặc `HTTPRoute` không được cập nhật.
+    *   **Khắc phục**:
+        *   Xác minh `GatewayClass` và `Gateway` của bạn được cấu hình chính xác và bộ điều khiển đang chạy.
+        *   Kiểm tra nhật ký Argo Rollouts (`kubectl logs -f -n argo-rollouts deploy/argo-rollouts`) để tìm lỗi liên quan đến cập nhật Gateway API.
+        *   Kiểm tra trực tiếp tài nguyên `HTTPRoute` (`kubectl get httproute canary-app-route -o yaml`) để xem liệu Argo Rollouts có đang cố gắng sửa đổi trọng số `backendRefs` của nó hay không.
+        *   Đảm bảo `controllerName` trong phần `trafficRouting.gatewayAPI` của `Rollout` của bạn khớp chính xác với `controllerName` được định nghĩa trong `GatewayClass` của bạn. Đây là một cấu hình sai phổ biến.
+
+3.  **Lỗi truy vấn AnalysisTemplate**:
+    *   **Vấn đề**: Các lần chạy phân tích thất bại với "no data" hoặc "query error" ngay cả khi các chỉ số tồn tại.
+    *   **Khắc phục**:
+        *   **Địa chỉ Prometheus**: Kiểm tra kỹ `address` trong phần `prometheus` của `AnalysisTemplate` của bạn. Nó phải là tên dịch vụ và cổng chính xác cho phiên bản Prometheus của bạn trong cụm (ví dụ: `http://prometheus-kube-prometheus-stack.monitoring:9090`).
+        *   **Cú pháp truy vấn**: Kiểm tra các truy vấn Prometheus của bạn trực tiếp trong giao diện người dùng Prometheus. Đảm bảo chúng trả về dữ liệu hợp lệ cho cả dịch vụ ổn định và canary. Chú ý kỹ đến việc khớp nhãn (`service="{{args.service}}"`).
+        *   **Phạm vi thời gian**: Đảm bảo `interval` và cửa sổ thời gian trong truy vấn Prometheus của bạn (ví dụ: `[5m]`) phù hợp với khối lượng lưu lượng truy cập và tốc độ tạo chỉ số của bạn. Nếu lưu lượng truy cập thưa thớt, có thể cần một cửa sổ dài hơn.
+
+4.  **Rollout bị kẹt ở trạng thái tạm dừng**:
+    *   **Vấn đề**: Rollout bị kẹt ở bước `pause: {}` vô thời hạn.
+    *   **Khắc phục**: Điều này được mong đợi đối với các lần tạm dừng thủ công. Để tiếp tục, hãy sử dụng `kubectl argo rollouts promote canary-app`. Đối với các lần tạm dừng tự động, đảm bảo `duration` được đặt chính xác và không có điều kiện nào khác ngăn cản tiến trình (ví dụ: một bước `analysis` trước đó vẫn đang chạy hoặc đã thất bại).
+
+5.  **Giới hạn tài nguyên**:
+    *   **Vấn đề**: Bộ điều khiển Argo Rollouts hoặc các pod Prometheus đang gặp sự cố hoặc hoạt động kém.
+    *   **Khắc phục**: Xem xét các yêu cầu và giới hạn tài nguyên cho triển khai `argo-rollouts` và các thành phần Prometheus. Tăng CPU/bộ nhớ nếu cần, đặc biệt trong các cụm bận rộn hoặc với nhiều lần triển khai/chỉ số.
+
+## Các câu hỏi thường gặp
+
+1.  **Tôi có thể sử dụng các bộ điều khiển ingress khác ngoài Envoy Gateway với Gateway API không?**
+    Có. Vẻ đẹp của Gateway API là tính trừu tượng của nó. Miễn là bộ điều khiển ingress của bạn triển khai đặc tả Gateway API (ví dụ: NGINX Gateway Fabric, Contour, Istio), Argo Rollouts có thể tích hợp với nó. Bạn chỉ cần đảm bảo `controllerName` trong `Rollout` của bạn khớp với `GatewayClass` của bạn.
+
+2.  **Làm cách nào để xử lý việc di chuyển lược đồ cơ sở dữ liệu với các triển khai canary?**
+    Việc di chuyển lược đồ cơ sở dữ liệu rất phức tạp với các canary. Cách tiếp cận chung là thực hiện các di chuyển tương thích ngược, cho phép cả phiên bản ứng dụng cũ và mới chạy đồng thời trên cùng một lược đồ cơ sở dữ liệu. Điều này thường liên quan đến việc di chuyển hai bước:
+    1.  Thêm các cột/bảng mới, nhưng giữ lại các cột/bảng cũ. Triển khai phiên bản ứng dụng mới.
+    2.  Khi ứng dụng mới được quảng bá hoàn toàn, hãy xóa các cột/bảng cũ trong một lần di chuyển tiếp theo.
+    Ngoài ra, hãy sử dụng chiến lược blue/green cho các thay đổi cơ sở dữ liệu, hoặc một quy trình di chuyển riêng biệt, được kiểm soát chặt chẽ.
+
+3.  **Điều gì sẽ xảy ra nếu ứng dụng của tôi không hiển thị các chỉ số Prometheus?**
+    Bạn phải đo lường ứng dụng của mình để hiển thị các chỉ số ở định dạng Prometheus. Đối với các dịch vụ HTTP, các chỉ số phổ biến bao gồm số lượng yêu cầu, thời lượng và mã trạng thái. Các thư viện tồn tại cho hầu hết các ngôn ngữ (ví dụ: `prom-client` cho Node.js, `prometheus_client` cho Python, `micrometer` cho Java). Nếu việc đo lường trực tiếp không khả thi, hãy cân nhắc sử dụng proxy sidecar (như Envoy hoặc Linkerd) có thể tự động thu thập các chỉ số HTTP, hoặc bộ điều khiển ingress NGINX hiển thị các chỉ số.
+
+4.  **Làm cách nào để làm cho `AnalysisTemplate` của tôi mạnh mẽ hơn, ví dụ: xử lý các tình huống lưu lượng truy cập thấp?**
+    Đối với lưu lượng truy cập thấp, các truy vấn `rate()` có thể trả về `NaN` hoặc không, dẫn đến dương tính/âm tính giả.
+    *   **`irate()` so với `rate()`**: `irate()` nhạy cảm hơn với các đột biến nhưng có thể gây nhiễu. `rate()` làm mịn theo thời gian. Chọn dựa trên nhu cầu về độ nhạy.
+    *   **Toán tử `unless`**: Sử dụng `unless` để ngăn chia cho 0 hoặc để xử lý các trường hợp không có yêu cầu nào được quan sát. Ví dụ: `(sum(rate(http_requests_total{...}[5m])) by (service) unless sum(rate(http_requests_total{...}[5m])) by (service) == 0)`.
+    *   **Ngưỡng yêu cầu tối thiểu**: Thêm một kiểm tra chỉ số riêng biệt trong `AnalysisTemplate` của bạn để đảm bảo số lượng yêu cầu tối thiểu đã được xử lý bởi canary trước khi đánh giá SLI. Ví dụ: `successCondition: "result[0] > 100"` cho một truy vấn `sum(increase(http_requests_total{...}[5m]))`.
+    *   **`absent_over_time()`**: Có thể được sử dụng để phát hiện nếu một chỉ số đã biến mất, điều này có thể cho thấy một vấn đề.
+
+5.  **Tôi có thể sử dụng nhiều `AnalysisTemplate` trong một bước `Rollout` không?**
+    Có, bạn có thể chỉ định nhiều `templates` trong một khối `analysis` trong một bước `Rollout`. Argo Rollouts sẽ chạy tất cả các phân tích được chỉ định đồng thời, và bước đó sẽ chỉ thành công nếu *tất cả* các phân tích thành công. Điều này cho phép xác thực toàn diện trên các SLI khác nhau.
+
+```yaml
+      - analysis:
+          templates:
+          - templateName: canary-app-error-rate-analysis
+          - templateName: canary-app-p99-latency-analysis
+          args:
+          - name: service
+            value: "canary-app-canary"
+```
+Điều này kết thúc hướng dẫn về việc triển khai phân phối lũy tiến tự động với Argo Rollouts, Gateway API và Prometheus. Bằng cách tuân theo các mẫu này, bạn có thể thiết lập một quy trình triển khai mạnh mẽ và đáng tin cậy, tự động xác thực các bản phát hành mới dựa trên các SLO quan trọng.

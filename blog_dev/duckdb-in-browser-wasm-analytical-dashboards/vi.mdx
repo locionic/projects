@@ -1,0 +1,455 @@
+---
+title: "DuckDB-Wasm trong các ứng dụng web hiện đại: OLAP phía client, truyền tải Parquet và bảng điều khiển dưới một giây"
+images: ['/static/images/duckdb-in-browser-wasm-analytical-dashboards.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["database", "webassembly", "duckdb", "frontend", "performance"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Intermediate"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về duckdb-wasm trong các ứng dụng web hiện đại: OLAP phía client, truyền tải Parquet và bảng điều khiển dưới một giây với kiến trúc cấp độ sản xuất và các ví dụ mã."
+---
+
+DuckDB-Wasm cho phép thực hiện các tác vụ phân tích trực tiếp trong trình duyệt, loại bỏ nhu cầu tính toán phía máy chủ cho nhiều trường hợp sử dụng OLAP. Hướng dẫn này trình bày chi tiết cách xây dựng các bảng điều khiển phân tích không tốn chi phí backend, tận dụng DuckDB-Wasm để xử lý dữ liệu phía máy khách, truyền tải Parquet từ xa và trực quan hóa hiệu quả các tập dữ liệu lớn.
+
+<AudioPlayer src="/static/audio/duckdb-in-browser-wasm-analytical-dashboards-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Tổng quan kiến trúc
+
+Kiến trúc cốt lõi xoay quanh việc chuyển các tác vụ thực thi SQL nặng sang một Web Worker, duy trì luồng UI phản hồi nhanh. Việc nhập dữ liệu chủ yếu sử dụng các yêu cầu HTTP range để truyền tải các tệp Parquet từ xa, giảm thiểu thời gian tải ban đầu và dung lượng bộ nhớ. Trực quan hóa tận dụng bộ đệm bộ nhớ zero-copy của Apache Arrow để hiển thị trực tiếp, bỏ qua các chu trình tuần tự hóa/giải tuần tự hóa tốn kém.
+
+### Các thành phần chính:
+
+1.  **DuckDB-Wasm Web Worker**: Cô lập phiên bản DuckDB, ngăn chặn luồng UI bị chặn trong quá trình thực thi truy vấn. Xử lý khởi tạo cơ sở dữ liệu, đăng ký tệp Parquet và xử lý truy vấn SQL.
+2.  **Yêu cầu HTTP Range**: Chỉ tìm nạp các phần cần thiết của tệp Parquet từ xa, cho phép truyền tải hiệu quả và giảm chi phí mạng.
+3.  **Apache Arrow**: Định dạng đầu ra gốc của DuckDB-Wasm. Cung cấp một biểu diễn dạng cột, tiết kiệm bộ nhớ của kết quả truy vấn, có thể được các thư viện trực quan hóa sử dụng trực tiếp.
+4.  **Biểu đồ dựa trên Canvas**: Đối với các tập dữ liệu có hơn 500 nghìn hàng, các thư viện biểu đồ truyền thống dựa trên DOM trở thành nút thắt cổ chai về hiệu suất. Canvas cung cấp khả năng thao tác pixel trực tiếp, lý tưởng cho việc hiển thị thông lượng cao với dữ liệu Arrow.
+5.  **SharedArrayBuffer & Atomics**: Tạo điều kiện giao tiếp hiệu quả giữa luồng chính và Web Worker, đặc biệt để truyền các bộ đệm Arrow lớn mà không cần sao chép.
+
+## Thiết lập DuckDB-Wasm
+
+Khởi tạo DuckDB-Wasm trong một Web Worker để đảm bảo khả năng phản hồi của UI. Luồng chính giao tiếp với worker này thông qua `postMessage`.
+
+### Khởi tạo Worker (`duckdb.worker.ts`)
+
+```typescript
+// duckdb.worker.ts
+import * as duckdb from '@duckdb/duckdb-wasm';
+import duckdb_wasm from '@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm';
+import duckdb_wasm_next from '@duckdb/duckdb-wasm/dist/duckdb-eh.wasm';
+
+// Define the DuckDB bundle configuration
+const DUCKDB_BUNDLES: duckdb.DuckDBBundles = {
+  mvp: {
+    mainModule: duckdb_wasm,
+    mainWorker: new URL('@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js', import.meta.url).toString(),
+  },
+  eh: {
+    mainModule: duckdb_wasm_next,
+    mainWorker: new URL('@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js', import.meta.url).toString(),
+  },
+};
+
+let db: duckdb.AsyncDuckDB | null = null;
+let conn: duckdb.AsyncDuckDBConnection | null = null;
+
+// Initialize DuckDB and establish a connection
+async function initializeDuckDB() {
+  if (db && conn) return;
+
+  const logger = new duckdb.ConsoleLogger();
+  const bundle = await duckdb.selectBundle(DUCKDB_BUNDLES);
+
+  // Instantiate the database
+  db = new duckdb.AsyncDuckDB(logger, bundle);
+  await db.instantiate(bundle.mainWorker);
+  conn = await db.connect();
+
+  console.log('DuckDB-Wasm initialized in worker.');
+}
+
+// Handle messages from the main thread
+self.onmessage = async (event: MessageEvent) => {
+  const { id, type, payload } = event.data;
+
+  try {
+    if (type === 'init') {
+      await initializeDuckDB();
+      self.postMessage({ id, type: 'init_success' });
+    } else if (type === 'execute_sql') {
+      if (!conn) throw new Error('DuckDB connection not established.');
+
+      const { sql } = payload;
+      console.log(`Executing SQL: ${sql}`);
+
+      // Execute query and get results as Arrow
+      const result = await conn.query(sql);
+
+      // Transfer Arrow IPC buffer back to main thread
+      // The toIPC method serializes the Arrow table into an IPC stream buffer.
+      const arrowBuffer = result.toIPC();
+      self.postMessage({ id, type: 'execute_sql_success', payload: arrowBuffer }, [arrowBuffer]);
+    } else if (type === 'register_parquet_url') {
+      if (!db) throw new Error('DuckDB not initialized.');
+
+      const { url, tableName } = payload;
+      console.log(`Registering Parquet URL: ${url} as ${tableName}`);
+
+      // Register a remote Parquet file. DuckDB-Wasm handles HTTP range requests internally.
+      await db.registerFileURL(tableName, url, duckdb.DuckDBDataProtocol.HTTP, false);
+      self.postMessage({ id, type: 'register_parquet_url_success' });
+    } else {
+      throw new Error(`Unknown message type: ${type}`);
+    }
+  } catch (error: any) {
+    console.error(`Worker error for message ID ${id}:`, error);
+    self.postMessage({ id, type: 'error', payload: error.message });
+  }
+};
+```
+
+### Giao diện luồng chính (`duckdb.service.ts`)
+
+```typescript
+// duckdb.service.ts
+import { Table } from 'apache-arrow';
+
+// Using a dedicated worker for DuckDB operations
+const worker = new Worker(new URL('./duckdb.worker.ts', import.meta.url), { type: 'module' });
+
+// Map to store pending requests and resolve them
+const pendingRequests = new Map<string, { resolve: Function; reject: Function }>();
+let messageIdCounter = 0;
+
+worker.onmessage = (event: MessageEvent) => {
+  const { id, type, payload } = event.data;
+  const request = pendingRequests.get(id);
+
+  if (request) {
+    if (type === 'error') {
+      request.reject(new Error(payload));
+    } else if (type === 'execute_sql_success') {
+      // Reconstruct Arrow Table from the transferred buffer
+      const table = Table.from([new Uint8Array(payload)]);
+      request.resolve(table);
+    } else {
+      request.resolve(payload);
+    }
+    pendingRequests.delete(id);
+  } else {
+    console.warn(`Received message for unknown request ID: ${id}`);
+  }
+};
+
+function sendMessageToWorker(type: string, payload?: any): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const id = `msg_${messageIdCounter++}`;
+    pendingRequests.set(id, { resolve, reject });
+    worker.postMessage({ id, type, payload });
+  });
+}
+
+export const duckdbService = {
+  init: () => sendMessageToWorker('init'),
+
+  /**
+   * Registers a remote Parquet file URL with DuckDB.
+   * DuckDB-Wasm will use HTTP range requests to access this file.
+   * @param url The URL of the Parquet file.
+   * @param tableName The name to register the table as in DuckDB.
+   */
+  registerParquetUrl: (url: string, tableName: string) =>
+    sendMessageToWorker('register_parquet_url', { url, tableName }),
+
+  /**
+   * Executes a SQL query and returns the result as an Apache Arrow Table.
+   * @param sql The SQL query string.
+   * @returns A Promise that resolves to an Apache Arrow Table.
+   */
+  executeSql: async (sql: string): Promise<Table> =>
+    sendMessageToWorker('execute_sql', { sql }),
+};
+
+// Initialize DuckDB-Wasm when the service is imported
+duckdbService.init().catch(console.error);
+```
+
+## Truyền tải tệp Parquet từ xa
+
+DuckDB-Wasm hỗ trợ đọc các tệp Parquet từ xa thông qua các yêu cầu HTTP range. Điều này rất quan trọng đối với hiệu suất vì nó tránh tải xuống toàn bộ tệp ngay từ đầu.
+
+```typescript
+// Example usage in a React component or similar
+import React, { useEffect, useState } from 'react';
+import { duckdbService } from './duckdb.service';
+import { Table } from 'apache-arrow';
+
+const ParquetDataLoader: React.FC = () => {
+  const [data, setData] = useState<Table | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const loadData = async () => {
+      try {
+        // Ensure DuckDB is initialized
+        await duckdbService.init();
+
+        const parquetUrl = 'https://example.com/path/to/your/large_dataset.parquet';
+        const tableName = 'my_data';
+
+        // Register the remote Parquet file
+        await duckdbService.registerParquetUrl(parquetUrl, tableName);
+
+        // Execute a query to fetch some data
+        // DuckDB will automatically fetch only the necessary parts of the Parquet file
+        const resultTable = await duckdbService.executeSql(`
+          SELECT
+            category,
+            SUM(value) AS total_value,
+            COUNT(*) AS record_count
+          FROM my_data
+          WHERE timestamp > '2023-01-01'
+          GROUP BY category
+          ORDER BY total_value DESC
+          LIMIT 10;
+        `);
+
+        setData(resultTable);
+      } catch (err: any) {
+        setError(err.message);
+        console.error('Failed to load Parquet data:', err);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    loadData();
+  }, []);
+
+  if (loading) return <div>Loading data...</div>;
+  if (error) return <div>Error: {error}</div>;
+  if (!data) return <div>No data loaded.</div>;
+
+  return (
+    <div>
+      <h2>Top Categories by Value</h2>
+      <pre>{JSON.stringify(data.toArray().map(row => row.toJSON()), null, 2)}</pre>
+      {/* Render chart here using 'data' */}
+    </div>
+  );
+};
+
+export default ParquetDataLoader;
+```
+
+## Trực quan hóa hơn 500 nghìn hàng với Apache Arrow & Canvas
+
+Việc hiển thị trực tiếp các Bảng Arrow lớn bằng các phần tử DOM không hiệu quả. Canvas cung cấp một giải pháp thay thế hiệu quả. Ở đây, chúng ta sẽ phác thảo một cách tiếp cận khái niệm cho biểu đồ phân tán, thể hiện tiện ích của Arrow.
+
+```typescript
+// components/ArrowScatterPlot.tsx
+import React, { useRef, useEffect } from 'react';
+import { Table } from 'apache-arrow';
+
+interface ArrowScatterPlotProps {
+  data: Table;
+  xColumn: string;
+  yColumn: string;
+  width?: number;
+  height?: number;
+  pointColor?: string;
+  pointRadius?: number;
+}
+
+const ArrowScatterPlot: React.FC<ArrowScatterPlotProps> = ({
+  data,
+  xColumn,
+  yColumn,
+  width = 800,
+  height = 400,
+  pointColor = 'rgba(75, 192, 192, 0.5)',
+  pointRadius = 2,
+}) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    if (!data || !canvasRef.current) return;
+
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, width, height); // Clear previous drawing
+
+    const xData = data.getChild(xColumn);
+    const yData = data.getChild(yColumn);
+
+    if (!xData || !yData || xData.length !== yData.length) {
+      console.warn('Invalid x or y column data for scatter plot.');
+      return;
+    }
+
+    // Determine data bounds for scaling
+    const minX = Math.min(...(xData.toArray() as number[]));
+    const maxX = Math.max(...(xData.toArray() as number[]));
+    const minY = Math.min(...(yData.toArray() as number[]));
+    const maxY = Math.max(...(yData.toArray() as number[]));
+
+    // Simple linear scaling functions
+    const scaleX = (value: number) => {
+      if (maxX === minX) return width / 2; // Avoid division by zero
+      return ((value - minX) / (maxX - minX)) * width;
+    };
+    const scaleY = (value: number) => {
+      if (maxY === minY) return height / 2; // Avoid division by zero
+      // Invert Y-axis for canvas coordinates (0,0 is top-left)
+      return height - (((value - minY) / (maxY - minY)) * height);
+    };
+
+    ctx.fillStyle = pointColor;
+    ctx.beginPath();
+
+    // Iterate directly over Arrow vectors for performance
+    // Using get() is slower than iterating over underlying TypedArrays if possible,
+    // but for demonstration, get() is simpler. For extreme performance,
+    // access xData.data.values directly if it's a primitive type.
+    for (let i = 0; i < data.numRows; i++) {
+      const x = xData.get(i) as number;
+      const y = yData.get(i) as number;
+
+      if (x !== null && y !== null && !isNaN(x) && !isNaN(y)) {
+        const screenX = scaleX(x);
+        const screenY = scaleY(y);
+
+        ctx.moveTo(screenX, screenY); // Move before arc to avoid connecting dots
+        ctx.arc(screenX, screenY, pointRadius, 0, Math.PI * 2);
+      }
+    }
+    ctx.fill();
+
+    // Optional: Draw axes and labels
+    ctx.strokeStyle = '#ccc';
+    ctx.lineWidth = 1;
+    ctx.font = '10px Arial';
+    ctx.fillStyle = '#333';
+
+    // X-axis
+    ctx.beginPath();
+    ctx.moveTo(0, height);
+    ctx.lineTo(width, height);
+    ctx.stroke();
+    ctx.fillText(minX.toFixed(2), 0, height - 5);
+    ctx.fillText(maxX.toFixed(2), width - 30, height - 5);
+
+    // Y-axis
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(0, height);
+    ctx.stroke();
+    ctx.fillText(maxY.toFixed(2), 5, 15);
+    ctx.fillText(minY.toFixed(2), 5, height - 5);
+
+  }, [data, xColumn, yColumn, width, height, pointColor, pointRadius]);
+
+  return <canvas ref={canvasRef} width={width} height={height} style={{ border: '1px solid #eee' }} />;
+};
+
+export default ArrowScatterPlot;
+```
+
+Thành phần `ArrowScatterPlot` này nhận trực tiếp một `Apache Arrow Table`. Sau đó, nó truy cập các cột được chỉ định (`xColumn`, `yColumn`) dưới dạng Arrow Vectors và lặp qua chúng để vẽ các điểm trên Canvas. Cách tiếp cận này tránh chuyển đổi toàn bộ tập dữ liệu thành các đối tượng JavaScript, đây là một nút thắt cổ chai lớn về hiệu suất đối với các tập dữ liệu lớn.
+
+## Đánh đổi kiến trúc
+
+| Tính năng | DuckDB-Wasm phía máy khách | OLAP phía máy chủ (ví dụ: ClickHouse) |
+|---|---|---|
+| **Chi phí** | Không tốn chi phí tính toán backend | Lưu trữ, bảo trì, mở rộng máy chủ |
+| **Độ trễ** | Thực thi cục bộ, mạng chỉ dành cho dữ liệu | Thời gian khứ hồi mạng cho mỗi truy vấn |
+| **Khả năng mở rộng** | Bị giới hạn bởi tài nguyên máy khách (CPU, RAM) | Có thể mở rộng theo chiều ngang |
+| **Kích thước dữ liệu** | Gigabyte (với truyền tải) | Terabyte đến Petabyte |
+| **Bảo mật** | Dữ liệu vẫn ở phía máy khách | Dữ liệu được truyền đến máy chủ |
+| **Độ phức tạp** | Tập trung vào frontend, quản lý Web Worker | Full-stack, quản lý cơ sở hạ tầng |
+| **Ngoại tuyến** | Có thể với dữ liệu cục bộ | Yêu cầu kết nối liên tục |
+| **Tải ban đầu** | Tải xuống gói Wasm (vài MB) | Tối thiểu, chỉ tài sản UI |
+
+## Những vấn đề và cách khắc phục trong sản xuất
+
+1.  **Giới hạn bộ nhớ trình duyệt**: DuckDB-Wasm có thể tiêu thụ bộ nhớ đáng kể, đặc biệt với các kết quả truy vấn trung gian lớn hoặc khi lưu trữ toàn bộ tệp Parquet.
+    *   **Triệu chứng**: Tab trình duyệt bị treo, lỗi "Out of Memory" trong console.
+    *   **Cách khắc phục**:
+        *   **Tối ưu hóa truy vấn**: Viết SQL hiệu quả. Sử dụng các mệnh đề `LIMIT`, các hàm tổng hợp `GROUP BY` và các vị từ `FILTER` sớm.
+        *   **Truyền tải**: Đảm bảo các tệp Parquet được đăng ký thông qua `registerFileURL` với `DuckDBDataProtocol.HTTP` để bật yêu cầu range. Tránh `registerFileBuffer` cho các tệp lớn.
+        *   **Thu gom rác**: DuckDB-Wasm quản lý bộ nhớ riêng của nó. Đóng rõ ràng các kết nối (`conn.close()`) và các phiên bản cơ sở dữ liệu (`db.terminate()`) khi không còn cần thiết, mặc dù đối với một bảng điều khiển liên tục, điều này ít phổ biến hơn.
+        *   **`PRAGMA memory_limit`**: Đặt giới hạn bộ nhớ trong DuckDB-Wasm.
+            ```sql
+            PRAGMA memory_limit='2GB'; -- Example: limit to 2GB
+            ```
+            Điều này có thể ngăn chặn sự cố bằng cách làm cho các truy vấn thất bại một cách nhẹ nhàng nếu chúng vượt quá giới hạn.
+2.  **Chi phí giao tiếp của Web Worker**: Chuyển các bộ đệm Arrow lớn giữa luồng chính và worker.
+    *   **Triệu chứng**: UI bị giật, sử dụng CPU cao trong quá trình truyền dữ liệu.
+    *   **Cách khắc phục**:
+        *   **Đối tượng có thể chuyển giao**: Luôn sử dụng `postMessage(data, [transferableObjects])` cho `ArrayBuffer` (như bộ đệm Arrow IPC). Điều này di chuyển quyền sở hữu, tránh sao chép. `duckdb.service.ts` được cung cấp đã làm điều này.
+        *   **Giảm thiểu việc chuyển giao**: Chỉ chuyển dữ liệu cuối cùng, tổng hợp cần thiết cho trực quan hóa, không phải kết quả trung gian thô.
+3.  **Chia sẻ tài nguyên đa nguồn gốc (CORS)**: Truy cập các tệp Parquet từ xa.
+    *   **Triệu chứng**: Lỗi `Failed to fetch`, `CORS policy` trong console khi `registerFileURL` được gọi.
+    *   **Cách khắc phục**: Máy chủ lưu trữ các tệp Parquet phải bao gồm các tiêu đề CORS thích hợp, đặc biệt cho phép các yêu cầu `Range`.
+        ```
+        Access-Control-Allow-Origin: *
+        Access-Control-Allow-Methods: GET, HEAD
+        Access-Control-Allow-Headers: Range
+        Access-Control-Expose-Headers: Accept-Ranges, Content-Encoding, Content-Length, Content-Range
+        ```
+        `Access-Control-Expose-Headers` cho `Content-Range` rất quan trọng để các yêu cầu range hoạt động chính xác.
+4.  **Lỗi tải gói Wasm**: Sự cố mạng hoặc đường dẫn không chính xác cho các tệp Wasm.
+    *   **Triệu chứng**: `Failed to load module`, `TypeError: Failed to fetch` liên quan đến các tệp `.wasm` hoặc `.worker.js`.
+    *   **Cách khắc phục**:
+        *   **Xác minh đường dẫn**: Đảm bảo `DUCKDB_BUNDLES` trong `duckdb.worker.ts` trỏ chính xác đến các tệp Wasm và worker JS tương đối với ngữ cảnh thực thi của worker.
+        *   **Cấu hình Bundler**: Nếu sử dụng Webpack/Vite, đảm bảo `file-loader` hoặc tương tự được cấu hình để xử lý các tệp `.wasm` và các tập lệnh worker được đóng gói chính xác. Vite xử lý tốt điều này với `new URL('...', import.meta.url)`.
+        *   **Kiểm tra mạng**: Xác nhận trình duyệt thực sự có thể tải xuống các tệp Wasm.
+5.  **Hiệu suất truy vấn SQL**: Truy vấn chậm trên các tập dữ liệu lớn.
+    *   **Triệu chứng**: Thời gian chờ đợi lâu cho các cuộc gọi `executeSql`.
+    *   **Cách khắc phục**:
+        *   **Truy cập theo cột**: DuckDB là dạng cột. Các truy vấn chỉ chọn một vài cột từ một bảng rộng sẽ nhanh hơn.
+        *   **Đẩy vị từ xuống**: Các bộ lọc (mệnh đề `WHERE`) được đẩy xuống trình đọc Parquet, giảm dữ liệu được xử lý.
+        *   **Tổng hợp**: Thực hiện tổng hợp sớm trong truy vấn.
+        *   **`EXPLAIN`**: Sử dụng `EXPLAIN` để hiểu kế hoạch truy vấn và xác định các nút thắt cổ chai.
+            ```sql
+            EXPLAIN SELECT ... FROM my_data WHERE ...;
+            ```
+6.  **Xử lý ngày/giờ**: Không nhất quán giữa các đối tượng JavaScript `Date` và các kiểu nội bộ của DuckDB.
+    *   **Triệu chứng**: Lọc hoặc hiển thị dữ liệu ngày/giờ không chính xác.
+    *   **Cách khắc phục**:
+        *   **ISO 8601**: Truyền các chuỗi ngày/giờ đến DuckDB ở định dạng ISO 8601 (ví dụ: `'2023-10-27T10:00:00Z'`) để phân tích cú pháp đáng tin cậy.
+        *   **Arrow `Date` / `Timestamp` Types**: Khi nhận Bảng Arrow, hãy lưu ý các kiểu ngày/giờ Arrow cụ thể (ví dụ: `TimestampMillisecond`, `DateDay`). Chuyển đổi chúng thành các đối tượng JavaScript `Date` khi cần để hiển thị.
+
+## Câu hỏi thường gặp
+
+1.  **DuckDB-Wasm có thể lưu trữ dữ liệu cục bộ không?**
+    Có. DuckDB-Wasm hỗ trợ nhiều backend lưu trữ khác nhau. Bạn có thể sử dụng `duckdb.DuckDBDataProtocol.BROWSER_FS` để lưu trữ dữ liệu trong IndexedDB của trình duyệt, cho phép lưu trữ liên tục giữa các phiên. Điều này yêu cầu thiết lập API `FileSystem` trong worker.
+    ```typescript
+    // In worker initialization
+    await db.instantiate(bundle.mainWorker, {
+      query: {
+        'default_connection': {
+          'user_agent': navigator.userAgent,
+          'allow_unsigned_http_requests': 'true', // For HTTP range requests
+        },
+        'default_database': {
+          'path': 'my_persistent_db.duckdb', // Name for IndexedDB storage
+          'type': 'browser_fs',
+        },
+      },
+    });
+    ```
+2.  **DuckDB-Wasm xử lý các truy vấn đồng thời như thế nào?**
+    Một phiên bản DuckDB-Wasm duy nhất (và do đó là một `AsyncDuckDBConnection` duy nhất) xử lý các truy vấn tuần tự. Để có sự đồng thời thực sự, bạn sẽ cần nhiều Web Worker, mỗi worker có phiên bản DuckDB riêng. Tuy nhiên, điều này làm tăng mức tiêu thụ bộ nhớ. Đối với hầu hết các kịch bản bảng điều khiển, một worker duy nhất là đủ, vì các truy vấn thường có thời gian tồn tại ngắn.
+3.  **Kích thước dữ liệu tối đa mà DuckDB-Wasm có thể xử lý là bao nhiêu?**
+    Mặc dù bị giới hạn bởi bộ nhớ máy khách, với việc truyền tải Parquet hiệu quả và tối ưu hóa truy vấn, DuckDB-Wasm có thể truy vấn hiệu quả các tập dữ liệu trong phạm vi gigabyte (ví dụ: 1-10 GB) mà không cần tải toàn bộ tập dữ liệu vào RAM. Điều quan trọng là chỉ tìm nạp và xử lý các khối dữ liệu cần thiết.
+4.  **Tôi có thể sử dụng DuckDB-Wasm với các định dạng dữ liệu khác như CSV hoặc JSON không?**
+    Có. DuckDB-Wasm hỗ trợ đọc các tệp CSV và JSON. Đối với các tệp từ xa, `registerFileURL` có thể được sử dụng với `DuckDBDataProtocol.HTTP` và loại tệp thích hợp (ví dụ: `CREATE TABLE my_csv AS SELECT * FROM read_csv_auto('https://example.com/data.csv');`). Tuy nhiên, Parquet thường được ưu tiên cho các tác vụ phân tích do bản chất dạng cột, khả năng nén và đẩy vị từ xuống, làm cho nó hiệu quả hơn đáng kể đối với các tập dữ liệu lớn.
+5.  **DuckDB-Wasm so sánh với các thư viện dữ liệu JavaScript phía máy khách (ví dụ: Data-Forge, Lodash) như thế nào?**
+    DuckDB-Wasm mang lại hiệu suất vượt trội cho các tác vụ SQL phân tích trên các tập dữ liệu lớn. Nó được viết bằng C++ và được biên dịch thành WebAssembly, cung cấp tốc độ thực thi gần như gốc. Nó tận dụng xử lý dạng cột và thực thi vector hóa, điều mà các thư viện JavaScript thường không thể sánh kịp. Đối với thao tác dữ liệu đơn giản trên các tập dữ liệu nhỏ, các thư viện JS có thể đủ, nhưng đối với các tổng hợp, kết hợp và bộ lọc phức tạp trên hàng trăm nghìn hoặc hàng triệu hàng, DuckDB-Wasm nhanh hơn nhiều lần.

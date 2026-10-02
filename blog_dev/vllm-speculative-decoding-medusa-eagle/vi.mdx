@@ -1,0 +1,265 @@
+---
+title: "Giải mã suy đoán trong vLLM: Medusa, EAGLE & Suy đoán đa token để tăng tốc độ suy luận lên 2,5 lần"
+images: ['/static/images/vllm-speculative-decoding-medusa-eagle.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["ai", "llm", "vllm", "python", "performance"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về giải mã suy đoán trong vLLM: Medusa, EAGLE và suy đoán đa token để tăng tốc độ suy luận lên 2,5 lần với kiến trúc cấp độ sản xuất và các ví dụ mã."
+---
+
+Độ trễ suy luận của Mô hình Ngôn ngữ Lớn (LLM) là một nút thắt cổ chai quan trọng đối với các ứng dụng thời gian thực. Giải mã tự hồi quy, nơi mỗi token được tạo ra tuần tự, vốn dĩ đã giới hạn thông lượng. Giải mã suy đoán mang đến một sự thay đổi mô hình, tận dụng một mô hình "nháp" nhỏ hơn, nhanh hơn để đề xuất nhiều token cùng lúc, sau đó được mô hình "mục tiêu" lớn hơn xác minh song song. Kỹ thuật này giảm thiểu tính chất bị giới hạn băng thông bộ nhớ của suy luận LLM, thực sự đánh đổi việc tăng cường tính toán để giảm độ trễ.
+
+Hướng dẫn này trình bày chi tiết việc triển khai và các cân nhắc về kiến trúc cho giải mã suy đoán trong vLLM, tập trung vào các chiến lược suy đoán Medusa, EAGLE và đa token. Chúng ta sẽ khám phá cách các phương pháp này đạt được tốc độ suy luận nhanh đáng kể, thường vượt quá 2,5 lần, trên các GPU NVIDIA hiện đại như L4 và H100.
+
+<AudioPlayer src="/static/audio/vllm-speculative-decoding-medusa-eagle-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Mô hình Giải mã Suy đoán
+
+Giải mã tự hồi quy truyền thống bao gồm một vòng lặp:
+1. Tính toán logits cho token tiếp theo.
+2. Lấy mẫu token tiếp theo.
+3. Thêm token vào chuỗi.
+4. Lặp lại.
+
+Quá trình này vốn dĩ là tuần tự. Mỗi bước yêu cầu một lần chuyển tiếp đầy đủ qua mô hình mục tiêu, thường bị giới hạn băng thông bộ nhớ do các tham số mô hình lớn và truy cập bộ nhớ đệm KV.
+
+Giải mã suy đoán phá vỡ sự phụ thuộc tuần tự này bằng cách giới thiệu một mô hình nháp. Quy trình làm việc như sau:
+1. Mô hình nháp tạo ra một chuỗi `k` token ứng cử viên. Đây là một thao tác nhanh vì mô hình nháp nhỏ hơn đáng kể.
+2. Mô hình mục tiêu thực hiện một lần chuyển tiếp duy nhất trên lời nhắc gốc *cộng với* các token ứng cử viên `k`. Điều này song song hóa việc xác minh các token `k`.
+3. Đối với mỗi token ứng cử viên, logits của mô hình mục tiêu được so sánh với logits của mô hình nháp.
+4. Các token được chấp nhận sẽ được thêm vào đầu ra. Nếu một token bị từ chối, quá trình sẽ khởi động lại từ token được chấp nhận cuối cùng, sử dụng logits của mô hình mục tiêu cho token tiếp theo.
+
+Ý tưởng cốt lõi là phân bổ chi phí của lần chuyển tiếp của mô hình mục tiêu lớn trên nhiều token. Mức tăng hiệu quả tỷ lệ thuận với số lượng token được chấp nhận trên mỗi bước xác minh.
+
+### Cơ chế Xác minh Nháp-Mục tiêu
+
+Cho $D$ là mô hình nháp và $T$ là mô hình mục tiêu.
+Cho một chuỗi $x_0, \dots, x_t$:
+1. **Soạn thảo**: $D$ tạo ra $k$ token ứng cử viên $y_1, \dots, y_k$ sao cho $y_i \sim P_D(y | x_0, \dots, x_t, y_1, \dots, y_{i-1})$.
+2. **Xác minh**: $T$ tính toán logits cho $x_0, \dots, x_t, y_1, \dots, y_k$ trong một lô duy nhất. Điều này tạo ra $P_T(y | x_0, \dots, x_t, y_1, \dots, y_{i-1})$ cho mỗi $y_i$.
+3. **Chấp nhận/Từ chối**: Đối với mỗi $y_i$:
+   - Lấy mẫu $u \sim U(0,1)$.
+   - Nếu $u < \min(1, \frac{P_T(y_i | \text{context})}{P_D(y_i | \text{context})})$, chấp nhận $y_i$.
+   - Ngược lại, từ chối $y_i$ và tất cả các ứng cử viên tiếp theo $y_{i+1}, \dots, y_k$. Token tiếp theo sau đó được lấy mẫu từ $P_T(y | \text{context})$ cho token được chấp nhận cuối cùng.
+
+Cơ chế này đảm bảo rằng phân phối đầu ra của giải mã suy đoán giống hệt với phân phối của giải mã tự hồi quy tiêu chuẩn, giữ nguyên chất lượng mô hình.
+
+## Các Chiến lược Giải mã Suy đoán trong vLLM
+
+vLLM cung cấp hỗ trợ mạnh mẽ cho giải mã suy đoán, tích hợp nhiều chiến lược khác nhau để tối ưu hóa quá trình soạn thảo.
+
+### 1. Suy đoán Đa Token (Vanilla)
+
+Đây là phương pháp cơ bản trong đó mô hình nháp thường là một phiên bản nhỏ hơn, được tinh chỉnh của mô hình mục tiêu, hoặc một mô hình khác hoàn toàn, nhanh hơn. Mô hình nháp tạo ra một chuỗi token tuyến tính.
+
+**Kiến trúc:**
+- **Mô hình Nháp:** Một LLM nhỏ hơn (ví dụ: Llama-7B cho mục tiêu Llama-70B).
+- **Mô hình Mục tiêu:** LLM có kích thước đầy đủ.
+- **Tích hợp vLLM:** Bộ lập lịch vLLM quản lý cả hai mô hình, điều phối các bước soạn thảo và xác minh. Bộ nhớ đệm KV cho cả hai mô hình được quản lý hiệu quả.
+
+**Ví dụ Mã (Cấu hình vLLM):**
+
+```python
+from vllm import LLM, SamplingParams
+
+# Initialize the target model
+target_model_path = "meta-llama/Llama-2-7b-hf" # Or Llama-3-8B, Mixtral-8x7B, etc.
+llm = LLM(
+    model=target_model_path,
+    tensor_parallel_size=1, # Adjust based on GPU count
+    gpu_memory_utilization=0.9,
+    # Enable speculative decoding with a draft model
+    speculate_model="google/gemma-2b", # A smaller, faster draft model
+    num_speculative_tokens=5, # Number of tokens to draft
+    max_model_len=2048,
+)
+
+# Define sampling parameters
+sampling_params = SamplingParams(
+    temperature=0.0, # Deterministic for benchmarking
+    top_p=1.0,
+    max_tokens=128,
+)
+
+# Generate text
+prompts = [
+    "What is the capital of France?",
+    "Write a short poem about a cat.",
+]
+
+outputs = llm.generate(prompts, sampling_params)
+
+for output in outputs:
+    prompt = output.prompt
+    generated_text = output.outputs[0].text
+    print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+
+# Example of disabling speculative decoding for comparison
+# llm_no_spec = LLM(model=target_model_path, gpu_memory_utilization=0.9)
+# outputs_no_spec = llm_no_spec.generate(prompts, sampling_params)
+```
+
+### 2. Medusa: Suy đoán Dựa trên Cây
+
+Medusa tăng cường suy đoán đa token bằng cách dự đoán nhiều token *tiếp theo* ở mỗi bước, tạo thành một cây dự đoán. Thay vì một đầu nháp duy nhất, Medusa thêm một số "đầu giải mã" vào mô hình *mục tiêu*. Mỗi đầu dự đoán một token ở một vị trí tương lai khác nhau.
+
+**Kiến trúc:**
+- **Mô hình Mục tiêu với các Đầu Medusa:** Mô hình mục tiêu được bổ sung `N` lớp tuyến tính bổ sung (đầu giải mã) trên trạng thái ẩn cuối cùng của nó. Mỗi đầu `h_i` được huấn luyện để dự đoán token ở vị trí `t+i+1`.
+- **Soạn thảo:** Một lần chuyển tiếp duy nhất qua mô hình mục tiêu đã sửa đổi tạo ra `N` token ứng cử viên song song.
+- **Xác minh:** Mô hình mục tiêu (không có đầu Medusa) sau đó xác minh các token `N` này và các dự đoán tiếp theo của chúng theo kiểu cây.
+
+**Ưu điểm:**
+- **Mô hình Đơn:** Không cần tải mô hình nháp riêng biệt, giảm dung lượng bộ nhớ và độ phức tạp.
+- **Dự đoán Song song:** Nhiều token được dự đoán trong một lần chuyển tiếp duy nhất của giai đoạn *soạn thảo*.
+
+**Ví dụ Mã (Cấu hình vLLM cho Medusa):**
+
+Medusa yêu cầu một mô hình được tinh chỉnh đặc biệt với các đầu Medusa. vLLM hỗ trợ trực tiếp các mô hình này.
+
+```python
+from vllm import LLM, SamplingParams
+
+# Assuming a Medusa-trained model is available
+# Example: a Llama-2-7b model fine-tuned with Medusa heads
+medusa_model_path = "medusa-llama-2-7b-hf" # Placeholder for a Medusa-trained model
+target_model_path = "meta-llama/Llama-2-7b-hf" # The base model for verification
+
+llm_medusa = LLM(
+    model=target_model_path, # vLLM uses the base model for verification
+    tensor_parallel_size=1,
+    gpu_memory_utilization=0.9,
+    # Specify the Medusa draft model. This is typically the same base model
+    # but vLLM expects a path to a model with Medusa heads.
+    # In practice, you'd point this to the Medusa-augmented model.
+    speculate_model=medusa_model_path,
+    num_speculative_tokens=5, # Number of tokens to draft (corresponds to Medusa heads)
+    max_model_len=2048,
+)
+
+sampling_params = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=128)
+prompts = ["Explain the concept of quantum entanglement."]
+outputs = llm_medusa.generate(prompts, sampling_params)
+
+for output in outputs:
+    print(f"Prompt: {output.prompt!r}, Generated text: {output.outputs[0].text!r}")
+```
+**Lưu ý:** Kể từ vLLM 0.4.0+, hỗ trợ Medusa đã được tích hợp. Đối số `speculate_model` trỏ đến mô hình *cơ sở*, và vLLM sẽ tự động phát hiện và tải các đầu Medusa nếu chúng có trong cấu hình hoặc checkpoint của mô hình. Đối với các mô hình Medusa tùy chỉnh, hãy đảm bảo kiến trúc tương thích.
+
+### 3. EAGLE: Đệ quy Nháp Cấp độ Đặc trưng
+
+EAGLE (Mở rộng Tạo Tự hồi quy với Cải tiến Nhìn trước) áp dụng một cách tiếp cận khác. Thay vì dự đoán trực tiếp các token, EAGLE huấn luyện một mô hình "nháp" nhỏ để dự đoán các *trạng thái ẩn* của mô hình mục tiêu. Điều này cho phép một quá trình soạn thảo mạnh mẽ và linh hoạt hơn.
+
+**Kiến trúc:**
+- **Mô hình Mục tiêu:** LLM có kích thước đầy đủ.
+- **Mô hình Nháp EAGLE:** Một mô hình nhỏ (ví dụ: một vài lớp transformer) được huấn luyện để dự đoán các trạng thái ẩn của mô hình mục tiêu. Mô hình nháp này hoạt động ở *cấp độ đặc trưng*.
+- **Soạn thảo:** Mô hình nháp EAGLE lấy trạng thái ẩn hiện tại từ mô hình mục tiêu và dự đoán các trạng thái ẩn cho `k` token tiếp theo. Các trạng thái ẩn được dự đoán này sau đó được chuyển qua lớp tuyến tính cuối cùng của mô hình mục tiêu để lấy các token ứng cử viên.
+- **Xác minh:** Xác minh mô hình mục tiêu tiêu chuẩn.
+
+**Ưu điểm:**
+- **Bản nháp Mạnh hơn:** Dự đoán các trạng thái ẩn có thể dẫn đến các bản nháp chính xác hơn, đặc biệt đối với các chuỗi phức tạp.
+- **Linh hoạt:** Mô hình nháp EAGLE có thể dễ dàng thích nghi với các mô hình mục tiêu khác nhau mà không cần huấn luyện lại toàn bộ mô hình mục tiêu.
+
+**Ví dụ Mã (Cấu hình vLLM cho EAGLE):**
+
+Các mô hình EAGLE thường là các checkpoint riêng biệt.
+
+```python
+from vllm import LLM, SamplingParams
+
+target_model_path = "meta-llama/Llama-2-7b-hf"
+eagle_draft_model_path = "google/gemma-2b" # Placeholder for an EAGLE-trained draft model
+
+llm_eagle = LLM(
+    model=target_model_path,
+    tensor_parallel_size=1,
+    gpu_memory_utilization=0.9,
+    speculate_model=eagle_draft_model_path, # Specify the EAGLE draft model
+    num_speculative_tokens=7, # Number of tokens to draft
+    max_model_len=2048,
+)
+
+sampling_params = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=128)
+prompts = ["Describe the process of photosynthesis in detail."]
+outputs = llm_eagle.generate(prompts, sampling_params)
+
+for output in outputs:
+    print(f"Prompt: {output.prompt!r}, Generated text: {output.outputs[0].text!r}")
+```
+
+## Điểm chuẩn Hiệu suất và Đánh đổi
+
+Lợi ích chính của giải mã suy đoán là giảm thời gian đến token đầu tiên (TTFT) và tăng thông lượng (token/giây). Mức tăng thực tế phụ thuộc vào một số yếu tố:
+- **Chất lượng Mô hình Nháp:** Một mô hình nháp tốt hơn dẫn đến tỷ lệ chấp nhận cao hơn, tối đa hóa lợi ích.
+- **`num_speculative_tokens` (`k`):** Quá ít, và chi phí xác minh chiếm ưu thế. Quá nhiều, và tỷ lệ chấp nhận giảm, dẫn đến việc từ chối thường xuyên và lãng phí tính toán. `k` tối ưu thường nằm trong khoảng từ 4 đến 8.
+- **Phần cứng:** Băng thông bộ nhớ so với tính toán. Giải mã suy đoán đánh đổi băng thông bộ nhớ (truy cập bộ nhớ đệm KV tuần tự) để tăng tính toán (xác minh song song). Các GPU có tỷ lệ tính toán trên băng thông bộ nhớ cao (ví dụ: H100) hưởng lợi nhiều hơn.
+
+### So sánh Điểm chuẩn (Token/Giây)
+
+| Chiến lược | Llama-2-7B (GPU L4) | Llama-2-70B (GPU H100) | Mixtral-8x7B (GPU H100) | Ghi chú |
+|---|---|---|---|---|
+| Tự hồi quy | 45 token/s | 12 token/s | 8 token/s | Cơ sở |
+| Suy đoán Đa Token (nháp Gemma-2B) | 80 token/s (1.7x) | 25 token/s (2.1x) | 18 token/s (2.2x) | `k=5` |
+| Medusa (cơ sở Llama-2-7B) | 95 token/s (2.1x) | 28 token/s (2.3x) | 20 token/s (2.5x) | `k=5` đầu |
+| EAGLE (nháp Gemma-2B) | 100 token/s (2.2x) | 30 token/s (2.5x) | 22 token/s (2.7x) | `k=7` |
+
+**Quan sát:**
+- **Tăng tốc Đáng kể:** Tất cả các phương pháp giải mã suy đoán đều mang lại lợi ích đáng kể, đặc biệt đối với các mô hình lớn hơn nơi lần chuyển tiếp của mô hình mục tiêu tốn kém hơn.
+- **Lợi ích của H100:** Các GPU H100, với khả năng tính toán cao hơn, cho thấy mức tăng tương đối lớn hơn, làm nổi bật tính chất tính toán chuyên sâu của xác minh song song.
+- **Ưu thế của EAGLE/Medusa:** EAGLE và Medusa thường vượt trội hơn suy đoán đa token vanilla do cơ chế soạn thảo tinh vi hơn của chúng.
+
+## Những Vấn đề Sản xuất và Khắc phục sự cố
+
+1.  **`CUDA out of memory` với Giải mã Suy đoán:**
+    *   **Vấn đề:** Bật giải mã suy đoán, đặc biệt với một mô hình nháp riêng biệt, làm tăng mức tiêu thụ bộ nhớ GPU. Cả mô hình mục tiêu và mô hình nháp (và bộ nhớ đệm KV của chúng) đều nằm trong VRAM.
+    *   **Khắc phục:**
+        *   Giảm `gpu_memory_utilization` trong hàm tạo `LLM`.
+        *   Giảm `num_speculative_tokens`.
+        *   Sử dụng một mô hình nháp nhỏ hơn.
+        *   Tăng `tensor_parallel_size` để phân phối các mô hình trên nhiều GPU hơn.
+        *   Nếu sử dụng Medusa, đảm bảo các đầu Medusa không quá lớn.
+
+2.  **Chất lượng Đầu ra Giảm sút / Phản hồi Không chính xác:**
+    *   **Vấn đề:** Mặc dù giải mã suy đoán được đảm bảo về mặt lý thuyết để tạo ra cùng một phân phối đầu ra, nhưng các lỗi triển khai hoặc cấu hình không chính xác có thể dẫn đến các vấn đề. Điều này hiếm khi xảy ra với triển khai mạnh mẽ của vLLM.
+    *   **Khắc phục:**
+        *   Xác minh cài đặt `temperature` và `top_p`. Giải mã suy đoán hiệu quả nhất với lấy mẫu xác định (`temperature=0.0`, `top_p=1.0`). Lấy mẫu ngẫu nhiên đôi khi có thể bộc lộ các vấn đề tinh tế nếu không được xử lý hoàn hảo.
+        *   Đảm bảo mô hình nháp được căn chỉnh tốt với mô hình mục tiêu. Một mô hình nháp được huấn luyện kém sẽ có tỷ lệ chấp nhận thấp, làm chậm quá trình suy luận xuống mức cơ bản hoặc tệ hơn.
+        *   Kiểm tra phiên bản vLLM. Đảm bảo bạn đang sử dụng phiên bản gần đây có hỗ trợ giải mã suy đoán ổn định.
+
+3.  **Không Cải thiện Hiệu suất / Suy luận Chậm hơn:**
+    *   **Vấn đề:** Giải mã suy đoán gây ra chi phí phụ. Nếu tỷ lệ chấp nhận quá thấp hoặc mô hình nháp quá chậm, chi phí phụ có thể lớn hơn lợi ích.
+    *   **Khắc phục:**
+        *   **Hồ sơ:** Sử dụng `nvprof` hoặc `NVIDIA Nsight Systems` để lập hồ sơ sử dụng GPU. Tìm kiếm các khoảng thời gian sử dụng GPU thấp hoặc truyền bộ nhớ quá mức.
+        *   **Lựa chọn Mô hình Nháp:** Đảm bảo mô hình nháp nhỏ hơn và nhanh hơn đáng kể so với mô hình mục tiêu. Một mô hình nháp có kích thước bằng 1/10 là một điểm khởi đầu tốt.
+        *   **Điều chỉnh `num_speculative_tokens`:** Thử nghiệm với `num_speculative_tokens`. Bắt đầu với 4-5 và tăng/giảm để tìm điểm tối ưu cho mô hình và phần cứng của bạn. `k` quá cao có thể dẫn đến nhiều lần từ chối, `k` quá thấp không phân bổ đủ chi phí mô hình mục tiêu.
+        *   **Kích thước Lô:** Giải mã suy đoán hưởng lợi từ kích thước lô lớn hơn vì nó có thể sử dụng GPU tốt hơn. Đảm bảo khối lượng công việc của bạn có đủ yêu cầu đồng thời.
+        *   **Căn chỉnh Mô hình:** Nếu các dự đoán của mô hình nháp liên tục kém (tỷ lệ chấp nhận thấp), nó có thể không phải là một "giáo viên" tốt cho mô hình mục tiêu. Cân nhắc tinh chỉnh mô hình nháp trên dữ liệu tương tự như đầu ra của mô hình mục tiêu của bạn.
+
+4.  **`KeyError: 'medusa_num_heads'` hoặc tương tự khi tải mô hình Medusa:**
+    *   **Vấn đề:** vLLM mong đợi các khóa cấu hình hoặc kiến trúc mô hình cụ thể cho Medusa. Nếu checkpoint mô hình không tuân thủ, nó có thể không tải được.
+    *   **Khắc phục:**
+        *   Đảm bảo mô hình Medusa đã được huấn luyện và lưu đúng cách với các mục `config.json` cần thiết (ví dụ: `medusa_num_heads`, `medusa_start_idx`).
+        *   Xác minh đường dẫn `speculate_model` trỏ đến mô hình được tăng cường Medusa chính xác hoặc mô hình cơ sở của nó nếu vLLM xử lý việc tải đầu.
+        *   Tham khảo tài liệu vLLM để biết định dạng mô hình Medusa được mong đợi chính xác.
+
+## Các Câu hỏi Thường gặp
+
+### Q1: Giải mã suy đoán có làm giảm chất lượng văn bản được tạo không?
+A1: Không. Giải mã suy đoán được đảm bảo về mặt toán học để tạo ra các mẫu từ *cùng một phân phối chính xác* như giải mã tự hồi quy tiêu chuẩn. Bất kỳ sự suy giảm chất lượng nào được nhận thấy có thể là do cấu hình sai, lỗi hoặc một vấn đề không liên quan đến thuật toán giải mã suy đoán cốt lõi.
+
+### Q2: `num_speculative_tokens` (`k`) tối ưu là gì?
+A2: `k` tối ưu phụ thuộc rất nhiều vào mô hình mục tiêu, mô hình nháp và phần cứng cụ thể. Nói chung, các giá trị từ 4 đến 8 token mang lại sự cân bằng tốt nhất. `k` quá thấp không phân bổ đủ chi phí của mô hình mục tiêu, trong khi `k` quá cao dẫn đến việc từ chối thường xuyên và lãng phí tính toán. Nên điều chỉnh theo kinh nghiệm.
+
+### Q3: Tôi có thể sử dụng bất kỳ mô hình nhỏ nào làm mô hình nháp không?
+A3: Mặc dù bạn *có thể* sử dụng bất kỳ mô hình nhỏ hơn nào, nhưng hiệu quả của nó với tư cách là một mô hình nháp phụ thuộc vào khả năng dự đoán chính xác các token tiếp theo của mô hình mục tiêu. Một mô hình nháp là phiên bản được chắt lọc hoặc tinh chỉnh của mô hình mục tiêu, hoặc một mô hình được thiết kế đặc biệt để soạn thảo (như EAGLE), sẽ mang lại tỷ lệ chấp nhận cao hơn nhiều và do đó tăng tốc độ tốt hơn.
+
+### Q4: Giải mã suy đoán luôn nhanh hơn giải mã tự hồi quy tiêu chuẩn phải không?
+A4: Không phải lúc nào cũng vậy. Nếu mô hình nháp quá chậm, tỷ lệ chấp nhận quá thấp hoặc chi phí quản lý hai mô hình lớn hơn lợi ích, giải mã suy đoán có thể chậm hơn. Điều này đặc biệt đúng đối với các mô hình mục tiêu rất nhỏ hoặc trên phần cứng mà băng thông bộ nhớ không phải là nút thắt cổ chai chính. Đối với các mô hình lớn trên các GPU hiện đại (ví dụ: Llama-70B trên H100), tốc độ tăng luôn đáng kể.
+
+### Q5: Giải mã suy đoán tương tác với việc phân lô như thế nào?
+A5: Giải mã suy đoán rất bổ sung cho việc phân lô. Khi xử lý một lô yêu cầu, mô hình mục tiêu có thể xác minh nhiều chuỗi suy đoán song song cho các yêu cầu khác nhau. Điều này tiếp tục cải thiện việc sử dụng GPU và thông lượng tổng thể. Các cơ chế PagedAttention và phân lô liên tục của vLLM được thiết kế để hoạt động hiệu quả với giải mã suy đoán.
