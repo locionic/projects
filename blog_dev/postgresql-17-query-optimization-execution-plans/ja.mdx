@@ -1,0 +1,359 @@
+---
+title: "PostgreSQL17クエリ最適化:実行プラン、メモリチューニング、EXPLAINANALYZE"
+images: ['/static/images/postgresql-17-query-optimization-execution-plans.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["database", "postgresql", "performance", "sql", "backend"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "PostgreSQL17のクエリ最適化について、実行プラン、メモリチューニング、EXPLAINANALYZEを網羅的に解説し、本番環境レベルのアーキテクチャとコード例を紹介する包括的なガイドです。"
+---
+
+PostgreSQL 17では、クエリ最適化機能と実行エンジンが大幅に強化され、パフォーマンスチューニングに対する洗練されたアプローチが求められます。このガイドでは、実行計画の解読、新しいメモリ管理機能の活用、複雑なクエリパターンの最適化を通じて、最高のパフォーマンスを実現する方法を詳しく解説します。
+
+<AudioPlayer src="/static/audio/postgresql-17-query-optimization-execution-plans-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+## `EXPLAIN ANALYZE`出力の理解
+
+PostgreSQLのクエリ最適化の基礎は、`EXPLAIN ANALYZE`出力の解釈にあります。このコマンドは、プランナーが推定した実行計画と実際のランタイム統計を提供します。
+
+### 計画ツリーの解読
+
+`EXPLAIN`ツリーの各ノードは操作を表します。主なメトリクスは次のとおりです。
+
+-   **`cost`**: プランナーが推定したコスト (起動..合計)。
+-   **`rows`**: プランナーが推定した行数。
+-   **`actual time`**: 実際に費やされた時間 (起動..合計、ミリ秒単位)。
+-   **`actual rows`**: 実際に返された行数。
+-   **`loops`**: ノードが実行された回数。
+-   **`Buffers`**: 共有、ローカル、一時ブロックアクセスに関する詳細 (`BUFFERS`オプションが必要)。
+-   **`Wal`**: WALレコード生成統計 (`WAL`オプションが必要)。
+-   **`Settings`**: 計画に影響を与えるGUCパラメータ (`SETTINGS`オプションが必要)。
+
+簡単なクエリを考えてみましょう。
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, SETTINGS, WAL)
+SELECT p.product_name, c.category_name
+FROM products p
+JOIN categories c ON p.category_id = c.category_id
+WHERE p.price > 100 AND c.category_name = 'Electronics';
+```
+
+典型的な出力は次のようになります。
+
+```
+                                      QUERY PLAN
+--------------------------------------------------------------------------------------
+ Hash Join  (cost=25.80..50.35 rows=10 width=64) (actual time=0.150..0.250 rows=5 loops=1)
+   Hash Cond: (p.category_id = c.category_id)
+   Buffers: shared hit=10 read=2
+   Wal: records=0, full_page_writes=0, bytes=0
+   ->  Seq Scan on products p  (cost=0.00..24.50 rows=20 width=36) (actual time=0.010..0.100 rows=15 loops=1)
+         Filter: (price > 100::numeric)
+         Rows Removed by Filter: 85
+         Buffers: shared hit=5 read=1
+   ->  Hash  (cost=25.75..25.75 rows=1 width=32) (actual time=0.030..0.030 rows=1 loops=1)
+         Buffers: shared hit=5 read=1
+         ->  Seq Scan on categories c  (cost=0.00..25.75 rows=1 width=32) (actual time=0.010..0.020 rows=1 loops=1)
+               Filter: (category_name = 'Electronics'::text)
+               Rows Removed by Filter: 99
+               Buffers: shared hit=5 read=1
+ Planning Time: 0.100 ms
+ Execution Time: 0.300 ms
+```
+
+**解釈:**
+
+1.  **`Hash Join`**: トップレベルの操作。完了までに`0.250 ms`かかり、`5`行を返しました。プランナーは`10`行と推定しました。
+2.  **`Seq Scan on products p`**: `products`テーブルをスキャンしました。`85`行をフィルタリングし、`15`行を保持しました。このスキャンは`5`個の共有ブロックにヒットし、ディスクから`1`を読み取りました。
+3.  **`Hash`**: `categories`テーブルスキャンからハッシュテーブルを構築しました。
+4.  **`Seq Scan on categories c`**: `categories`をスキャンし、`99`行をフィルタリングし、`1`行を保持しました。このスキャンも`5`個の共有ブロックにヒットし、ディスクから`1`を読み取りました。
+
+`Buffers`セクションは非常に重要です。`shared hit`は共有バッファ（メモリ）で見つかったデータを示し、`read`はディスクからフェッチする必要があったデータを示します。`read`のカウントが高い場合、インデックスの欠落や`shared_buffers`の不足を示していることがよくあります。
+
+### プランナーの行数推定ミス
+
+`rows`（推定）と`actual rows`の間の不一致は危険信号です。大きな不一致は、プランナーが誤った判断を下したことを示しており、その原因は次のいずれかであることが多いです。
+
+1.  **古い統計**: 定期的に`ANALYZE`または`VACUUM ANALYZE`を実行します。
+2.  **複雑な述語**: プランナーは、特に関数や式を含む複雑な`WHERE`句に苦慮します。
+3.  **データスキュー**: データ分布が不均一だと、プランナーが誤解することがあります。`ANALYZE`で`default_statistics_target`を増やすと役立ちます。
+4.  **統計の欠落**: カスタムデータ型や複雑な式の場合、`CREATE STATISTICS`は複数列または関数依存性の統計を提供できます。
+
+**推定ミスの例:**
+
+もし`actual rows`の`Seq Scan on products p`が`10000`だったのに、`rows`が`20`だった場合、プランナーは`Nested Loop`ではなく`Hash Join`や`Merge Join`を選択してしまい、ひどいパフォーマンスにつながる可能性があります。
+
+## メモリチューニング: `work_mem`と`maintenance_work_mem`
+
+PostgreSQL 17では、メモリ管理の改善が続けられています。`work_mem`と`maintenance_work_mem`の適切なチューニングが重要です。
+
+### `work_mem`
+
+このパラメータは、一時データをディスクに書き込む前に、クエリ操作（例：ソート、ハッシュテーブル）が使用できるメモリの最大量を定義します。各操作はこの量を使用できます。
+
+-   **低すぎる場合**: ソートやハッシュ操作で過剰なディスクI/Oが発生し、`EXPLAIN ANALYZE`出力で`spill`や`disk`として表示されます（例：`Sort Method: external merge Disk: 12345kB`）。
+-   **高すぎる場合**: 多くの複雑なクエリが同時に実行されると、メモリ不足エラーにつながる可能性があります。
+
+**チューニング戦略:**
+
+1.  **スピルの特定**: `EXPLAIN ANALYZE`で`Sort Method: external merge Disk`または`HashAggregate  (actual time=... loops=1)  Memory: 12345kB, Disk: 67890kB`を探します。
+2.  **段階的な増加**: まず控えめな値（例：`4MB`または`8MB`）から始めます。スピルが発生する場合は、増やします。一般的な本番環境での値は、セッションあたり`64MB`から`256MB`ですが、これはワークロードと利用可能なRAMに大きく依存します。
+3.  **セッションレベルでの上書き**: 特定の複雑なクエリには、`SET work_mem TO '256MB';`を使用できます。
+
+```sql
+-- Example: Observe a sort spill
+-- Assume 'large_table' has millions of rows and 'some_column' is not indexed
+SET work_mem TO '64kB'; -- Artificially low for demonstration
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT *
+FROM large_table
+ORDER BY some_column;
+
+-- Output might show:
+-- Sort  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+--   Sort Key: some_column
+--   Sort Method: external merge  Disk: 12345kB  <-- This indicates a spill
+--   Buffers: ...
+```
+
+```sql
+-- Increase work_mem to prevent spill
+SET work_mem TO '256MB'; -- Adjust based on actual spill size and available RAM
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT *
+FROM large_table
+ORDER BY some_column;
+
+-- Output should ideally show:
+-- Sort  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+--   Sort Key: some_column
+--   Sort Method: quicksort  Memory: 12345kB  <-- In-memory sort
+--   Buffers: ...
+```
+
+### `maintenance_work_mem`
+
+`VACUUM`、`CREATE INDEX`、`ALTER TABLE ADD FOREIGN KEY`などのメンテナンス操作に使用されます。これらの操作は通常、頻度は低いですが、非常にメモリを消費する可能性があります。
+
+-   **低すぎる場合**: 特に大規模なテーブルでのインデックス作成やバキューム処理が遅くなります。
+-   **高すぎる場合**: メンテナンス中に大量のメモリを消費し、アクティブなクエリに影響を与える可能性があります。
+
+**チューニング戦略:**
+
+-   `work_mem`よりも高く設定します。一般的な値は、最大のテーブルのサイズと利用可能なRAMに応じて、`256MB`から`1GB`以上です。
+-   このメモリは、セッションごとではなく、*メンテナンス操作ごと*に割り当てられます。
+
+```sql
+-- Example: Creating an index on a large table
+-- A low maintenance_work_mem can make this very slow.
+SET maintenance_work_mem TO '16MB'; -- Artificially low
+
+CREATE INDEX idx_large_table_col ON large_table (another_column);
+-- This might take a very long time and use temp files.
+
+-- Increase for faster index creation
+SET maintenance_work_mem TO '1GB'; -- Or higher, depending on table size
+CREATE INDEX idx_large_table_col_new ON large_table (yet_another_column);
+-- This should be significantly faster.
+```
+
+## インクリメンタルソートとハッシュ結合の最適化
+
+PostgreSQL 17では、インクリメンタルソートの利用とハッシュ結合のパフォーマンス向上に関して、プランナーの機能が強化されています。
+
+### インクリメンタルソート
+
+インデックスによって既にソートされている列のサブセットでソートを必要とするクエリの場合、PostgreSQLは「インクリメンタルソート」を実行できます。これにより、完全なソート操作が回避され、コストが大幅に削減されます。
+
+```sql
+-- Assume an index on (order_date, customer_id)
+CREATE INDEX idx_orders_date_customer ON orders (order_date, customer_id);
+
+-- Query that can benefit from incremental sort
+EXPLAIN (ANALYZE)
+SELECT *
+FROM orders
+WHERE order_date >= '2023-01-01'
+ORDER BY order_date, customer_id, order_total DESC;
+```
+
+`EXPLAIN`出力は次のようになるかもしれません。
+
+```
+                                      QUERY PLAN
+--------------------------------------------------------------------------------------
+ Sort  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+   Sort Key: order_total DESC
+   Presorted Key: order_date, customer_id  <-- Indicates incremental sort
+   ->  Index Scan using idx_orders_date_customer on orders  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+         Index Cond: (order_date >= '2023-01-01'::date)
+```
+
+`Presorted Key`の行が重要な指標です。最適化するには：
+
+-   インデックスが`ORDER BY`句の先頭列をカバーしていることを確認します。
+-   残りの`Sort Key`列はインクリメンタルにソートされます。
+
+### ハッシュ結合
+
+ハッシュ結合は、大規模でソートされていないデータセットを結合するのに効率的です。PostgreSQL 17では、メモリ使用量とスピル処理が改善されています。
+
+-   **メモリ**: `work_mem`が、より小さいリレーションのハッシュテーブルをメモリに保持するのに十分であることを確認してください。ディスクにスピルすると、パフォーマンスが低下します。
+-   **ビルド vs. プローブ**: プランナーは通常、より小さいリレーションでハッシュテーブルを構築し、より大きいリレーションでプローブします。プランナーが誤った選択をすると、過剰なメモリ使用量やスピルにつながる可能性があります。
+-   **`enable_hashjoin`**: このGUCが`on`（デフォルト）であることを確認してください。
+
+```sql
+-- Example: Hash Join
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT a.id, b.value
+FROM large_table_a a
+JOIN medium_table_b b ON a.b_id = b.id;
+```
+
+出力:
+
+```
+                                      QUERY PLAN
+--------------------------------------------------------------------------------------
+ Hash Join  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+   Hash Cond: (a.b_id = b.id)
+   Buffers: ...
+   ->  Seq Scan on large_table_a a  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+         Buffers: ...
+   ->  Hash  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+         Memory: 12345kB  <-- Hash table memory usage
+         Buffers: ...
+         ->  Seq Scan on medium_table_b b  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+               Buffers: ...
+```
+
+もし`Hash`ノードの`Memory`の後に`Disk`が続く場合、ハッシュテーブルがスピルしたことを意味します。`work_mem`を増やしてください。
+
+## 並列クエリ実行
+
+PostgreSQL 17では、並列クエリ機能が引き続き強化されており、複数のCPUコアが単一クエリの一部を処理できるようになっています。
+
+-   **`max_parallel_workers_per_gather`**: 単一の`Gather`または`Gather Merge`ノードに対して起動できる並列ワーカーの最大数を制御します。
+-   **`max_parallel_workers`**: システム全体で許可される並列ワーカーの総数。
+-   **`min_parallel_table_scan_size`**: 並列スキャンが考慮される最小テーブルサイズ（KB単位）。
+-   **`parallel_setup_cost`**: 並列ワーカーを起動するための推定コスト。
+-   **`parallel_tuple_cost`**: ワーカーからリーダーにタプルを転送するための推定コスト。
+
+**並列計画の特定:**
+
+`EXPLAIN ANALYZE`出力で`Gather`または`Gather Merge`ノードを探します。
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT COUNT(*)
+FROM very_large_table
+WHERE some_column > 100;
+```
+
+出力:
+
+```
+                                      QUERY PLAN
+--------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+   Buffers: ...
+   ->  Gather  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: ...
+         ->  Partial Aggregate  (cost=... rows=... width=...) (actual time=... rows=... loops=2)
+               Buffers: ...
+               ->  Parallel Seq Scan on very_large_table  (cost=... rows=... width=...) (actual time=... rows=... loops=2)
+                     Filter: (some_column > 100)
+                     Buffers: ...
+```
+
+**最適化:**
+
+-   `max_parallel_workers_per_gather`が適切に設定されていることを確認します（例：最新のサーバーでは`4`から`8`）。
+-   頻繁にスキャンされ、大規模なテーブルの場合、`min_parallel_table_scan_size`が高すぎないことを確認します。
+-   並列処理は、大規模なデータセットでのCPUバウンドな操作（例：大規模なシーケンシャルスキャン、集計、ハッシュ結合）に最も効果的です。インデックススキャンや少数の行を返すクエリには効果が薄いです。
+
+## アーキテクチャとトレードオフの比較
+
+| 機能/パラメータ | 説明 | デフォルト (PG17) | 推奨範囲 | トレードオフ |
+|---|---|---|---|---|
+| `work_mem` | クエリごとのソート/ハッシュ操作用メモリ。 | 4MB | 64MB - 256MB | 低すぎると: ディスクスピル、クエリが遅くなる。高すぎると: 同時実行クエリでOOM。 |
+| `maintenance_work_mem` | VACUUM、CREATE INDEX用メモリ。 | 64MB | 256MB - 1GB+ | 低すぎると: メンテナンスが遅くなる。高すぎると: メンテナンス中にアクティブなクエリに影響。 |
+| `shared_buffers` | メインデータキャッシュ。 | 128MB | RAMの25% - 40% | 低すぎると: 高いディスクI/O。高すぎると: OSキャッシュの冗長性、OOM。 |
+| `effective_cache_size` | プランナーのOS + shared_buffersの推定値。 | 4GB | RAMの50% - 75% | プランナーへの情報提供用。メモリは割り当てない。不正確な値は悪い計画につながる。 |
+| `max_parallel_workers_per_gather` | クエリごとの最大並列ワーカー数。 | 2 | 4 - 8 | 低すぎると: CPUを十分に活用できない。高すぎると: 過剰なコンテキストスイッチ、リソース競合。 |
+| `default_statistics_target` | 統計の粒度。 | 100 | 200 - 1000 | 低すぎると: 行推定が不正確。高すぎると: ANALYZE時間が増加、`pg_statistic`テーブルが大きくなる。 |
+
+## 本番環境での落とし穴とトラブルシューティング
+
+1.  **落とし穴: `VACUUM FULL`または`REINDEX`後の突然のパフォーマンス低下**
+    *   **失敗モード**: 高速だったクエリが遅くなり、多くの場合、`Index Scan`の代わりに`Seq Scan`が発生します。
+    *   **根本原因**: `VACUUM FULL`と`REINDEX`はテーブル/インデックスを書き換えるため、統計が古くなったり、プランナーのキャッシュが無効になったりする一時的な状態につながる可能性があります。
+    *   **修正**: これらの操作の後、影響を受けるテーブルまたはデータベース全体に対して直ちに`ANALYZE VERBOSE;`を実行します。これにより、プランナーは正確な統計を再構築するよう強制されます。`REINDEX`の場合、インデックス再構築後にテーブルに対して`ANALYZE`が実行されることを確認してください。
+
+2.  **落とし穴: 高い設定にもかかわらず`work_mem`スピルが発生する**
+    *   **失敗モード**: `EXPLAIN ANALYZE`が、`work_mem`が十分に高い値（例：`256MB`）に設定されているにもかかわらず、`Sort Method: external merge Disk`または`HashAggregate ... Disk`を示す。
+    *   **根本原因**: `work_mem`は*操作ごと*に割り当てられます。単一の複雑なクエリには複数のソートまたはハッシュ操作があり、それぞれが`work_mem`を消費する可能性があります。また、多くの同時実行クエリが実行されている場合、*合計*メモリ消費量がシステムRAMを超える可能性があります。
+    *   **修正**:
+        *   **特定の操作を特定する**: どのノードがスピルしているかを特定します。
+        *   **`work_mem`をさらに増やす**: 単一の重要なクエリである場合は、そのセッションの`work_mem`を増やしてみてください。
+        *   **クエリを最適化する**: ソート/ハッシュを回避できますか？`ORDER BY`または`GROUP BY`のインデックスを追加します。ソート/ハッシュの前にデータセットのサイズを減らすようにクエリをリファクタリングします。
+        *   **総メモリを監視する**: `pg_stat_activity`を使用して、アクティブなクエリの`temp_bytes`を確認します。すべてのクエリの合計`temp_bytes`が高い場合、システム制限に達している可能性があります。
+
+3.  **落とし穴: プランナーが最適でない結合順序を選択する**
+    *   **失敗モード**: 複数の結合を含むクエリが非常に遅く実行され、`EXPLAIN ANALYZE`が、大きな中間結果セットを早期に処理する結合順序を示す。
+    *   **根本原因**: 中間結果の行推定が不正確であること。これは、統計が古いか、プランナーが正確に推定できない複雑な`WHERE`句が原因であることが多い。
+    *   **修正**:
+        *   **`ANALYZE`**: 関係するすべてのテーブルに最新の統計があることを確認します。
+        *   **`CREATE STATISTICS`**: 複数列の相関関係や関数依存性については、拡張統計を作成します。
+            ```sql
+            CREATE STATISTICS my_correlation_stats ON (col1, col2) FROM my_table;
+            ANALYZE my_table;
+            ```
+        *   **`WHERE`句を簡素化する**: 可能であれば、複雑な述語を分解します。
+        *   **`SET join_collapse_limit` / `SET from_collapse_limit`**: これらのGUCを一時的に減らして、プランナーにさらに多くの結合順序を検討させます。ただし、これにより計画時間が長くなる可能性があります。
+        *   **`SET enable_nestloop = off;`**: 特定の結合タイプを一時的に無効にして、プランナーに代替案を検討させます。デバッグに役立ちます。
+
+4.  **落とし穴: `EXPLAIN ANALYZE`における高い`Planning Time`**
+    *   **失敗モード**: 簡単なクエリでも、`Planning Time`が常に高い（例：数百ミリ秒から数秒）。
+    *   **根本原因**:
+        *   **複雑なクエリ**: 多くの結合、サブクエリ、または`UNION`操作。
+        *   **高い`default_statistics_target`**: 精度は向上しますが、値が高いほど計画中に処理するデータが多くなります。
+        *   **`enable_seqscan = off`**: あらゆる場所でインデックススキャンを強制すると、プランナーがインデックスを見つけるのに苦労する可能性があります。
+        *   **古いPostgreSQLバージョン**: 古いバージョンでは、特定の複雑なシナリオでプランナーの効率が低かった。
+    *   **修正**:
+        *   **クエリを簡素化する**: 非常に複雑なクエリを、CTEや一時テーブルを使用して、より小さく管理しやすいものに分割します。
+        *   **クエリをパラメータ化する**: クエリ構造が同じでリテラルのみが変更される場合は、準備済みステートメントを使用して計画コストを償却します。
+        *   **GUCを確認する**: `default_statistics_target`がワークロードに対して過度に高くないことを確認します。
+        *   **PostgreSQLをアップグレードする**: 新しいバージョンでは、プランナーの改善がよく行われます。
+
+## よくある質問
+
+1.  **`work_mem`が正しく設定されているかどうかはどうすればわかりますか？**
+    `EXPLAIN ANALYZE`出力で`Sort Method: external merge Disk`または`HashAggregate ... Disk`を確認してください。これらが表示される場合、その特定の操作に対して`work_mem`が低すぎます。また、`pg_stat_statements`で`temp_bytes`と`temp_files`を監視して、全体的な一時ファイルの使用状況を確認してください。
+
+2.  **`CREATE STATISTICS`はいつ使用すべきですか？**
+    `CREATE STATISTICS`は、プランナーが、`WHERE`句、`JOIN`条件、または`GROUP BY`句に複数の列を含むクエリに対して、常に不正確な行推定を行う場合に使用します。特に、これらの列に相関データがある場合に有効です。これにより、プランナーは単一列の統計では見落とす列間の関係を理解するのに役立ちます。
+
+3.  **`shared_buffers`と`effective_cache_size`の違いは何ですか？**
+    `shared_buffers`は、PostgreSQLがデータキャッシュのために実際に割り当てるメモリです。`effective_cache_size`は、クエリプランナーに、`shared_buffers`やOSファイルシステムキャッシュを含む、データキャッシュに利用できると*期待される*メモリ量を伝えるGUCです。メモリを割り当てるわけではありませんが、ディスクI/Oのプランナーのコスト推定に影響を与えます。
+
+4.  **インデックスがあるのに、私のクエリは`Index Scan`ではなく`Seq Scan`を使用しています。なぜですか？**
+    これは通常、プランナーがシーケンシャルスキャンの方がインデックススキャンよりも高速であると推定した場合に発生します。一般的な理由は次のとおりです。
+    *   **高い選択性**: クエリがテーブルから大量の行（例：5～10%以上）を取得している場合。インデックススキャンはランダムI/Oを伴うため、多くの行に対しては完全なシーケンシャル読み取りよりも遅くなる可能性があります。
+    *   **古い統計**: プランナーの行推定が不正確です。`ANALYZE`を実行してください。
+    *   **テーブルサイズ**: 非常に小さいテーブルの場合、インデックス走査のオーバーヘッドがあるため、`Seq Scan`の方が高速であることがよくあります。
+    *   **`random_page_cost`**: このGUCが高すぎると、ランダムI/O（インデックススキャン）がより高価に見えるようになります。
+    *   **インデックスの肥大化**: 肥大化したインデックスは、インデックススキャンを非効率にする可能性があります。`REINDEX`が役立つかもしれません。
+
+5.  **PostgreSQLに特定の計画を使用させるにはどうすればよいですか？**
+    データが変更された場合に最適でない計画につながる可能性があるため、一般的には推奨されませんが、GUCを使用して特定の計画タイプを一時的に無効にすることで、プランナーに影響を与えることができます（例：`SET enable_seqscan = off;`、`SET enable_nestloop = off;`）。よりきめ細かな制御が必要な場合は、`pg_hint_plan`（拡張機能）などのツールを使用するとSQLレベルのヒントが可能ですが、これは細心の注意を払い、徹底的なテストの後でのみ使用すべきです。最善のアプローチは、根本的な統計またはインデックスの問題を修正することです。

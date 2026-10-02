@@ -1,0 +1,314 @@
+---
+title: "Rustでの高スループットLinux I/O: io_uring、Tokio、ゼロコピーネットワーキング"
+images: ['/static/images/rust-tokio-io-uring-high-throughput-networking.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["rust", "linux", "systems", "performance", "networking"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Rustにおける高スループットLinux I/Oを網羅したガイド。io_uring、Tokio、ゼロコピーネットワーキングを本番環境レベルのアーキテクチャとコード例で解説します。"
+---
+
+LinuxのI/Oパフォーマンスは、大規模なネットワークサービスにとって極めて重要です。従来の`epoll`ベースの非同期I/Oは効率的ですが、繰り返されるシステムコールやカーネル空間とユーザー空間間のデータコピーにより、依然としてかなりのオーバーヘッドが発生します。Linuxカーネル5.1で導入された`io_uring`は、システムコールを最小限に抑え、ゼロコピー操作を可能にする強力な非同期I/Oインターフェースを提供することで、これを根本的に再構築しました。このガイドでは、Rustで`io_uring`を活用する方法、特に高スループットでゼロコピーのネットワークのために`tokio`と統合する方法について詳しく説明します。
+
+<AudioPlayer src="/static/audio/rust-tokio-io-uring-high-throughput-networking-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+## `io_uring`のパラダイムシフト
+
+`io_uring`は、ユーザー空間とカーネル間の共有リングバッファメカニズムで動作します。各I/O操作に対して個別のシステムコールを発行する代わりに、アプリケーションはSubmission Queue (SQ)にSubmission Queue Entries (SQEs)をエンキューします。その後、カーネルはこれらのSQEを非同期に処理し、操作が完了するとCompletion Queue (CQ)にCompletion Queue Entries (CQEs)を配置します。このバッチ処理により、コンテキストスイッチとシステムコールのオーバーヘッドが大幅に削減されます。
+
+`io_uring`の主な機能：
+
+1.  **バッチ処理**: 複数のI/O操作を単一の`io_uring_enter`システムコールで発行します。
+2.  **非同期**: 呼び出し元のスレッドをブロックすることなく操作が完了します。
+3.  **ポーリング**: カーネルがSQを積極的にポーリングできるため、場合によっては`io_uring_enter`が不要になり、レイテンシがさらに削減されます。
+4.  **ゼロコピー**: `IORING_OP_SENDMSG`や`IORING_OP_RECVMSG`のような操作は、ユーザー空間バッファで直接動作できるため、データコピーを回避できます。
+5.  **固定バッファ/ファイル**: `io_uring`にバッファとファイルディスクリプタを登録することで、カーネルはアクセスを最適化し、繰り返しのルックアップを回避できます。
+
+## `epoll` vs. `io_uring`: アーキテクチャ比較
+
+| 機能 | `epoll` (標準Tokio) | `io_uring` (tokio-uring) |
+|---|---|---|
+| I/Oモデル | エッジトリガー、イベント駆動型 | 非同期、リングバッファ |
+| システムコールオーバーヘッド | 高 (操作ごとに1システムコール + `epoll_wait`) | 低 (バッチ処理、多くの操作で`io_uring_enter`) |
+| データコピー | `read`/`write`のユーザー-カーネルコピー | ゼロコピー可能 (`MSG_ZEROCOPY`) |
+| バッファ管理 | ユーザー管理、システムコールごとに渡される | カーネル登録済み固定バッファ |
+| ファイルディスクリプタ | システムコールごとに渡される | カーネル登録済み固定ファイル |
+| レイテンシ | システムコール/コピーにより高 | バッチ処理/ゼロコピーにより低 |
+| スループット | 多くの接続には良好、システムコールにより制限される | 大量のI/Oには優れている |
+| カーネルバージョン | Linux 2.5.44+ | Linux 5.1+ |
+| 複雑性 | よりシンプルなAPI | より複雑なAPI、学習曲線が高い |
+
+## Rust統合: `tokio-uring`
+
+直接的な`io_uring`バインディング（例: `io-uring`クレート）は存在しますが、`io_uring`を既存の非同期ランタイム（`tokio`など）と統合することが望ましい場合がよくあります。`tokio-uring`クレートは、`io_uring`上に構築された`tokio`互換ランタイムを提供します。これは、`TcpStream`、`UdpSocket`、ファイルI/Oなどの一般的な`tokio` I/Oプリミティブに対応する`io_uring`ベースの同等機能を提供します。
+
+### `tokio-uring`のセットアップ
+
+`Cargo.toml`に以下を追加します。
+
+```toml
+[dependencies]
+tokio-uring = { version = "0.6", features = ["net", "fs"] }
+bytes = "1.4"
+log = "0.4"
+env_logger = "0.10"
+```
+
+`net`機能は`TcpStream`、`UdpSocket`などを有効にし、`fs`はファイルI/Oを有効にします。
+
+### 基本的な`tokio-uring` TCPエコーサーバー
+
+この例では、`tokio-uring`を使用したシンプルなTCPエコーサーバーを示します。`tokio_uring::start()`マクロは、`io_uring`ランタイムを初期化することに注意してください。
+
+```rust
+use tokio_uring::net::{TcpListener, TcpStream};
+use tokio_uring::buf::IoBuf;
+use bytes::{BytesMut, BufMut};
+use log::{info, error};
+
+const BUFFER_SIZE: usize = 4096;
+
+#[tokio_uring::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let addr = "127.0.0.1:8080";
+    let listener = TcpListener::bind(addr).await?;
+    info!("Listening on {}", addr);
+
+    loop {
+        match listener.accept().await {
+            Ok((socket, peer_addr)) => {
+                info!("Accepted connection from {}", peer_addr);
+                tokio_uring::spawn(async move {
+                    if let Err(e) = handle_connection(socket).await {
+                        error!("Error handling connection from {}: {}", peer_addr, e);
+                    }
+                });
+            }
+            Err(e) => {
+                error!("Error accepting connection: {}", e);
+            }
+        }
+    }
+}
+
+async fn handle_connection(mut socket: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buf = BytesMut::with_capacity(BUFFER_SIZE);
+    loop {
+        // Prepare a buffer for receiving data.
+        // `bytes::BytesMut` implements `IoBuf`, making it suitable for `tokio-uring`.
+        let (res, filled_buf) = socket.recv(buf.split_off(0).limit(BUFFER_SIZE)).await;
+        let bytes_read = res?;
+
+        if bytes_read == 0 {
+            info!("Client disconnected.");
+            break; // Client disconnected
+        }
+
+        // Advance the buffer to reflect the bytes read.
+        // `filled_buf` is the original buffer, but its `IoBuf` trait implementation
+        // ensures it's correctly sliced for the `recv` operation.
+        // We need to manually advance the `BytesMut` to reflect the data.
+        buf.unsplit(filled_buf);
+        buf.advance_mut(bytes_read);
+
+        info!("Received {} bytes: {:?}", bytes_read, &buf[..bytes_read]);
+
+        // Send the received data back.
+        // `send` takes an `IoBuf` and returns the buffer back after completion.
+        let (res, _) = socket.send(buf.split_to(bytes_read)).await;
+        let bytes_written = res?;
+
+        info!("Sent {} bytes.", bytes_written);
+
+        if bytes_written == 0 {
+            info!("Failed to send data, client likely disconnected.");
+            break;
+        }
+    }
+    Ok(())
+}
+```
+
+これをテストするには、`netcat`を使用できます: `nc 127.0.0.1 8080`。テキストを入力してEnterキーを押すと、サーバーがそれをエコーバックします。
+
+## `MSG_ZEROCOPY`によるゼロコピーネットワーキング
+
+ネットワーキングにおける`io_uring`の真の力は、ゼロコピー操作を実行できることにあります。これは、`MSG_ZEROCOPY`フラグを使用した`IORING_OP_SENDMSG`操作によって実現されます。このフラグが設定されると、カーネルはユーザー空間バッファを自身のメモリ空間に直接マッピングして送信するため、従来の`copy_from_user`システムコールを回避できます。バッファが再利用可能になったとき（つまり、データが送信されたか、送信キューに入れられたとき）に、`CQE`を介してアプリケーションに通知されます。
+
+`tokio-uring`は、`TcpStream`の`send_zc`メソッドを通じてこの機能を提供します。
+
+### ゼロコピーTCPストリーミングの実装
+
+この例では、データを受信し、ゼロコピーを使用して固定応答を送信するサーバーを示します。重要なのは、バッファのライフサイクルを慎重に管理することです。
+
+```rust
+use tokio_uring::net::{TcpListener, TcpStream};
+use tokio_uring::buf::IoBuf;
+use bytes::{BytesMut, BufMut};
+use log::{info, error};
+use std::sync::Arc;
+
+const BUFFER_SIZE: usize = 4096;
+const RESPONSE_DATA: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nHello, World!";
+
+#[tokio_uring::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let addr = "127.0.0.1:8080";
+    let listener = TcpListener::bind(addr).await?;
+    info!("Listening on {}", addr);
+
+    loop {
+        match listener.accept().await {
+            Ok((socket, peer_addr)) => {
+                info!("Accepted connection from {}", peer_addr);
+                tokio_uring::spawn(async move {
+                    if let Err(e) = handle_zero_copy_connection(socket).await {
+                        error!("Error handling zero-copy connection from {}: {}", peer_addr, e);
+                    }
+                });
+            }
+            Err(e) => {
+                error!("Error accepting connection: {}", e);
+            }
+        }
+    }
+}
+
+async fn handle_zero_copy_connection(mut socket: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    let mut recv_buf = BytesMut::with_capacity(BUFFER_SIZE);
+    let send_buf = Arc::new(BytesMut::from(RESPONSE_DATA)); // Use Arc for shared buffer for zero-copy send
+
+    loop {
+        // Receive data (standard copy, as MSG_ZEROCOPY is for send)
+        let (res, filled_buf) = socket.recv(recv_buf.split_off(0).limit(BUFFER_SIZE)).await;
+        let bytes_read = res?;
+
+        if bytes_read == 0 {
+            info!("Client disconnected.");
+            break;
+        }
+
+        recv_buf.unsplit(filled_buf);
+        recv_buf.advance_mut(bytes_read);
+
+        info!("Received {} bytes from client.", bytes_read);
+
+        // Perform zero-copy send
+        // `send_zc` returns a future that completes when the kernel is done with the buffer.
+        // The buffer is returned, allowing reuse.
+        let (res, returned_buf) = socket.send_zc(send_buf.clone().slice(..)).await;
+        let bytes_written = res?;
+
+        info!("Zero-copy sent {} bytes.", bytes_written);
+
+        if bytes_written == 0 {
+            info!("Failed to zero-copy send data, client likely disconnected.");
+            break;
+        }
+
+        // Clear the receive buffer for the next read
+        recv_buf.clear();
+    }
+    Ok(())
+}
+```
+
+これをテストするには、`curl`を使用できます: `curl http://127.0.0.1:8080`。"Hello, World!"を受け取るはずです。
+
+### ゼロコピーに関する重要な考慮事項
+
+*   **バッファのライフタイム**: `send_zc`に渡されるバッファは、`send_zc`フューチャが完了するまで有効で変更されないままでなければなりません。`tokio-uring`はバッファを返すことでこれを処理し、バッファが時期尚早にドロップされないようにします。共有される静的データの場合、`Arc<BytesMut>`または`Arc<[u8]>`が適しています。
+*   **カーネルサポート**: `MSG_ZEROCOPY`にはLinuxカーネル5.2以降が必要です。
+*   **エラー処理**: `MSG_ZEROCOPY`が失敗した場合（例: カーネルメモリ不足や古いカーネルのため）、`send_zc`はエラーを返します。本番環境では、標準の`send`へのフォールバックが必要になる場合があります。
+*   **バッファ登録**: 特に同じデータを繰り返し送信する場合のパフォーマンスを最大化するには、`io_uring`を使用してバッファを`IORING_REGISTER_BUFFERS`に登録することを検討してください。`tokio-uring`はこれのために`tokio_uring::buf::BoundedBuf`と`tokio_uring::buf::FixedBuf`を提供します。
+
+## 10万同時WebSocket接続のベンチマーク
+
+10万同時WebSocket接続の`io_uring`のベンチマークには、堅牢なセットアップが必要です。ここでは、完全なベンチマーククライアント/サーバーを提供するのではなく、アプローチと期待される結果の概要を説明します。
+
+### サーバーアーキテクチャ
+
+`tokio-uring`ベースのWebSocketサーバーには以下が含まれます。
+
+1.  **`tokio_uring::net::TcpListener`**: 新しい接続を受け入れます。
+2.  **WebSocketハンドシェイク**: HTTPアップグレードを実行します。この部分は標準HTTPであり、`httparse`などを使用できます。
+3.  **WebSocketフレーミング**: WebSocketプロトコルのフレーミング（マスキング、オペコード、長さ）を実装します。
+4.  **`tokio_uring::net::TcpStream::recv`**: WebSocketフレームを受信するため。
+5.  **`tokio_uring::net::TcpStream::send_zc`**: WebSocketフレームを送信するため、特にブロードキャストメッセージや大量のデータの場合。ここでゼロコピーが威力を発揮します。
+
+### クライアントアーキテクチャ
+
+ベンチマーククライアントは以下を行う必要があります。
+
+1.  **10万のTCP接続を確立**: これには、かなりのファイルディスクリプタ制限（`ulimit -n`）が必要です。
+2.  **WebSocketハンドシェイクを実行**: 各接続に対して。
+3.  **接続を維持**: 接続を維持するためにping/pongを送信します。
+4.  **データの送受信**: アプリケーショントラフィックをシミュレートします。
+5.  **レイテンシとスループットを測定**: ラウンドトリップ時間とデータレートを追跡します。
+
+### 期待されるパフォーマンス向上
+
+`io_uring`とゼロコピーを使用すると、サーバーが頻繁に同一のメッセージ（市場データ、ゲームの状態更新など）を多数のクライアントに送信する場合、以下が期待されます。
+
+*   **CPU使用率の削減**: システムコールとデータコピーが少ないため、カーネルCPU時間が短縮されます。
+*   **スループットの向上**: 単位時間あたりに処理されるデータ量が増加します。
+*   **レイテンシの低減**: 特に送信操作の場合、データが直接送信キューに入れられるため。
+*   **接続密度の増加**: 接続ごとのオーバーヘッドが削減されるため、サーバーインスタンスあたりでより多くの接続を処理できます。
+
+### ベンチマーク環境
+
+*   **カーネル**: 最適な`io_uring`機能のためにLinux 5.10+ (LTS) または 6.x。
+*   **ハードウェア**: 高コア数CPU、十分なRAM、高速NIC。
+*   **`ulimit -n`**: 100,000を超える値に設定（例: `ulimit -n 1048576`）。
+*   **ネットワークチューニング**: `sysctl`パラメータ（例: `net.core.somaxconn`、`net.ipv4.tcp_max_syn_backlog`、`net.ipv4.tcp_tw_reuse`、`net.ipv4.tcp_fin_timeout`）。
+
+## 本番環境での落とし穴とトラブルシューティング
+
+1.  **`io_uring`が利用できない/有効になっていない**:
+    *   **症状**: `io_uring`操作が`ENOSYS`または同様のエラーで失敗する。
+    *   **原因**: カーネルバージョン < 5.1、または`io_uring`モジュールがロードされていない/コンパイルされていない。
+    *   **修正**: カーネルを5.1+にアップグレードする（安定性/機能のために5.10+を推奨）。カーネル設定で`CONFIG_IO_URING=y`を確認する。
+2.  **`ulimit -n`が低すぎる**:
+    *   **症状**: 接続を受け入れる際やソケットを作成する際に`Too many open files`エラーが発生する。
+    *   **原因**: デフォルトのファイルディスクリプタ制限（通常1024）では、高い同時実行性には不十分。
+    *   **修正**: アプリケーションを実行しているユーザーの`ulimit -n`を増やす。systemdサービスの場合、サービスユニットファイルで`LimitNOFILE`を設定する。
+3.  **`MSG_ZEROCOPY`の失敗**:
+    *   **症状**: `send_zc`が`EOPNOTSUPP`または他のエラーを返す。
+    *   **原因**: カーネルバージョン < 5.2、または特定のネットワークドライバの制限。
+    *   **修正**: カーネルをアップグレードする。`send_zc`が失敗した場合に`TcpStream::send`へのフォールバックを実装する。
+4.  **ゼロコピーでのバッファ管理の問題**:
+    *   **症状**: データ破損、use-after-freeエラー、または予期しない動作。
+    *   **原因**: `send_zc`が完了してバッファを返す前に、バッファを再利用または変更している。
+    *   **修正**: バッファのライフタイムが厳密に管理されていることを確認する。`tokio-uring`の`send_zc`はバッファを返し、再利用可能であることを示します。共有される静的データの場合、カーネル処理中に不変性を確保するために`Arc`と`slice`を使用します。
+5.  **`io_uring`ポーリングによる高いCPU使用率**:
+    *   **症状**: `io_uring`ワーカースレッドが低負荷でもCPUを100%消費する。
+    *   **原因**: `IORING_SETUP_SQPOLL`（カーネルポーリング）が積極的すぎる場合がある。正しく設定されていない場合、スピンウェイトする可能性がある。
+    *   **修正**: ワークロードに合わせて`io_uring`が適切に設定されていることを確認する。`tokio-uring`は通常これを管理しますが、生の`io-uring`を使用している場合は、ポーリングフラグに注意してください。ほとんどのサーバーワークロードでは、イベント駆動型（非ポーリング）の`io_uring`で十分であり、ポーリングは超低レイテンシのシナリオに限定されます。
+6.  **メモリプレッシャー**:
+    *   **症状**: OOMエラー、過剰なスワッピング。
+    *   **原因**: 多数の接続、それぞれが独自の受信バッファを持つ、または大量の登録済み固定バッファ。
+    *   **修正**: バッファサイズを最適化する。受信操作にバッファプールを使用することを検討する。固定バッファの場合、必要なものだけを登録する。
+
+## よくある質問
+
+1.  **既存の`tokio`コードで`tokio-uring`を使用できますか？**
+    はい、`tokio-uring`は`tokio`互換ランタイムを提供します。`tokio_uring::spawn`を使用して、通常の`tokio::spawn`フューチャと並行して`io_uring`ベースのフューチャを実行できますが、最適なパフォーマンスを得るには、`io_uring`固有のI/Oを`tokio-uring`ランタイムに保持することが一般的に推奨されます。
+2.  **ネットワーキングにおいて、`io_uring`が`epoll`よりも優れている主な利点は何ですか？**
+    主な利点は、バッチ処理によるシステムコールオーバーヘッドの削減と、ユーザー空間とカーネル間のゼロコピーデータ転送を実行できることです。これにより、特に大量のI/O操作において、CPU使用率の低下、スループットの向上、レイテンシの低減が実現します。
+3.  **`io_uring`は常に`epoll`よりも高速ですか？**
+    常にそうとは限りません。低並行性、低スループットのアプリケーションの場合、`io_uring`のセットアップオーバーヘッドがその利点を上回る可能性があります。`io_uring`は、高並行性、高I/Oボリューム、またはゼロコピーが重要なシナリオで威力を発揮します。また、最新のLinuxカーネルが必要です。
+4.  **`tokio-uring`はゼロコピーのバッファ管理をどのように処理しますか？**
+    `tokio-uring`の`send_zc`メソッドは、`IoBuf`（`BytesMut`や`Arc<[u8]>`など）を受け取り、カーネルがバッファの処理を終えるとそれを返します。これにより、バッファのライフタイムが正しく管理され、use-after-freeの問題が防止されます。静的データの場合、`Arc`を使用して所有権を共有します。
+5.  **`io_uring`と`MSG_ZEROCOPY`のカーネル要件は何ですか？**
+    `io_uring`にはLinuxカーネル5.1以降が必要です。`MSG_ZEROCOPY`は特にLinuxカーネル5.2以降が必要です。本番環境では、安定性と機能の完全性のために、カーネル5.10 (LTS) または最近の6.xカーネルが推奨されます。
+
+## 結論
+
+`io_uring`は、Linuxの非同期I/Oにおける大きな進歩を表しており、高スループットアプリケーションに比類のないパフォーマンスを提供します。Rustは、その強力な型システムとパフォーマンス特性により、`io_uring`の機能を活用するのに理想的な言語です。`tokio-uring`クレートは、`io_uring`を`tokio`ベースのアプリケーションに統合するための堅牢で人間工学的な方法を提供し、開発者がゼロコピーデータ転送などの機能で非常に効率的なネットワークサービスを構築できるようにします。`io_uring`の学習曲線は従来の`epoll`よりも急峻かもしれませんが、要求の厳しいワークロードに対するパフォーマンス向上は大きく、投資に値します。

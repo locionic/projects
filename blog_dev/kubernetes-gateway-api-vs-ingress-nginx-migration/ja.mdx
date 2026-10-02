@@ -1,0 +1,366 @@
+---
+title: "Kubernetes Gateway API本番環境での利用: Ingress-NginxからEnvoyへの移行"
+images: ['/static/images/kubernetes-gateway-api-vs-ingress-nginx-migration.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["kubernetes", "devops", "cloud", "networking", "envoy"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Intermediate"
+programmingLanguage: "TypeScript"
+summary: "Kubernetes Gateway APIを本番環境で利用するための包括的なガイドで、Ingress-NginxからEnvoyへの移行、本番レベルのアーキテクチャ、コード例を解説します。"
+---
+
+Kubernetes Ingress APIは基盤となるものですが、複雑なトラフィック管理においては、表現力、役割の分離、拡張性に限界があります。その後継であるGateway APIは、よりきめ細かく、役割指向の設計と堅牢な拡張メカニズムを導入することで、これらの欠点を解消します。このガイドでは、Envoyプロキシを基盤とする`Envoy Gateway`または`Cilium Gateway`に焦点を当て、`ingress-nginx`からEnvoyベースのGateway API実装への本番環境移行戦略について詳しく説明します。
+
+<AudioPlayer src="/static/audio/kubernetes-gateway-api-vs-ingress-nginx-migration-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+## Gateway APIの基本を理解する
+
+Gateway APIは階層構造を導入しています。
+
+1.  **`GatewayClass`**: Gatewayのクラスを定義し、それを実装するコントローラー（例：`envoy-gateway-class`、`cilium-gateway-class`）を指定します。これは通常、インフラプロバイダーまたはクラスター管理者によって管理されます。
+2.  **`Gateway`**: ロードバランサーの特定のインスタンスを表し、ポートとプロトコルを公開します。これはインフラオペレーターまたはプラットフォームチームによってプロビジョニングされます。
+3.  **`HTTPRoute` / `GRPCRoute` / `TLSRoute` / `TCPRoute` / `UDPRoute`**: プロトコル固有のルーティングルールを定義し、Gatewayにアタッチします。これらは通常、アプリケーション開発者によって管理されます。
+
+この役割指向の設計は関心を分離します。インフラチームは`GatewayClass`と`Gateway`リソースを管理し、アプリケーションチームは`Route`リソースを管理することで、インフラを直接変更することなくセルフサービスを可能にします。
+
+## 移行戦略の概要
+
+段階的でダウンタイムのない移行が重要です。この戦略には以下が含まれます。
+
+1.  **並行デプロイ**: 既存の`ingress-nginx`と並行してGateway APIコントローラーとリソースをデプロイします。
+2.  **DNS切り替え**: `ingress-nginx`ロードバランサーIPからGateway APIロードバランサーIPへトラフィックを段階的に移行します。
+3.  **検証**: 完全な切り替えの前に、新しいパスを徹底的にテストします。
+4.  **ロールバック計画**: 新しいシステムが完全に検証されるまで`ingress-nginx`を維持します。
+
+### 前提条件
+
+*   Kubernetesクラスター（Gateway APIにはv1.20+を推奨）。
+*   自動TLS用に`cert-manager`がインストールされていること。
+*   `kubectl`および`helm` CLIツール。
+*   既存の`ingress-nginx`デプロイメント。
+
+## ステップ1：Gateway APIコントローラーのデプロイ
+
+ここでは`Envoy Gateway`を主要な例として使用しますが、`Cilium Gateway`も同様のパターンに従い、CiliumのeBPFデータプレーンを活用します。
+
+### オプションA：Envoy Gatewayのデプロイ
+
+```yaml
+# gateway-api-crd-install.yaml
+# Install Gateway API CRDs if not already present in your cluster.
+# This is a prerequisite for any Gateway API controller.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gatewayclasses.gateway.networking.k8s.io
+spec:
+  group: gateway.networking.k8s.io
+  names:
+    kind: GatewayClass
+    listKind: GatewayClassList
+    plural: gatewayclasses
+    singular: gatewayclass
+  scope: Cluster
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+      subresources:
+        status: {}
+---
+# ... other Gateway API CRDs (Gateway, HTTPRoute, etc.) ...
+# For brevity, full CRD definitions are omitted.
+# You can find them at https://github.com/kubernetes-sigs/gateway-api/releases
+
+# Install Envoy Gateway via Helm
+# Add the Envoy Gateway Helm repository
+helm repo add envoy-gateway https://envoyproxy.github.io/envoy-gateway/
+helm repo update
+
+# Install Envoy Gateway into the 'envoy-gateway-system' namespace
+helm install envoy-gateway envoy-gateway/envoy-gateway \
+  --create-namespace \
+  --namespace envoy-gateway-system \
+  --version v0.8.0 # Use the latest stable version
+```
+
+デプロイを確認します。
+
+```bash
+kubectl get pods -n envoy-gateway-system
+kubectl get gatewayclass
+```
+
+`EnvoyGateway`ポッドが実行され、`eg`（Envoy Gatewayのデフォルト）または類似の`GatewayClass`が表示されるはずです。
+
+### オプションB：Cilium Gatewayのデプロイ（代替）
+
+CiliumをCNIとしてすでに使用している場合、`Cilium Gateway`はeBPFを活用した高度に統合されたソリューションを提供します。
+
+```yaml
+# Install Cilium with Gateway API support
+helm upgrade --install cilium cilium/cilium \
+  --namespace kube-system \
+  --set gatewayAPI.enabled=true \
+  --set gatewayAPI.nodePort.enabled=true # Or LoadBalancer, depending on your cloud provider
+  # ... other Cilium configurations ...
+```
+
+デプロイを確認します。
+
+```bash
+kubectl get pods -n kube-system -l k8s-app=cilium
+kubectl get gatewayclass
+```
+
+`cilium`または類似の`GatewayClass`が表示されるはずです。
+
+## ステップ2：GatewayおよびHTTPRouteリソースの定義
+
+このステップでは、外部ロードバランサーをプロビジョニングする`Gateway`リソースと、ルーティングルールを定義する`HTTPRoute`リソースを作成します。
+
+### Gatewayの定義
+
+この`Gateway`リソースは、クラウドロードバランサーをプロビジョニングし、ポート80と443を公開します。
+
+```yaml
+# gateway.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-app-gateway
+  namespace: default # Or your designated ingress namespace
+spec:
+  gatewayClassName: eg # Use 'eg' for Envoy Gateway, 'cilium' for Cilium Gateway
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All # Allow HTTPRoutes from any namespace to attach
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: my-app-tls-secret # This secret will be provisioned by cert-manager
+      allowedRoutes:
+        namespaces:
+          from: All # Allow HTTPRoutes from any namespace to attach
+```
+
+これを適用します: `kubectl apply -f gateway.yaml`
+
+`Gateway`がプロビジョニングされるまで待ちます。そのステータスを確認します。
+
+```bash
+kubectl get gateway my-app-gateway -n default -o yaml
+```
+
+プロビジョニングされたロードバランサーの外部IPまたはホスト名を取得するには、`status.addresses`を探します。これが新しいエントリポイントになります。
+
+### `cert-manager`による自動TLS
+
+`cert-manager`がインストールされ、設定されていることを確認してください。TLSシークレットをプロビジョニングするために`Certificate`リソースを使用します。
+
+```yaml
+# cert-manager-certificate.yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: my-app-tls-certificate
+  namespace: default
+spec:
+  secretName: my-app-tls-secret # Matches the name in Gateway listener
+  dnsNames:
+    - myapp.example.com
+    - www.myapp.example.com
+  issuerRef:
+    name: letsencrypt-prod # Or your preferred ClusterIssuer/Issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+```
+
+これを適用します: `kubectl apply -f cert-manager-certificate.yaml`
+
+シークレットが作成されたことを確認します: `kubectl get secret my-app-tls-secret -n default`
+
+### HTTPRouteの定義
+
+次に、バックエンドサービスにトラフィックを転送するための`HTTPRoute`を定義します。この例には、パスベースのルーティングとカナリアデプロイメントのための重み付けされたトラフィックスプリットが含まれています。
+
+```yaml
+# httproute.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: my-app-route
+  namespace: default # Namespace where your application service resides
+spec:
+  parentRefs:
+    - name: my-app-gateway # Attach to the Gateway defined above
+      namespace: default
+  hostnames:
+    - "myapp.example.com"
+    - "www.myapp.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/v1/
+      backendRefs:
+        - name: my-app-service-v1 # Existing stable service
+          port: 80
+          weight: 90 # 90% of traffic to v1
+        - name: my-app-service-v2 # New canary service
+          port: 80
+          weight: 10 # 10% of traffic to v2
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: my-app-service-v1 # Default route for all other paths
+          port: 80
+```
+
+これを適用します: `kubectl apply -f httproute.yaml`
+
+`default`名前空間に`my-app-service-v1`と`my-app-service-v2`（およびそれに対応するデプロイメント）が存在することを確認してください。
+
+## ステップ3：DNS切り替え戦略
+
+これはダウンタイムゼロを実現するための最も重要なフェーズです。
+
+1.  **新しいロードバランサーIP/ホスト名の特定**: `kubectl get gateway my-app-gateway -n default -o jsonpath='{.status.addresses[0].value}'`からこれを入手します。
+2.  **DNSレコードの更新**:
+    *   **CNAME（クラウドロードバランサーに推奨）**: Gatewayがホスト名（例：`a123.us-east-1.elb.amazonaws.com`）をプロビジョニングする場合、`myapp.example.com`のCNAMEレコードをこの新しいホスト名に更新します。
+    *   **Aレコード**: GatewayがIPアドレスをプロビジョニングする場合、`myapp.example.com`のAレコードをこの新しいIPに更新します。
+3.  **段階的なDNS更新（オプションだが推奨）**:
+    *   **TTLの短縮**: 切り替えの前に、`myapp.example.com`のDNSレコードのTTL（Time To Live）を非常に低い値（例：60秒）に短縮します。これにより、変更が迅速に伝播されます。
+    *   **段階的な移行**: 可能であれば、重み付けされたDNSレコード（例：AWS Route 53の重み付けルーティングポリシー）をサポートするDNSプロバイダーを使用して、古い`ingress-nginx` IPから新しいGateway API IPへトラフィックを段階的に移行します。これにより、制御されたパーセンテージベースの切り替えが可能になります。
+    *   **ブルー/グリーンDNS**: よりシンプルなアプローチは、DNSレコードを直接更新することです。DNSキャッシュのため、これはクライアントにとっては依然として段階的な移行となります。
+
+**DNS更新の例（概念的、`myapp.example.com`を使用）:**
+
+```
+# Before migration (pointing to ingress-nginx LB)
+myapp.example.com.  300 IN  A   192.0.2.100
+
+# During migration (after Gateway API LB is ready)
+# Option 1: CNAME (if Gateway provides hostname)
+myapp.example.com.  60  IN  CNAME   a123.us-east-1.elb.amazonaws.com.
+
+# Option 2: A Record (if Gateway provides IP)
+myapp.example.com.  60  IN  A   203.0.113.200
+
+# After full validation, revert TTL to a higher value (e.g., 3600)
+myapp.example.com.  3600 IN CNAME   a123.us-east-1.elb.amazonaws.com.
+```
+
+## ステップ4：検証と監視
+
+徹底的な検証が最も重要です。
+
+1.  **直接アクセス**: DNS切り替えの前に、新しいGateway APIエンドポイントにそのIP/ホスト名を使用して直接テストします。
+2.  **ヘルスチェック**: すべてのバックエンドサービスが正常であることを確認します。
+3.  **アプリケーションログ**: アプリケーションログでエラーを監視します。
+4.  **メトリクス**: 古い`ingress-nginx`パスと新しいGateway APIパスの間で、レイテンシ、エラー率、スループットを比較します。Envoy Gatewayは、スクレイピング可能なPrometheusメトリクスを公開しています。
+5.  **カナリアテスト**: `HTTPRoute`の重み付けされたトラフィックスプリットを活用して、少数のユーザーを新しいパスに段階的に公開します。綿密に監視します。
+6.  **エンドツーエンドテスト**: 新しいエンドポイントに対して自動E2Eテストスイートを実行します。
+
+## 本番環境での落とし穴とトラブルシューティング
+
+### 1. `Gateway`が`Pending`状態のままになる
+
+*   **症状**: `kubectl get gateway my-app-gateway`が`Ready: False`と`message: "Gateway is not ready"`で`status.conditions`を表示する。
+*   **原因**: 基盤となるクラウドロードバランサーのプロビジョニングに失敗したか、Gatewayコントローラーでエラーが発生した。
+*   **修正**:
+    *   コントローラーログを確認する: `kubectl logs -n envoy-gateway-system -l app.kubernetes.io/name=envoy-gateway`。クラウドプロバイダーAPI呼び出しに関連するエラーを探す。
+    *   クラウドプロバイダーのクォータを確認する: ロードバランサーのクォータが十分にあることを確認する。
+    *   Kubernetesイベントを確認する: `kubectl describe gateway my-app-gateway`。
+
+### 2. `HTTPRoute`が`Gateway`にアタッチされない
+
+*   **症状**: `kubectl get httproute my-app-route -o yaml`が`conditions`で`status.parents`を表示し、`ResolvedRefs: False`または`Accepted: False`を示す。
+*   **原因**: `parentRefs`（名前、名前空間）の不一致、または`Gateway`上の`allowedRoutes`設定。
+*   **修正**:
+    *   `HTTPRoute`の`parentRefs.name`と`parentRefs.namespace`が、`Gateway`の名前と名前空間に正確に一致することを確認する。
+    *   `Gateway.spec.listeners.allowedRoutes.namespaces.from`が正しく設定されていることを確認する（例：`All`または`Selector`が`HTTPRoute`の名前空間と一致する）。
+    *   `Gateway`と`HTTPRoute`のイベントを確認する: `kubectl describe gateway my-app-gateway`と`kubectl describe httproute my-app-route`。
+
+### 3. TLSハンドシェイクエラー
+
+*   **症状**: クライアントが`SSL_PROTOCOL_ERROR`または`certificate_unknown`エラーを報告する。
+*   **原因**: `Gateway`の`certificateRef`が間違っている、`cert-manager`の失敗、または`tls.mode`が間違っている。
+*   **修正**:
+    *   `Gateway.spec.listeners.tls.certificateRefs`が正しい`Secret`名と名前空間を指していることを確認する。
+    *   `cert-manager` `Certificate`と`CertificateRequest`リソースを確認する: `kubectl get certificate my-app-tls-certificate -n default -o yaml`。`Ready: True`を確認する。
+    *   `cert-manager`コントローラーログを検査する: `kubectl logs -n cert-manager -l app.kubernetes.io/instance=cert-manager`。
+    *   エッジTLS終端のために`tls.mode`が`Terminate`であることを確認する。
+
+### 4. 重み付けされたトラフィックスプリットが機能しない
+
+*   **症状**: トラフィックの分散が`weight`設定と一致しない、またはすべてのトラフィックが1つのバックエンドに流れる。
+*   **原因**: `backendRefs`の設定ミス、またはサービスディスカバリの問題。
+*   **修正**:
+    *   `HTTPRoute.spec.rules.backendRefs.weight`の値を再確認する。複数のルールが適用される場合は、それらが正しく合計されていることを確認する。
+    *   `backendRefs.name`と`backendRefs.port`がKubernetesの`Service`リソースを正しく指していることを確認する。
+    *   バックエンドサービス用の`Service`と`EndpointSlice`リソースを確認し、正常なポッドがあることを確認する。
+    *   Envoy Gatewayのログでルーティングエラーを監視する。
+
+### 5. 移行後のパフォーマンス低下
+
+*   **症状**: レイテンシの増加、エラー率の上昇、またはスループットの低下。
+*   **原因**: GatewayコントローラーまたはEnvoyプロキシポッドのリソース制約、Envoyプロキシ設定の誤り、またはネットワークの問題。
+*   **修正**:
+    *   **リソース制限**: Envoy GatewayコントローラーとEnvoyプロキシポッドのCPU/メモリ制限を増やす。
+    *   **Envoy設定**: 高度なチューニングの場合、バッファサイズ、接続制限、またはその他のEnvoy固有の設定を調整するために、`EnvoyProxy`リソース（Envoy Gatewayを使用している場合）をカスタマイズする必要があるかもしれません。
+    *   **ネットワークパス**: Gatewayロードバランサーとバックエンドポッド間のネットワーク接続とレイテンシを確認する。
+    *   **メトリクス**: Prometheus/Grafanaを使用してEnvoyメトリクス（例：`envoy_cluster_upstream_rq_total`、`envoy_server_uptime`）を監視する。
+
+## アーキテクチャ比較：Ingress-Nginx vs. Gateway API (Envoy)
+
+| 機能 | Ingress-Nginx | Gateway API (Envoy Gateway) |
+|:--------|:--------------|:----------------------------|
+| **APIモデル** | Ingress, IngressClass | GatewayClass, Gateway, HTTPRouteなど |
+| **役割分離** | 限定的（管理者がIngressClassを管理、開発者がIngressを管理） | 強力（インフラ: GatewayClass、オペレーター: Gateway、開発者: Route） |
+| **拡張性** | アノテーション、Nginx ConfigMap | ポリシーアタッチメント（例：`HTTPRouteFilter`）、`EnvoyProxy` CRD |
+| **トラフィックスプリット** | アノテーション（例：`nginx.ingress.kubernetes.io/canary`） | `HTTPRoute`におけるファーストクラスの`backendRefs.weight` |
+| **マルチクラスター** | ネイティブではサポートされていない | マルチクラスター/マルチテナント向けに設計 |
+| **プロトコルサポート** | HTTP/HTTPS、TCP/UDP（`externalName`または`stream-snippets`経由） | HTTP/HTTPS、gRPC、TCP、UDP、TLS（ネイティブCRD） |
+| **実装** | Nginx | Envoy Proxy |
+| **TLS管理** | Ingressアノテーション経由の`cert-manager` | `Gateway.spec.listeners.tls.certificateRefs`経由の`cert-manager` |
+
+## よくある質問
+
+### 1. `ingress-nginx`とGateway APIを同時に実行できますか？
+
+はい、これは段階的な移行に推奨されるアプローチです。これらは独立して動作し、それぞれ独自のロードバランサーをプロビジョニングします。DNSを管理して、どちらか一方にトラフィックを誘導します。
+
+### 2. カスタムLuaスクリプトや特定のNginxディレクティブのような高度なNginx設定はどのように扱いますか？
+
+`Envoy Gateway`の場合、通常は`EnvoyProxy`カスタムリソースを使用して高度なEnvoy設定を適用します。これにより、基盤となるEnvoyプロキシの設定を直接操作できます。`Cilium Gateway`の場合、Ciliumのネットワークポリシーと、高度なEnvoy機能のための`CiliumEnvoyConfig`リソースを活用します。Gateway API自体は標準的なルーティングに焦点を当てており、コントローラー固有のCRDが拡張性を提供します。
+
+### 3. Envoyを使用したGateway APIへの移行がパフォーマンスに与える影響は何ですか？
+
+Envoyは高性能なプロキシであり、特にHTTP/2やgRPCの特定のワークロードではNginxよりも優れたパフォーマンスを発揮することがよくあります。適切なリソース割り当てを前提とすれば、パフォーマンスへの影響は一般的に肯定的または中立的です。重要なのは、Envoy GatewayコントローラーとEnvoyプロキシポッドの適切な設定とリソースプロビジョニングです。
+
+### 4. Gateway APIでのクロスネームスペースルーティングはどのように機能しますか？
+
+`Gateway.spec.listeners.allowedRoutes`フィールドは、どの名前空間が特定の`Gateway`に`Route`リソースをアタッチすることを許可されているかを制御します。`All`、`Same`、または`Selector`を指定して、`Route`のアタッチメントを制限または許可し、安全なマルチテナント環境を可能にすることができます。例えば、`from: All`は任意の名前空間を許可し、`from: Selector`と`namespaceSelector`は特定のラベルに一致する名前空間のみを許可します。
+
+### 5. Gateway APIは本番環境で使用できますか？
+
+はい、Gateway APIは2023年10月に`v1`のGA（一般提供）に昇格しました。`Envoy Gateway`や`Cilium Gateway`のようなコントローラーは活発に開発されており、本番環境で使用されています。これはKubernetesにおけるIngressとトラフィック管理の未来と考えられています。

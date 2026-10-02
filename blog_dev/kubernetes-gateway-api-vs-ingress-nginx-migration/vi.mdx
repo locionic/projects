@@ -1,0 +1,366 @@
+---
+title: "Kubernetes Gateway API trong sản xuất: Di chuyển từ Ingress-Nginx với Envoy"
+images: ['/static/images/kubernetes-gateway-api-vs-ingress-nginx-migration.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["kubernetes", "devops", "cloud", "networking", "envoy"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Intermediate"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về Kubernetes Gateway API trong sản xuất: di chuyển từ Ingress-Nginx với Envoy với kiến trúc cấp độ sản xuất và các ví dụ code."
+---
+
+API Ingress của Kubernetes, dù là nền tảng, vẫn bộc lộ những hạn chế về khả năng biểu đạt, phân tách vai trò và khả năng mở rộng cho việc quản lý lưu lượng phức tạp. Gateway API, một phiên bản kế nhiệm, giải quyết những thiếu sót này bằng cách giới thiệu một thiết kế chi tiết hơn, định hướng vai trò và một cơ chế mở rộng mạnh mẽ. Hướng dẫn này trình bày chi tiết chiến lược di chuyển sản xuất từ `ingress-nginx` sang triển khai Gateway API dựa trên Envoy, tập trung vào `Envoy Gateway` hoặc `Cilium Gateway` vì nền tảng proxy Envoy của chúng.
+
+<AudioPlayer src="/static/audio/kubernetes-gateway-api-vs-ingress-nginx-migration-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Hiểu các Nguyên tắc cơ bản của Gateway API
+
+Gateway API giới thiệu một cấu trúc phân cấp:
+
+1.  **`GatewayClass`**: Định nghĩa một lớp Gateway, chỉ định bộ điều khiển chịu trách nhiệm triển khai nó (ví dụ: `envoy-gateway-class`, `cilium-gateway-class`). Điều này thường được quản lý bởi các nhà cung cấp cơ sở hạ tầng hoặc quản trị viên cụm.
+2.  **`Gateway`**: Đại diện cho một phiên bản cụ thể của bộ cân bằng tải, phơi bày các cổng và giao thức. Nó được cung cấp bởi các nhà điều hành cơ sở hạ tầng hoặc nhóm nền tảng.
+3.  **`HTTPRoute` / `GRPCRoute` / `TLSRoute` / `TCPRoute` / `UDPRoute`**: Định nghĩa các quy tắc định tuyến cụ thể theo giao thức, gắn vào các Gateway. Những quy tắc này thường được quản lý bởi các nhà phát triển ứng dụng.
+
+Thiết kế định hướng vai trò này phân tách các mối quan tâm: các nhóm cơ sở hạ tầng quản lý tài nguyên `GatewayClass` và `Gateway`, trong khi các nhóm ứng dụng quản lý tài nguyên `Route`, cho phép tự phục vụ mà không cần sửa đổi trực tiếp cơ sở hạ tầng.
+
+## Tổng quan Chiến lược Di chuyển
+
+Việc di chuyển theo từng giai đoạn, không gián đoạn là rất quan trọng. Chiến lược bao gồm:
+
+1.  **Triển khai song song**: Triển khai bộ điều khiển Gateway API và các tài nguyên cùng với `ingress-nginx` hiện có.
+2.  **Chuyển đổi DNS**: Dần dần chuyển lưu lượng từ IP LoadBalancer của `ingress-nginx` sang IP LoadBalancer của Gateway API.
+3.  **Xác thực**: Kiểm tra kỹ lưỡng đường dẫn mới trước khi chuyển đổi hoàn toàn.
+4.  **Kế hoạch khôi phục**: Duy trì `ingress-nginx` cho đến khi hệ thống mới được xác thực hoàn toàn.
+
+### Điều kiện tiên quyết
+
+*   Một cụm Kubernetes (khuyến nghị v1.20+ cho Gateway API).
+*   `cert-manager` được cài đặt để tự động hóa TLS.
+*   Các công cụ CLI `kubectl` và `helm`.
+*   Triển khai `ingress-nginx` hiện có.
+
+## Bước 1: Triển khai Bộ điều khiển Gateway API
+
+Chúng ta sẽ sử dụng `Envoy Gateway` làm ví dụ chính, nhưng `Cilium Gateway` tuân theo một mô hình tương tự, tận dụng mặt phẳng dữ liệu eBPF của Cilium.
+
+### Tùy chọn A: Triển khai Envoy Gateway
+
+```yaml
+# gateway-api-crd-install.yaml
+# Install Gateway API CRDs if not already present in your cluster.
+# This is a prerequisite for any Gateway API controller.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gatewayclasses.gateway.networking.k8s.io
+spec:
+  group: gateway.networking.k8s.io
+  names:
+    kind: GatewayClass
+    listKind: GatewayClassList
+    plural: gatewayclasses
+    singular: gatewayclass
+  scope: Cluster
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+      subresources:
+        status: {}
+---
+# ... other Gateway API CRDs (Gateway, HTTPRoute, etc.) ...
+# For brevity, full CRD definitions are omitted.
+# You can find them at https://github.com/kubernetes-sigs/gateway-api/releases
+
+# Install Envoy Gateway via Helm
+# Add the Envoy Gateway Helm repository
+helm repo add envoy-gateway https://envoyproxy.github.io/envoy-gateway/
+helm repo update
+
+# Install Envoy Gateway into the 'envoy-gateway-system' namespace
+helm install envoy-gateway envoy-gateway/envoy-gateway \
+  --create-namespace \
+  --namespace envoy-gateway-system \
+  --version v0.8.0 # Use the latest stable version
+```
+
+Xác minh việc triển khai:
+
+```bash
+kubectl get pods -n envoy-gateway-system
+kubectl get gatewayclass
+```
+
+Bạn sẽ thấy một pod `EnvoyGateway` đang chạy và một `GatewayClass` có tên `eg` (mặc định cho Envoy Gateway) hoặc tương tự.
+
+### Tùy chọn B: Triển khai Cilium Gateway (Thay thế)
+
+Nếu bạn đã sử dụng Cilium làm CNI của mình, `Cilium Gateway` cung cấp một giải pháp tích hợp cao tận dụng eBPF.
+
+```yaml
+# Install Cilium with Gateway API support
+helm upgrade --install cilium cilium/cilium \
+  --namespace kube-system \
+  --set gatewayAPI.enabled=true \
+  --set gatewayAPI.nodePort.enabled=true # Or LoadBalancer, depending on your cloud provider
+  # ... other Cilium configurations ...
+```
+
+Xác minh việc triển khai:
+
+```bash
+kubectl get pods -n kube-system -l k8s-app=cilium
+kubectl get gatewayclass
+```
+
+Bạn sẽ thấy một `GatewayClass` có tên `cilium` hoặc tương tự.
+
+## Bước 2: Định nghĩa Tài nguyên Gateway và HTTPRoute
+
+Bước này bao gồm việc tạo tài nguyên `Gateway`, tài nguyên này sẽ cung cấp bộ cân bằng tải bên ngoài, và tài nguyên `HTTPRoute` để định nghĩa các quy tắc định tuyến.
+
+### Định nghĩa Gateway
+
+Tài nguyên `Gateway` này sẽ cung cấp một Cloud LoadBalancer và phơi bày các cổng 80 và 443.
+
+```yaml
+# gateway.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-app-gateway
+  namespace: default # Or your designated ingress namespace
+spec:
+  gatewayClassName: eg # Use 'eg' for Envoy Gateway, 'cilium' for Cilium Gateway
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All # Allow HTTPRoutes from any namespace to attach
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: my-app-tls-secret # This secret will be provisioned by cert-manager
+      allowedRoutes:
+        namespaces:
+          from: All # Allow HTTPRoutes from any namespace to attach
+```
+
+Áp dụng điều này: `kubectl apply -f gateway.yaml`
+
+Chờ `Gateway` được cung cấp. Kiểm tra trạng thái của nó:
+
+```bash
+kubectl get gateway my-app-gateway -n default -o yaml
+```
+
+Tìm `status.addresses` để lấy IP hoặc tên máy chủ bên ngoài của LoadBalancer đã được cung cấp. Đây sẽ là điểm truy cập mới của bạn.
+
+### Tự động hóa TLS với `cert-manager`
+
+Đảm bảo `cert-manager` đã được cài đặt và cấu hình. Chúng ta sẽ sử dụng tài nguyên `Certificate` để cung cấp bí mật TLS.
+
+```yaml
+# cert-manager-certificate.yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: my-app-tls-certificate
+  namespace: default
+spec:
+  secretName: my-app-tls-secret # Matches the name in Gateway listener
+  dnsNames:
+    - myapp.example.com
+    - www.myapp.example.com
+  issuerRef:
+    name: letsencrypt-prod # Or your preferred ClusterIssuer/Issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+```
+
+Áp dụng điều này: `kubectl apply -f cert-manager-certificate.yaml`
+
+Xác minh bí mật đã được tạo: `kubectl get secret my-app-tls-secret -n default`
+
+### Định nghĩa HTTPRoute
+
+Bây giờ, hãy định nghĩa `HTTPRoute` để định tuyến lưu lượng đến dịch vụ backend của bạn. Ví dụ này bao gồm định tuyến dựa trên đường dẫn và chia tách lưu lượng theo trọng số cho các triển khai canary.
+
+```yaml
+# httproute.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: my-app-route
+  namespace: default # Namespace where your application service resides
+spec:
+  parentRefs:
+    - name: my-app-gateway # Attach to the Gateway defined above
+      namespace: default
+  hostnames:
+    - "myapp.example.com"
+    - "www.myapp.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/v1/
+      backendRefs:
+        - name: my-app-service-v1 # Existing stable service
+          port: 80
+          weight: 90 # 90% of traffic to v1
+        - name: my-app-service-v2 # New canary service
+          port: 80
+          weight: 10 # 10% of traffic to v2
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: my-app-service-v1 # Default route for all other paths
+          port: 80
+```
+
+Áp dụng điều này: `kubectl apply -f httproute.yaml`
+
+Đảm bảo `my-app-service-v1` và `my-app-service-v2` của bạn (và các Triển khai tương ứng của chúng) tồn tại trong không gian tên `default`.
+
+## Bước 3: Chiến lược Chuyển đổi DNS
+
+Đây là giai đoạn quan trọng nhất để không gián đoạn.
+
+1.  **Xác định IP/Tên máy chủ LoadBalancer mới**: Lấy từ `kubectl get gateway my-app-gateway -n default -o jsonpath='{.status.addresses[0].value}'`.
+2.  **Cập nhật bản ghi DNS**:
+    *   **CNAME (Khuyến nghị cho Cloud LoadBalancers)**: Nếu Gateway của bạn cung cấp một tên máy chủ (ví dụ: `a123.us-east-1.elb.amazonaws.com`), hãy cập nhật bản ghi CNAME `myapp.example.com` của bạn để trỏ đến tên máy chủ mới này.
+    *   **Bản ghi A**: Nếu Gateway của bạn cung cấp một địa chỉ IP, hãy cập nhật bản ghi A `myapp.example.com` của bạn để trỏ đến IP mới này.
+3.  **Cập nhật DNS theo giai đoạn (Tùy chọn nhưng được khuyến nghị)**:
+    *   **Giảm TTL**: Trước khi chuyển đổi, hãy giảm TTL (Time To Live) của các bản ghi DNS cho `myapp.example.com` xuống một giá trị rất thấp (ví dụ: 60 giây). Điều này đảm bảo các thay đổi được lan truyền nhanh chóng.
+    *   **Chuyển đổi dần dần**: Nếu có thể, hãy sử dụng nhà cung cấp DNS hỗ trợ các bản ghi DNS có trọng số (ví dụ: chính sách định tuyến có trọng số của AWS Route 53) để dần dần chuyển lưu lượng từ IP `ingress-nginx` cũ sang IP Gateway API mới. Điều này cho phép chuyển đổi có kiểm soát, dựa trên tỷ lệ phần trăm.
+    *   **DNS xanh/xanh lam**: Một cách tiếp cận đơn giản hơn là cập nhật trực tiếp bản ghi DNS. Do bộ nhớ đệm DNS, điều này vẫn sẽ là một sự chuyển đổi dần dần đối với các máy khách.
+
+**Ví dụ Cập nhật DNS (Khái niệm, sử dụng `myapp.example.com`):**
+
+```
+# Before migration (pointing to ingress-nginx LB)
+myapp.example.com.  300 IN  A   192.0.2.100
+
+# During migration (after Gateway API LB is ready)
+# Option 1: CNAME (if Gateway provides hostname)
+myapp.example.com.  60  IN  CNAME   a123.us-east-1.elb.amazonaws.com.
+
+# Option 2: A Record (if Gateway provides IP)
+myapp.example.com.  60  IN  A   203.0.113.200
+
+# After full validation, revert TTL to a higher value (e.g., 3600)
+myapp.example.com.  3600 IN CNAME   a123.us-east-1.elb.amazonaws.com.
+```
+
+## Bước 4: Xác thực và Giám sát
+
+Xác thực kỹ lưỡng là tối quan trọng.
+
+1.  **Truy cập trực tiếp**: Kiểm tra điểm cuối Gateway API mới trực tiếp bằng IP/tên máy chủ của nó trước khi chuyển đổi DNS.
+2.  **Kiểm tra sức khỏe**: Đảm bảo tất cả các dịch vụ backend đều khỏe mạnh.
+3.  **Nhật ký ứng dụng**: Giám sát nhật ký ứng dụng để tìm lỗi.
+4.  **Số liệu**: So sánh độ trễ, tỷ lệ lỗi và thông lượng giữa đường dẫn `ingress-nginx` cũ và đường dẫn Gateway API mới. Envoy Gateway phơi bày các số liệu Prometheus có thể được thu thập.
+5.  **Kiểm tra Canary**: Tận dụng việc chia tách lưu lượng theo trọng số trong `HTTPRoute` để dần dần cho một tỷ lệ nhỏ người dùng tiếp cận đường dẫn mới. Giám sát chặt chẽ.
+6.  **Kiểm tra đầu cuối**: Chạy bộ kiểm tra E2E tự động của bạn đối với điểm cuối mới.
+
+## Các vấn đề và Khắc phục sự cố trong sản xuất
+
+### 1. `Gateway` bị kẹt ở trạng thái `Pending`
+
+*   **Triệu chứng**: `kubectl get gateway my-app-gateway` hiển thị `status.conditions` với `Ready: False` và `message: "Gateway is not ready"`.
+*   **Nguyên nhân**: Cloud LoadBalancer cơ bản không được cung cấp, hoặc bộ điều khiển Gateway gặp lỗi.
+*   **Khắc phục**:
+    *   Kiểm tra nhật ký bộ điều khiển: `kubectl logs -n envoy-gateway-system -l app.kubernetes.io/name=envoy-gateway`. Tìm kiếm các lỗi liên quan đến các lệnh gọi API của nhà cung cấp đám mây.
+    *   Xác minh hạn ngạch của nhà cung cấp đám mây: Đảm bảo bạn có đủ hạn ngạch LoadBalancer.
+    *   Kiểm tra các sự kiện Kubernetes: `kubectl describe gateway my-app-gateway`.
+
+### 2. `HTTPRoute` không gắn vào `Gateway`
+
+*   **Triệu chứng**: `kubectl get httproute my-app-route -o yaml` hiển thị `status.parents` với `conditions` cho biết `ResolvedRefs: False` hoặc `Accepted: False`.
+*   **Nguyên nhân**: Không khớp trong `parentRefs` (tên, không gian tên) hoặc cấu hình `allowedRoutes` trên `Gateway`.
+*   **Khắc phục**:
+    *   Đảm bảo `parentRefs.name` và `parentRefs.namespace` trong `HTTPRoute` khớp chính xác với tên và không gian tên của `Gateway`.
+    *   Xác minh `Gateway.spec.listeners.allowedRoutes.namespaces.from` được đặt chính xác (ví dụ: `All` hoặc `Selector` khớp với không gian tên của `HTTPRoute`).
+    *   Kiểm tra các sự kiện `Gateway` và `HTTPRoute`: `kubectl describe gateway my-app-gateway` và `kubectl describe httproute my-app-route`.
+
+### 3. Lỗi bắt tay TLS
+
+*   **Triệu chứng**: Máy khách báo cáo lỗi `SSL_PROTOCOL_ERROR` hoặc `certificate_unknown`.
+*   **Nguyên nhân**: `certificateRef` không chính xác trong `Gateway`, lỗi `cert-manager`, hoặc `tls.mode` không chính xác.
+*   **Khắc phục**:
+    *   Xác minh `Gateway.spec.listeners.tls.certificateRefs` trỏ đến tên và không gian tên `Secret` chính xác.
+    *   Kiểm tra tài nguyên `cert-manager` `Certificate` và `CertificateRequest`: `kubectl get certificate my-app-tls-certificate -n default -o yaml`. Đảm bảo `Ready: True`.
+    *   Kiểm tra nhật ký bộ điều khiển `cert-manager`: `kubectl logs -n cert-manager -l app.kubernetes.io/instance=cert-manager`.
+    *   Đảm bảo `tls.mode` là `Terminate` để kết thúc TLS ở biên.
+
+### 4. Chia tách lưu lượng theo trọng số không hoạt động
+
+*   **Triệu chứng**: Phân phối lưu lượng không khớp với cấu hình `weight`, hoặc tất cả lưu lượng đi đến một backend.
+*   **Nguyên nhân**: Cấu hình sai trong `backendRefs` hoặc các vấn đề với khám phá dịch vụ.
+*   **Khắc phục**:
+    *   Kiểm tra lại các giá trị `HTTPRoute.spec.rules.backendRefs.weight`. Đảm bảo chúng tổng hợp chính xác nếu nhiều quy tắc được áp dụng.
+    *   Xác minh `backendRefs.name` và `backendRefs.port` trỏ chính xác đến tài nguyên `Service` Kubernetes của bạn.
+    *   Kiểm tra tài nguyên `Service` và `EndpointSlice` cho các dịch vụ backend của bạn để đảm bảo chúng có các pod khỏe mạnh.
+    *   Giám sát nhật ký Envoy Gateway để tìm lỗi định tuyến.
+
+### 5. Suy giảm hiệu suất sau khi di chuyển
+
+*   **Triệu chứng**: Tăng độ trễ, tỷ lệ lỗi cao hơn hoặc giảm thông lượng.
+*   **Nguyên nhân**: Hạn chế tài nguyên trên bộ điều khiển Gateway hoặc các pod proxy Envoy, cài đặt proxy Envoy bị cấu hình sai hoặc các vấn đề mạng.
+*   **Khắc phục**:
+    *   **Giới hạn tài nguyên**: Tăng giới hạn CPU/bộ nhớ cho bộ điều khiển Envoy Gateway và các pod proxy Envoy.
+    *   **Cấu hình Envoy**: Để điều chỉnh nâng cao, bạn có thể cần tùy chỉnh tài nguyên `EnvoyProxy` (nếu sử dụng Envoy Gateway) để điều chỉnh kích thước bộ đệm, giới hạn kết nối hoặc các cài đặt cụ thể khác của Envoy.
+    *   **Đường dẫn mạng**: Xác minh kết nối mạng và độ trễ giữa Gateway LoadBalancer và các pod backend của bạn.
+    *   **Số liệu**: Sử dụng Prometheus/Grafana để giám sát các số liệu Envoy (ví dụ: `envoy_cluster_upstream_rq_total`, `envoy_server_uptime`).
+
+## So sánh kiến trúc: Ingress-Nginx so với Gateway API (Envoy)
+
+| Tính năng | Ingress-Nginx | Gateway API (Envoy Gateway) |
+|:--------|:--------------|:----------------------------|
+| **Mô hình API** | Ingress, IngressClass | GatewayClass, Gateway, HTTPRoute, v.v. |
+| **Phân tách vai trò** | Hạn chế (quản trị viên quản lý IngressClass, nhà phát triển quản lý Ingress) | Mạnh mẽ (Cơ sở hạ tầng: GatewayClass, Người vận hành: Gateway, Nhà phát triển: Route) |
+| **Khả năng mở rộng** | Chú thích, Nginx ConfigMaps | Gắn chính sách (ví dụ: `HTTPRouteFilter`), CRD `EnvoyProxy` |
+| **Chia tách lưu lượng** | Chú thích (ví dụ: `nginx.ingress.kubernetes.io/canary`) | `backendRefs.weight` hạng nhất trong `HTTPRoute` |
+| **Đa cụm** | Không được hỗ trợ nguyên bản | Được thiết kế cho đa cụm/đa người thuê |
+| **Hỗ trợ giao thức** | HTTP/HTTPS, TCP/UDP (qua `externalName` hoặc `stream-snippets`) | HTTP/HTTPS, gRPC, TCP, UDP, TLS (CRD gốc) |
+| **Triển khai** | Nginx | Envoy Proxy |
+| **Quản lý TLS** | `cert-manager` qua chú thích Ingress | `cert-manager` qua `Gateway.spec.listeners.tls.certificateRefs` |
+
+## Các câu hỏi thường gặp
+
+### 1. Tôi có thể chạy `ingress-nginx` và Gateway API đồng thời không?
+
+Có, đây là cách tiếp cận được khuyến nghị cho việc di chuyển theo từng giai đoạn. Chúng hoạt động độc lập, mỗi cái cung cấp LoadBalancer riêng. Bạn sẽ quản lý DNS để định tuyến lưu lượng đến một trong hai.
+
+### 2. Làm cách nào để xử lý các cấu hình Nginx nâng cao như tập lệnh Lua tùy chỉnh hoặc các chỉ thị Nginx cụ thể?
+
+Đối với `Envoy Gateway`, bạn thường sử dụng tài nguyên tùy chỉnh `EnvoyProxy` để áp dụng các cấu hình Envoy nâng cao. Điều này cho phép thao tác trực tiếp cấu hình của proxy Envoy cơ bản. Đối với `Cilium Gateway`, bạn sẽ tận dụng các chính sách mạng của Cilium và có thể là tài nguyên `CiliumEnvoyConfig` cho các tính năng Envoy nâng cao. Bản thân Gateway API tập trung vào định tuyến tiêu chuẩn, trong khi các CRD cụ thể của bộ điều khiển cung cấp khả năng mở rộng.
+
+### 3. Tác động đến hiệu suất khi di chuyển sang Gateway API với Envoy là gì?
+
+Envoy là một proxy hiệu suất cao, thường vượt trội hơn Nginx đối với một số khối lượng công việc nhất định, đặc biệt với HTTP/2 và gRPC. Tác động hiệu suất thường là tích cực hoặc trung tính, giả sử phân bổ tài nguyên đầy đủ. Điều quan trọng là cấu hình và cung cấp tài nguyên phù hợp cho bộ điều khiển Envoy Gateway và các pod proxy Envoy.
+
+### 4. Định tuyến giữa các không gian tên hoạt động như thế nào với Gateway API?
+
+Trường `Gateway.spec.listeners.allowedRoutes` kiểm soát những không gian tên nào được phép gắn tài nguyên `Route` vào một `Gateway` cụ thể. Bạn có thể chỉ định `All`, `Same` hoặc `Selector` để hạn chế hoặc cho phép các tệp đính kèm `Route`, cho phép môi trường đa người thuê an toàn. Ví dụ: `from: All` cho phép bất kỳ không gian tên nào, trong khi `from: Selector` với `namespaceSelector` chỉ cho phép các không gian tên khớp với các nhãn cụ thể.
+
+### 5. Gateway API đã sẵn sàng cho sản xuất chưa?
+
+Có, Gateway API đã được nâng cấp lên GA (General Availability) cho `v1` vào tháng 10 năm 2023. Các bộ điều khiển như `Envoy Gateway` và `Cilium Gateway` đang được phát triển tích cực và được sử dụng trong môi trường sản xuất. Nó được coi là tương lai của ingress và quản lý lưu lượng trong Kubernetes.

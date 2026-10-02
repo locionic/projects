@@ -1,0 +1,314 @@
+---
+title: "I/O Linux thông lượng cao trong Rust: io_uring, Tokio & Zero-Copy Networking"
+images: ['/static/images/rust-tokio-io-uring-high-throughput-networking.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["rust", "linux", "systems", "performance", "networking"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về I/O Linux thông lượng cao trong Rust: io_uring, Tokio & zero-copy networking với kiến trúc và ví dụ code cấp độ sản xuất."
+---
+
+Hiệu năng I/O của Linux rất quan trọng đối với các dịch vụ mạng quy mô lớn. I/O bất đồng bộ truyền thống dựa trên `epoll`, mặc dù hiệu quả, vẫn gây ra chi phí đáng kể do các syscall lặp đi lặp lại và việc sao chép dữ liệu giữa không gian kernel và không gian người dùng. `io_uring`, được giới thiệu trong nhân Linux 5.1, tái kiến trúc cơ bản điều này bằng cách cung cấp một giao diện I/O bất đồng bộ mạnh mẽ, giảm thiểu syscall và cho phép các hoạt động zero-copy. Hướng dẫn này trình bày chi tiết cách tận dụng `io_uring` với Rust, đặc biệt là tích hợp nó với `tokio` để đạt được hiệu năng mạng thông lượng cao, zero-copy.
+
+<AudioPlayer src="/static/audio/rust-tokio-io-uring-high-throughput-networking-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Sự thay đổi mô hình của `io_uring`
+
+`io_uring` hoạt động dựa trên cơ chế bộ đệm vòng chia sẻ giữa không gian người dùng và kernel. Thay vì phát hành các syscall riêng lẻ cho mỗi hoạt động I/O, các ứng dụng xếp hàng các Submission Queue Entry (SQE) vào một Submission Queue (SQ). Kernel sau đó xử lý các SQE này một cách bất đồng bộ, đặt các Completion Queue Entry (CQE) vào một Completion Queue (CQ) khi các hoạt động hoàn tất. Việc xử lý theo lô này giúp giảm đáng kể việc chuyển đổi ngữ cảnh và chi phí syscall.
+
+Các tính năng chính của `io_uring`:
+
+1.  **Xử lý theo lô**: Nhiều hoạt động I/O được gửi bằng một syscall `io_uring_enter` duy nhất.
+2.  **Bất đồng bộ**: Các hoạt động hoàn tất mà không chặn luồng gọi.
+3.  **Polling**: Kernel có thể chủ động thăm dò SQ, loại bỏ nhu cầu `io_uring_enter` trong một số trường hợp, giảm độ trễ hơn nữa.
+4.  **Zero-Copy**: Các hoạt động như `IORING_OP_SENDMSG` và `IORING_OP_RECVMSG` có thể trực tiếp hoạt động trên các bộ đệm trong không gian người dùng, tránh sao chép dữ liệu.
+5.  **Bộ đệm/Tệp cố định**: Đăng ký bộ đệm và bộ mô tả tệp với `io_uring` cho phép kernel tối ưu hóa quyền truy cập và tránh các tra cứu lặp lại.
+
+## `epoll` so với `io_uring`: So sánh kiến trúc
+
+| Tính năng | `epoll` (Tokio tiêu chuẩn) | `io_uring` (tokio-uring) |
+|---|---|---|
+| Mô hình I/O | Kích hoạt cạnh, hướng sự kiện | Bất đồng bộ, bộ đệm vòng |
+| Chi phí Syscall | Cao (1 syscall cho mỗi thao tác + `epoll_wait`) | Thấp (xử lý theo lô, `io_uring_enter` cho nhiều thao tác) |
+| Sao chép dữ liệu | Sao chép người dùng-kernel cho `read`/`write` | Có thể zero-copy (`MSG_ZEROCOPY`) |
+| Quản lý bộ đệm | Người dùng quản lý, truyền theo từng syscall | Bộ đệm cố định được đăng ký bởi kernel |
+| Bộ mô tả tệp | Truyền theo từng syscall | Tệp cố định được đăng ký bởi kernel |
+| Độ trễ | Cao hơn do syscall/sao chép | Thấp hơn do xử lý theo lô/zero-copy |
+| Thông lượng | Tốt cho nhiều kết nối, bị giới hạn bởi syscall | Tuyệt vời cho I/O khối lượng lớn |
+| Phiên bản Kernel | Linux 2.5.44+ | Linux 5.1+ |
+| Độ phức tạp | API đơn giản hơn | API phức tạp hơn, đường cong học tập cao hơn |
+
+## Tích hợp Rust: `tokio-uring`
+
+Mặc dù các ràng buộc `io_uring` trực tiếp tồn tại (ví dụ: crate `io-uring`), việc tích hợp `io_uring` với một runtime bất đồng bộ hiện có như `tokio` thường được mong muốn. Crate `tokio-uring` cung cấp một runtime tương thích `tokio` được xây dựng trên `io_uring`. Nó cung cấp các tương đương được hỗ trợ bởi `io_uring` cho các nguyên thủy I/O `tokio` phổ biến như `TcpStream`, `UdpSocket` và I/O tệp.
+
+### Thiết lập `tokio-uring`
+
+Thêm đoạn sau vào `Cargo.toml` của bạn:
+
+```toml
+[dependencies]
+tokio-uring = { version = "0.6", features = ["net", "fs"] }
+bytes = "1.4"
+log = "0.4"
+env_logger = "0.10"
+```
+
+Tính năng `net` cho phép `TcpStream`, `UdpSocket`, v.v., trong khi `fs` cho phép I/O tệp.
+
+### Máy chủ TCP Echo cơ bản `tokio-uring`
+
+Ví dụ này minh họa một máy chủ TCP echo đơn giản sử dụng `tokio-uring`. Lưu ý macro `tokio_uring::start()`, nó khởi tạo runtime `io_uring`.
+
+```rust
+use tokio_uring::net::{TcpListener, TcpStream};
+use tokio_uring::buf::IoBuf;
+use bytes::{BytesMut, BufMut};
+use log::{info, error};
+
+const BUFFER_SIZE: usize = 4096;
+
+#[tokio_uring::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let addr = "127.0.0.1:8080";
+    let listener = TcpListener::bind(addr).await?;
+    info!("Listening on {}", addr);
+
+    loop {
+        match listener.accept().await {
+            Ok((socket, peer_addr)) => {
+                info!("Accepted connection from {}", peer_addr);
+                tokio_uring::spawn(async move {
+                    if let Err(e) = handle_connection(socket).await {
+                        error!("Error handling connection from {}: {}", peer_addr, e);
+                    }
+                });
+            }
+            Err(e) => {
+                error!("Error accepting connection: {}", e);
+            }
+        }
+    }
+}
+
+async fn handle_connection(mut socket: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buf = BytesMut::with_capacity(BUFFER_SIZE);
+    loop {
+        // Prepare a buffer for receiving data.
+        // `bytes::BytesMut` implements `IoBuf`, making it suitable for `tokio-uring`.
+        let (res, filled_buf) = socket.recv(buf.split_off(0).limit(BUFFER_SIZE)).await;
+        let bytes_read = res?;
+
+        if bytes_read == 0 {
+            info!("Client disconnected.");
+            break; // Client disconnected
+        }
+
+        // Advance the buffer to reflect the bytes read.
+        // `filled_buf` is the original buffer, but its `IoBuf` trait implementation
+        // ensures it's correctly sliced for the `recv` operation.
+        // We need to manually advance the `BytesMut` to reflect the data.
+        buf.unsplit(filled_buf);
+        buf.advance_mut(bytes_read);
+
+        info!("Received {} bytes: {:?}", bytes_read, &buf[..bytes_read]);
+
+        // Send the received data back.
+        // `send` takes an `IoBuf` and returns the buffer back after completion.
+        let (res, _) = socket.send(buf.split_to(bytes_read)).await;
+        let bytes_written = res?;
+
+        info!("Sent {} bytes.", bytes_written);
+
+        if bytes_written == 0 {
+            info!("Failed to send data, client likely disconnected.");
+            break;
+        }
+    }
+    Ok(())
+}
+```
+
+Để kiểm tra điều này, bạn có thể sử dụng `netcat`: `nc 127.0.0.1 8080`. Nhập một số văn bản và nhấn enter; máy chủ sẽ trả lời lại.
+
+## Mạng Zero-Copy với `MSG_ZEROCOPY`
+
+Sức mạnh thực sự của `io_uring` đối với mạng nằm ở khả năng thực hiện các hoạt động zero-copy. Điều này đạt được bằng cách sử dụng hoạt động `IORING_OP_SENDMSG` với cờ `MSG_ZEROCOPY`. Khi cờ này được đặt, kernel ánh xạ trực tiếp bộ đệm không gian người dùng vào không gian bộ nhớ của chính nó để truyền, tránh syscall `copy_from_user` truyền thống. Ứng dụng được thông báo qua một `CQE` khi bộ đệm an toàn để sử dụng lại (tức là dữ liệu đã được truyền hoặc xếp hàng để truyền).
+
+`tokio-uring` hiển thị chức năng này thông qua phương thức `send_zc` trên `TcpStream`.
+
+### Triển khai truyền tải TCP Zero-Copy
+
+Ví dụ này minh họa một máy chủ nhận dữ liệu và sau đó gửi một phản hồi cố định bằng cách sử dụng zero-copy. Điều quan trọng là phải quản lý cẩn thận vòng đời của bộ đệm.
+
+```rust
+use tokio_uring::net::{TcpListener, TcpStream};
+use tokio_uring::buf::IoBuf;
+use bytes::{BytesMut, BufMut};
+use log::{info, error};
+use std::sync::Arc;
+
+const BUFFER_SIZE: usize = 4096;
+const RESPONSE_DATA: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nHello, World!";
+
+#[tokio_uring::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let addr = "127.0.0.1:8080";
+    let listener = TcpListener::bind(addr).await?;
+    info!("Listening on {}", addr);
+
+    loop {
+        match listener.accept().await {
+            Ok((socket, peer_addr)) => {
+                info!("Accepted connection from {}", peer_addr);
+                tokio_uring::spawn(async move {
+                    if let Err(e) = handle_zero_copy_connection(socket).await {
+                        error!("Error handling zero-copy connection from {}: {}", peer_addr, e);
+                    }
+                });
+            }
+            Err(e) => {
+                error!("Error accepting connection: {}", e);
+            }
+        }
+    }
+}
+
+async fn handle_zero_copy_connection(mut socket: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    let mut recv_buf = BytesMut::with_capacity(BUFFER_SIZE);
+    let send_buf = Arc::new(BytesMut::from(RESPONSE_DATA)); // Use Arc for shared buffer for zero-copy send
+
+    loop {
+        // Receive data (standard copy, as MSG_ZEROCOPY is for send)
+        let (res, filled_buf) = socket.recv(recv_buf.split_off(0).limit(BUFFER_SIZE)).await;
+        let bytes_read = res?;
+
+        if bytes_read == 0 {
+            info!("Client disconnected.");
+            break;
+        }
+
+        recv_buf.unsplit(filled_buf);
+        recv_buf.advance_mut(bytes_read);
+
+        info!("Received {} bytes from client.", bytes_read);
+
+        // Perform zero-copy send
+        // `send_zc` returns a future that completes when the kernel is done with the buffer.
+        // The buffer is returned, allowing reuse.
+        let (res, returned_buf) = socket.send_zc(send_buf.clone().slice(..)).await;
+        let bytes_written = res?;
+
+        info!("Zero-copy sent {} bytes.", bytes_written);
+
+        if bytes_written == 0 {
+            info!("Failed to zero-copy send data, client likely disconnected.");
+            break;
+        }
+
+        // Clear the receive buffer for the next read
+        recv_buf.clear();
+    }
+    Ok(())
+}
+```
+
+Để kiểm tra điều này, bạn có thể sử dụng `curl`: `curl http://127.0.0.1:8080`. Bạn sẽ nhận được "Hello, World!".
+
+### Những cân nhắc quan trọng đối với Zero-Copy
+
+*   **Vòng đời bộ đệm**: Bộ đệm được truyền cho `send_zc` phải còn hiệu lực và không thay đổi cho đến khi future `send_zc` hoàn tất. `tokio-uring` xử lý điều này bằng cách trả về bộ đệm, đảm bảo nó không bị hủy sớm. Đối với dữ liệu tĩnh, được chia sẻ, `Arc<BytesMut>` hoặc `Arc<[u8]>` là phù hợp.
+*   **Hỗ trợ Kernel**: `MSG_ZEROCOPY` yêu cầu nhân Linux 5.2 trở lên.
+*   **Xử lý lỗi**: Nếu `MSG_ZEROCOPY` thất bại (ví dụ: do bộ nhớ kernel không đủ hoặc kernel cũ hơn), `send_zc` sẽ trả về lỗi. Có thể cần một phương án dự phòng cho `send` tiêu chuẩn trong môi trường sản xuất.
+*   **Đăng ký bộ đệm**: Để đạt hiệu suất tối đa, đặc biệt là với việc gửi lặp lại cùng một dữ liệu, hãy cân nhắc đăng ký bộ đệm với `io_uring` bằng cách sử dụng `IORING_REGISTER_BUFFERS`. `tokio-uring` cung cấp `tokio_uring::buf::BoundedBuf` và `tokio_uring::buf::FixedBuf` cho việc này.
+
+## Kiểm tra hiệu năng 100k kết nối WebSocket đồng thời
+
+Kiểm tra hiệu năng `io_uring` cho 100k kết nối WebSocket đồng thời yêu cầu một thiết lập mạnh mẽ. Chúng tôi sẽ phác thảo cách tiếp cận và kết quả mong đợi thay vì cung cấp một máy khách/máy chủ kiểm tra hiệu năng đầy đủ, điều này sẽ rất rộng.
+
+### Kiến trúc máy chủ
+
+Một máy chủ WebSocket dựa trên `tokio-uring` sẽ bao gồm:
+
+1.  **`tokio_uring::net::TcpListener`**: Chấp nhận các kết nối mới.
+2.  **WebSocket Handshake**: Thực hiện nâng cấp HTTP. Phần này là HTTP tiêu chuẩn và có thể sử dụng `httparse` hoặc tương tự.
+3.  **WebSocket Framing**: Triển khai khung của giao thức WebSocket (masking, opcode, length).
+4.  **`tokio_uring::net::TcpStream::recv`**: Để nhận các khung WebSocket.
+5.  **`tokio_uring::net::TcpStream::send_zc`**: Để gửi các khung WebSocket, đặc biệt là cho các tin nhắn broadcast hoặc dữ liệu lớn. Đây là nơi zero-copy tỏa sáng.
+
+### Kiến trúc máy khách
+
+Một máy khách kiểm tra hiệu năng cần:
+
+1.  **Thiết lập 100k kết nối TCP**: Điều này yêu cầu giới hạn bộ mô tả tệp đáng kể (`ulimit -n`).
+2.  **Thực hiện WebSocket handshakes**: Cho mỗi kết nối.
+3.  **Duy trì kết nối**: Gửi pings/pongs để giữ kết nối sống.
+4.  **Gửi/Nhận dữ liệu**: Mô phỏng lưu lượng ứng dụng.
+5.  **Đo độ trễ và thông lượng**: Theo dõi thời gian khứ hồi và tốc độ dữ liệu.
+
+### Lợi ích hiệu suất mong đợi
+
+Với `io_uring` và zero-copy, đối với một máy chủ gửi các tin nhắn thường xuyên, giống hệt nhau (ví dụ: dữ liệu thị trường, cập nhật trạng thái trò chơi) đến nhiều máy khách, chúng tôi mong đợi:
+
+*   **Giảm sử dụng CPU**: Ít syscall và sao chép dữ liệu hơn có nghĩa là ít thời gian CPU kernel hơn.
+*   **Thông lượng cao hơn**: Nhiều dữ liệu được xử lý hơn trên mỗi đơn vị thời gian.
+*   **Độ trễ thấp hơn**: Đặc biệt đối với các hoạt động gửi, vì dữ liệu được xếp hàng trực tiếp để truyền.
+*   **Mật độ kết nối tăng**: Nhiều kết nối có thể được xử lý trên mỗi phiên bản máy chủ do giảm chi phí trên mỗi kết nối.
+
+### Môi trường kiểm tra hiệu năng
+
+*   **Kernel**: Linux 5.10+ (LTS) hoặc 6.x để có các tính năng `io_uring` tối ưu.
+*   **Phần cứng**: CPU có số lõi cao, RAM dồi dào, NIC nhanh.
+*   **`ulimit -n`**: Đặt thành giá trị > 100.000 (ví dụ: `ulimit -n 1048576`).
+*   **Điều chỉnh mạng**: Các tham số `sysctl` như `net.core.somaxconn`, `net.ipv4.tcp_max_syn_backlog`, `net.ipv4.tcp_tw_reuse`, `net.ipv4.tcp_fin_timeout`.
+
+## Những vấn đề và cách khắc phục trong sản xuất
+
+1.  **`io_uring` Không khả dụng/Được bật**:
+    *   **Triệu chứng**: Các hoạt động `io_uring` thất bại với `ENOSYS` hoặc các lỗi tương tự.
+    *   **Nguyên nhân**: Phiên bản Kernel < 5.1, hoặc mô-đun `io_uring` chưa được tải/biên dịch.
+    *   **Khắc phục**: Nâng cấp kernel lên 5.1+ (khuyến nghị 5.10+ để ổn định/tính năng). Xác minh `CONFIG_IO_URING=y` trong cấu hình kernel.
+2.  **`ulimit -n` Quá thấp**:
+    *   **Triệu chứng**: Lỗi `Too many open files` khi chấp nhận kết nối hoặc tạo socket.
+    *   **Nguyên nhân**: Giới hạn bộ mô tả tệp mặc định (thường là 1024) không đủ cho độ đồng thời cao.
+    *   **Khắc phục**: Tăng `ulimit -n` cho người dùng chạy ứng dụng. Đối với các dịch vụ systemd, đặt `LimitNOFILE` trong tệp đơn vị dịch vụ.
+3.  **Lỗi `MSG_ZEROCOPY`**:
+    *   **Triệu chứng**: `send_zc` trả về `EOPNOTSUPP` hoặc các lỗi khác.
+    *   **Nguyên nhân**: Phiên bản Kernel < 5.2, hoặc giới hạn trình điều khiển mạng cụ thể.
+    *   **Khắc phục**: Nâng cấp kernel. Triển khai phương án dự phòng cho `TcpStream::send` nếu `send_zc` thất bại.
+4.  **Vấn đề quản lý bộ đệm với Zero-Copy**:
+    *   **Triệu chứng**: Hỏng dữ liệu, lỗi sử dụng sau khi giải phóng (use-after-free), hoặc hành vi không mong muốn.
+    *   **Nguyên nhân**: Sử dụng lại hoặc sửa đổi bộ đệm trước khi `send_zc` hoàn tất và trả về nó.
+    *   **Khắc phục**: Đảm bảo vòng đời của bộ đệm được quản lý chặt chẽ. `tokio-uring`'s `send_zc` trả về bộ đệm, cho biết nó an toàn để sử dụng lại. Đối với dữ liệu tĩnh, `Arc` và `slice` được sử dụng để đảm bảo tính bất biến trong quá trình xử lý của kernel.
+5.  **Sử dụng CPU cao với Polling `io_uring`**:
+    *   **Triệu chứng**: Các luồng worker `io_uring` tiêu thụ 100% CPU ngay cả khi tải thấp.
+    *   **Nguyên nhân**: `IORING_SETUP_SQPOLL` (polling kernel) có thể quá tích cực. Nếu không được cấu hình đúng cách, nó có thể quay vòng chờ.
+    *   **Khắc phục**: Đảm bảo `io_uring` được cấu hình phù hợp với khối lượng công việc của bạn. `tokio-uring` thường quản lý điều này, nhưng nếu bạn đang sử dụng `io-uring` thô, hãy lưu ý các cờ polling. Đối với hầu hết các khối lượng công việc máy chủ, `io_uring` hướng sự kiện (không polling) là đủ, với polling được dành cho các kịch bản độ trễ cực thấp.
+6.  **Áp lực bộ nhớ**:
+    *   **Triệu chứng**: Lỗi OOM, trao đổi quá mức.
+    *   **Nguyên nhân**: Số lượng kết nối lớn, mỗi kết nối có bộ đệm nhận riêng, hoặc các bộ đệm cố định đã đăng ký lớn.
+    *   **Khắc phục**: Tối ưu hóa kích thước bộ đệm. Cân nhắc sử dụng một nhóm bộ đệm cho các hoạt động nhận. Đối với các bộ đệm cố định, chỉ đăng ký những gì cần thiết.
+
+## Các câu hỏi thường gặp
+
+1.  **Tôi có thể sử dụng `tokio-uring` với mã `tokio` hiện có không?**
+    Có, `tokio-uring` cung cấp một runtime tương thích `tokio`. Bạn có thể sử dụng `tokio_uring::spawn` để chạy các future được hỗ trợ bởi `io_uring` cùng với các future `tokio::spawn` thông thường, mặc dù nhìn chung nên giữ I/O cụ thể của `io_uring` trên runtime `tokio-uring` để đạt hiệu suất tối ưu.
+2.  **Những lợi ích chính của `io_uring` so với `epoll` đối với mạng là gì?**
+    Những lợi ích chính là giảm chi phí syscall thông qua việc xử lý theo lô và khả năng thực hiện truyền dữ liệu zero-copy giữa không gian người dùng và kernel. Điều này dẫn đến việc sử dụng CPU thấp hơn, thông lượng cao hơn và độ trễ thấp hơn, đặc biệt đối với các hoạt động I/O khối lượng lớn.
+3.  **`io_uring` luôn nhanh hơn `epoll` không?**
+    Không phải lúc nào cũng vậy. Đối với các ứng dụng có độ đồng thời thấp, thông lượng thấp, chi phí thiết lập `io_uring` có thể lớn hơn lợi ích của nó. `io_uring` tỏa sáng trong các kịch bản có độ đồng thời cao, khối lượng I/O lớn hoặc khi zero-copy là rất quan trọng. Nó cũng yêu cầu một nhân Linux hiện đại.
+4.  **`tokio-uring` xử lý việc quản lý bộ đệm cho zero-copy như thế nào?**
+    Phương thức `tokio-uring`'s `send_zc` nhận một `IoBuf` (như `BytesMut` hoặc `Arc<[u8]>`) và trả về nó sau khi kernel đã hoàn thành với bộ đệm. Điều này đảm bảo vòng đời của bộ đệm được quản lý chính xác, ngăn ngừa các vấn đề sử dụng sau khi giải phóng. Đối với dữ liệu tĩnh, `Arc` được sử dụng để chia sẻ quyền sở hữu.
+5.  **Các yêu cầu kernel đối với `io_uring` và `MSG_ZEROCOPY` là gì?**
+    `io_uring` yêu cầu nhân Linux 5.1 trở lên. `MSG_ZEROCOPY` đặc biệt yêu cầu nhân Linux 5.2 trở lên. Đối với sản xuất, kernel 5.10 (LTS) hoặc kernel 6.x gần đây được khuyến nghị để ổn định và đầy đủ tính năng.
+
+## Kết luận
+
+`io_uring` đại diện cho một bước tiến đáng kể trong I/O bất đồng bộ của Linux, mang lại hiệu suất vượt trội cho các ứng dụng thông lượng cao. Rust, với hệ thống kiểu mạnh mẽ và đặc tính hiệu suất, là một ngôn ngữ lý tưởng để tận dụng khả năng của `io_uring`. Crate `tokio-uring` cung cấp một cách mạnh mẽ và tiện lợi để tích hợp `io_uring` vào các ứng dụng dựa trên `tokio`, cho phép các nhà phát triển xây dựng các dịch vụ mạng hiệu quả cao với các tính năng như truyền dữ liệu zero-copy. Mặc dù đường cong học tập cho `io_uring` có thể dốc hơn so với `epoll` truyền thống, nhưng lợi ích hiệu suất cho các khối lượng công việc đòi hỏi là đáng kể và xứng đáng với sự đầu tư.

@@ -1,0 +1,457 @@
+---
+title: "TursoとlibSQL: 低レイテンシーバックエンドのための分散SQLiteと組み込みレプリカ"
+images: ['/static/images/turso-libsql-distributed-sqlite-edge-replicas.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["database", "sqlite", "turso", "typescript", "backend"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Intermediate"
+programmingLanguage: "TypeScript"
+summary: "TursoとlibSQLによる低レイテンシーバックエンドのための分散SQLiteと組み込みレプリカについて、本番環境レベルのアーキテクチャとコード例を交えて解説する包括的なガイドです。"
+---
+
+## はじめに：エッジデータベースの必然性
+
+グローバルなアプリケーションで5ms未満のデータアクセスレイテンシーを達成するには、データをユーザーに近づける必要があります。従来の集中型データベースアーキテクチャでは、リードレプリカを使用しても、エッジではネットワークオーバーヘッドが許容できないレベルになります。libSQL（SQLiteのフォーク）上に構築されたTursoは、組み込みレプリカを備えた分散SQLiteという魅力的なソリューションを提供します。このアーキテクチャにより、ローカルでの低レイテンシー読み取りが可能になり、プライマリ委任を通じて書き込みの強力な一貫性が維持されます。このガイドでは、Tursoと組み込みレプリカの実践的な実装について、デプロイ、レイテンシー測定、書き込み処理、オフライン同期、移行戦略を網羅して詳しく説明します。
+
+<AudioPlayer src="/static/audio/turso-libsql-distributed-sqlite-edge-replicas-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+## アーキテクチャの概要：エッジ組み込み型プライマリ・レプリカモデル
+
+Tursoの核となる強みは、プライマリ・レプリカモデルにあります。単一のプライマリデータベースがすべての書き込みを処理し、ACID準拠と強力な一貫性を保証します。一方、リードレプリカは、エッジワーカー内に直接組み込むなど、グローバルにデプロイできます。この組み込みは非常に重要です。読み取り操作のネットワークホップを排除し、ローカルディスク速度でのアクセスを実現します。
+
+### 主要なアーキテクチャコンポーネント：
+
+1.  **Tursoプライマリデータベース：** すべてのデータの信頼できるソースであり、書き込み操作とレプリカへの変更の伝播を担当します。通常、中央のリージョンにデプロイされます。
+2.  **Tursoリードレプリカ：** プライマリから更新を受け取る、地理的に分散されたデータベースインスタンスです。これらは従来のクラウドホスト型レプリカである場合もあれば、アプリケーションプロセス内に組み込まれる場合もあります。
+3.  **libSQLクライアントライブラリ：** Tursoデータベースと対話するためのクライアント側インターフェースです。リモート接続とローカル組み込みレプリカの両方をサポートします。
+4.  **エッジワーカー/アプリケーション：** libSQL組み込みレプリカが常駐するコンピューティング環境（例：Cloudflare Workers、Vercel Edge Functions、Fly.io Machines）。
+
+### データフロー：
+
+*   **書き込み：** すべての書き込み操作はTursoプライマリデータベースにルーティングされます。libSQLクライアントは、この委任を透過的または明示的に処理します。
+*   **読み取り：** 読み取り操作は、最も近い、または組み込みのレプリカによって優先的に処理されます。組み込みレプリカが利用可能で最新の場合、読み取りはローカルで行われます。それ以外の場合は、リモートレプリカまたはプライマリにフォールバックします。
+*   **レプリケーション：** プライマリは、接続されているすべてのレプリカにデータを非同期的にレプリケートします。Tursoは、ライトアヘッドログ（WAL）ベースのレプリケーションメカニズムを利用して、レプリカの最終的な一貫性を保証します。
+
+## TursoとlibSQLのセットアップ
+
+まず、Turso CLIをインストールし、データベースを作成します。
+
+```bash
+# Install Turso CLI
+curl -sSfL https://get.tur.so/install.sh | bash
+
+# Authenticate
+turso auth login
+
+# Create a database in a primary region (e.g., 'ord' for Chicago)
+turso db create my-edge-app-db --location ord
+
+# Create a read replica in an edge region (e.g., 'syd' for Sydney)
+turso db replicate my-edge-app-db --location syd
+
+# Get connection URL and auth token for the primary
+turso db shell my-edge-app-db
+# In the shell, run:
+# .connection-url
+# .auth-token
+# Exit the shell
+```
+
+プライマリデータベースのURLと認証トークンは安全に保管してください。組み込みレプリカには、別の接続文字列を使用します。
+
+### libSQLクライアントの初期化
+
+`libsql-client`ライブラリは、必要なインターフェースを提供します。
+
+```typescript
+// src/lib/turso.ts
+import { createClient, Client } from '@libsql/client';
+
+let tursoClient: Client | null = null;
+
+export function getTursoClient(
+  url: string = process.env.TURSO_DATABASE_URL!,
+  authToken: string = process.env.TURSO_AUTH_TOKEN!
+): Client {
+  if (!tursoClient) {
+    if (!url || !authToken) {
+      throw new Error('TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set.');
+    }
+    tursoClient = createClient({
+      url,
+      authToken,
+    });
+  }
+  return tursoClient;
+}
+
+// Example usage (e.g., in an API route)
+// const db = getTursoClient();
+// const result = await db.execute('SELECT * FROM users');
+```
+
+## 5ms未満の読み取りを実現する組み込みレプリカ
+
+エッジアプリケーション向けのTursoの真の力は、レプリカを組み込むことにあります。これは、SQLiteデータベースファイルがエッジワーカーによってローカルで管理され、プライマリと同期することを意味します。
+
+### Cloudflare Workersでのデプロイ（例）
+
+Cloudflare Workersはステートフルアプリケーション向けにDurable Objectsを提供しますが、単純な組み込みレプリカの場合、Workerのファイルシステム（利用可能な場合、または一時的なレプリカ向けにローカルのインメモリ/一時ファイルシステム）を活用するか、より実用的に`libsql-client`のローカルレプリカ機能を使用できます。
+
+`libsql-client`は、「ローカルレプリカ」モードで動作するように構成でき、ローカルのSQLiteファイルを維持し、リモートのTursoプライマリと同期します。
+
+```typescript
+// src/lib/turso-edge.ts
+import { createClient, Client } from '@libsql/client';
+import { fileURLToPath } from 'url';
+import path from 'path';
+
+// For Cloudflare Workers, you might need to use a different storage mechanism
+// or rely on the remote replica for reads if true local file system access is limited.
+// This example assumes a Node.js-like environment where file system access is possible.
+// For Workers, consider using a remote replica URL directly or Durable Objects for state.
+
+// In a Node.js environment (e.g., Vercel Edge Functions with Node.js runtime)
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DB_PATH = path.join(__dirname, '../../data/local.db'); // Path to store the local SQLite file
+
+let edgeTursoClient: Client | null = null;
+
+export function getEdgeTursoClient(
+  syncUrl: string = process.env.TURSO_DATABASE_URL!, // Primary URL for synchronization
+  authToken: string = process.env.TURSO_AUTH_TOKEN!,
+  localDbPath: string = DB_PATH // Path for the local SQLite file
+): Client {
+  if (!edgeTursoClient) {
+    if (!syncUrl || !authToken) {
+      throw new Error('TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set for edge client.');
+    }
+
+    // Initialize the client in local replica mode
+    edgeTursoClient = createClient({
+      url: `file:${localDbPath}`, // Connect to a local SQLite file
+      syncUrl, // URL of the primary database for synchronization
+      authToken,
+      syncInterval: 5000, // Sync every 5 seconds (adjust as needed)
+    });
+
+    // Start synchronization immediately
+    edgeTursoClient.sync();
+  }
+  return edgeTursoClient;
+}
+
+// Example usage in an edge function
+// import { getEdgeTursoClient } from '../lib/turso-edge';
+//
+// export default async function handler(req: Request) {
+//   const db = getEdgeTursoClient();
+//   try {
+//     const start = performance.now();
+//     const result = await db.execute('SELECT * FROM products WHERE category = ?', ['electronics']);
+//     const end = performance.now();
+//     console.log(`Read latency: ${end - start}ms`);
+//     return new Response(JSON.stringify(result.rows), { status: 200 });
+//   } catch (error) {
+//     console.error('Edge DB error:', error);
+//     return new Response('Internal Server Error', { status: 500 });
+//   }
+// }
+```
+
+**エッジ環境における重要な考慮事項：**
+
+*   **ファイルシステムアクセス：** 真の組み込みレプリカには永続的なファイルシステムアクセスが必要です。Cloudflare Workersは通常、個々のリクエストに対してこれを直接提供しません。解決策としては次のものがあります。
+    *   **Durable Objects：** Durable ObjectはlibSQLクライアントとそのローカルファイルを管理し、特定のスコープの単一インスタンスレプリカとして機能できます。
+    *   **リモートレプリカへのフォールバック：** 永続的なローカルストレージがない環境では、`libsql-client`を構成して、最も近いTursoリードレプリカURLに直接接続します。「組み込み」ではありませんが、地理的には近いです。
+    *   **Vercel Edge Functions (Node.js Runtime)：** これらは`/tmp`に書き込むことができます。これは一時的ですが、レプリカがリクエストごとに初期化および同期される場合（効率は低い）、単一の関数呼び出しには十分です。永続的な状態には、外部ストレージまたはリモートレプリカが推奨されます。
+*   **同期戦略：** `syncInterval`は、ローカルレプリカがプライマリから変更をプルする頻度を定義します。重要な読み取りの場合、読み取り前に手動で`db.sync()`をトリガーするかもしれませんが、これはレイテンシーを追加します。エッジ読み取りでは、最終的な一貫性が標準です。
+
+### 5ms未満のローカル読み取りレイテンシーの測定
+
+5ms未満のレイテンシーを実証するには、`getEdgeTursoClient`の例を、ローカルファイルシステムアクセスをサポートする環境（例：ローカルのNode.jsサーバー、または一時データ用の`/tmp`パスを持つVercel Edge Function）にデプロイします。
+
+```typescript
+// src/pages/api/products.ts (Example Vercel Edge Function)
+import type { NextRequest } from 'next/server';
+import { getEdgeTursoClient } from '../../lib/turso-edge';
+
+export const config = {
+  runtime: 'edge', // This ensures it runs on the Vercel Edge Network
+};
+
+export default async function handler(req: NextRequest) {
+  const db = getEdgeTursoClient(); // This will initialize and sync the local replica
+
+  try {
+    const start = performance.now();
+    // Ensure your database has a 'products' table with some data
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        category TEXT NOT NULL,
+        price REAL NOT NULL
+      );
+    `);
+    await db.execute(`
+      INSERT OR IGNORE INTO products (id, name, category, price) VALUES
+      (1, 'Laptop Pro', 'electronics', 1200.00),
+      (2, 'Mechanical Keyboard', 'peripherals', 150.00);
+    `);
+
+    const result = await db.execute('SELECT * FROM products WHERE category = ?', ['electronics']);
+    const end = performance.now();
+    const latency = end - start;
+
+    console.log(`Edge Read Latency: ${latency.toFixed(2)}ms`);
+
+    return new Response(JSON.stringify({
+      data: result.rows,
+      latency: `${latency.toFixed(2)}ms`,
+      source: 'edge_replica'
+    }), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+  } catch (error: any) {
+    console.error('Edge DB error:', error);
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+  }
+}
+```
+
+これをローカルで実行するか、Vercel Edgeにデプロイすると、クエリの複雑さと環境に応じて、読み取りレイテンシーが5ms未満、場合によっては1ms未満になることがよくあります。これは、データがネットワーク経由ではなく、ローカルファイルから読み取られているためです。
+
+## プライマリノードへの書き込み委任
+
+すべての書き込み操作は、強力な一貫性を維持するためにTursoプライマリデータベースに指示される*必要があります*。`libsql-client`は、ローカルレプリカの`syncUrl`を指定できるようにすることで、これを簡素化します。これは書き込みに使用されます。
+
+`createClient`を`file:` URLと`syncUrl`で使用すると、クライアントは書き込みを`syncUrl`（プライマリ）に自動的に委任します。
+
+```typescript
+// src/lib/turso-write.ts
+import { getEdgeTursoClient } from './turso-edge'; // Re-use the edge client setup
+
+export async function createProduct(name: string, category: string, price: number) {
+  const db = getEdgeTursoClient(); // This client is configured to delegate writes
+
+  try {
+    const start = performance.now();
+    const result = await db.execute(
+      'INSERT INTO products (name, category, price) VALUES (?, ?, ?)',
+      [name, category, price]
+    );
+    const end = performance.now();
+    console.log(`Write operation to primary latency: ${end - start}ms`);
+    return result;
+  } catch (error) {
+    console.error('Write error:', error);
+    throw error;
+  }
+}
+
+// Example usage in an API route:
+// import { createProduct } from '../../lib/turso-write';
+//
+// export default async function handler(req: Request) {
+//   if (req.method !== 'POST') {
+//     return new Response('Method Not Allowed', { status: 405 });
+//   }
+//   const { name, category, price } = await req.json();
+//   try {
+//     await createProduct(name, category, price);
+//     return new Response('Product created successfully', { status: 201 });
+//   } catch (error) {
+//     return new Response('Failed to create product', { status: 500 });
+//   }
+// }
+```
+
+書き込み操作のレイテンシーは、プライマリデータベースへのネットワークラウンドトリップを伴うため、ローカル読み取りよりも自然に高くなります。これは、強力な一貫性のための本質的なトレードオフです。
+
+## オフラインファースト同期
+
+組み込みレプリカモデルは、オフラインファースト機能を本質的にサポートしています。エッジワーカーまたはクライアントアプリケーションがネットワーク接続を失った場合でも、ローカルレプリカから読み取りを継続できます。接続が復元されると、`libsql-client`はプライマリとの同期を自動的に試行します。
+
+クライアントサイドアプリケーション（例：Electron、モバイルアプリ）の場合、`libsql-client`を直接使用して、Tursoと同期するローカルSQLiteデータベースを管理できます。
+
+```typescript
+// Example: Client-side offline-first setup (e.g., in an Electron app)
+import { createClient } from '@libsql/client';
+import path from 'path';
+import { app } from 'electron'; // Assuming Electron context
+
+const userDataPath = app.getPath('userData');
+const localDbPath = path.join(userDataPath, 'my-app-offline.db');
+
+const offlineClient = createClient({
+  url: `file:${localDbPath}`,
+  syncUrl: process.env.TURSO_DATABASE_URL!,
+  authToken: process.env.TURSO_AUTH_TOKEN!,
+  syncInterval: 10000, // Sync every 10 seconds when online
+});
+
+// Start synchronization
+offlineClient.sync();
+
+// Application logic can now read/write to offlineClient
+// Writes will be queued and sent to primary when online.
+// Reads will be served from local DB.
+```
+
+このセットアップは、断続的なネットワークアクセスでも回復力とスムーズなユーザーエクスペリエンスを提供します。
+
+## Neon/Supabase PostgreSQLからの移行
+
+NeonやSupabaseのようなPostgreSQLベースのサービスからTursoへの移行には、スキーマ変換とデータ転送が含まれます。
+
+### 1. スキーマ変換
+
+SQLiteのSQL方言はPostgreSQLとほぼ互換性がありますが、違いがあります。
+
+*   **データ型：** PostgreSQLの`TEXT`、`VARCHAR`、`INTEGER`、`BOOLEAN`はうまくマッピングされます。`UUID`は`TEXT`になります。`JSONB`は`TEXT`になります（JSON文字列として保存）。`ARRAY`型はシリアル化する必要があります（例：JSON文字列）。
+*   **自動インクリメントID：** PostgreSQLは`SERIAL`または`GENERATED BY DEFAULT AS IDENTITY`を使用します。SQLiteは`INTEGER PRIMARY KEY AUTOINCREMENT`を使用します。
+*   **関数：** 多くのPostgreSQL固有の関数（例：`GEN_RANDOM_UUID()`、`NOW()`）は、SQLiteの同等物またはアプリケーションレベルの処理が必要です。
+*   **制約：** `CHECK`制約、`FOREIGN KEY`制約はサポートされていますが、動作が若干異なる場合があります。
+*   **インデックス：** 標準の`CREATE INDEX`構文は互換性があります。
+
+**スキーマ変換の例：**
+
+```sql
+-- PostgreSQL Schema
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Turso (SQLite) Schema
+CREATE TABLE users (
+    id TEXT PRIMARY KEY, -- UUIDs stored as TEXT
+    email TEXT UNIQUE NOT NULL,
+    created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) -- ISO 8601 format
+);
+```
+
+### 2. データのエクスポートとインポート
+
+1.  **PostgreSQLからのエクスポート：** `pg_dump`を使用して、インポートに適した形式でデータをエクスポートします。CSVが最も簡単な場合が多いです。
+
+    ```bash
+    pg_dump -d your_db_name -t users --data-only --column-inserts > users_data.sql
+    ```
+
+    または、CSVの場合：
+
+    ```sql
+    COPY users TO '/tmp/users.csv' WITH (FORMAT CSV, HEADER);
+    ```
+
+2.  **Tursoへのインポート：**
+    *   **CSVインポート：** CSVにエクスポートした場合、CSVを読み取り、Tursoに挿入するスクリプトを作成できます。
+
+        ```typescript
+        // src/scripts/importUsers.ts
+        import fs from 'fs';
+        import csv from 'csv-parser';
+        import { getTursoClient } from '../lib/turso'; // Use the primary client
+
+        async function importUsers() {
+          const db = getTursoClient();
+          const users: any[] = [];
+
+          fs.createReadStream('/tmp/users.csv')
+            .pipe(csv())
+            .on('data', (row) => {
+              users.push(row);
+            })
+            .on('end', async () => {
+              console.log(`Importing ${users.length} users...`);
+              for (const user of users) {
+                await db.execute(
+                  'INSERT INTO users (id, email, created_at) VALUES (?, ?, ?)',
+                  [user.id, user.email, user.created_at]
+                );
+              }
+              console.log('Users imported successfully.');
+            });
+        }
+
+        importUsers().catch(console.error);
+        ```
+
+    *   **SQLインポート：** `pg_dump`を`INSERT`ステートメントで使用した場合、SQLiteの互換性のためにSQLを手動で調整する必要があるかもしれません（例：IDの場合、`UUID`を`TEXT`に、`NOW()`を`strftime`に）。その後、Turso CLIまたは`libsql-client`を介してSQLファイルを実行できます。
+
+        ```bash
+        # Via Turso CLI
+        turso db shell my-edge-app-db < users_data_sqlite_compatible.sql
+        ```
+
+### 比較：Turso (libSQL) vs. PostgreSQL (Neon/Supabase)
+
+| 機能                 | Turso (libSQL)                                  | PostgreSQL (Neon/Supabase)                               |
+| :---------------------- | :---------------------------------------------- | :------------------------------------------------------- |
+| **アーキテクチャ**        | プライマリ・レプリカ、組み込みエッジレプリカ         | プライマリ・レプリカ、論理レプリケーション                     |
+| **読み取りレイテンシー (エッジ)** | 5ms未満 (ローカルファイルアクセス)                     | 10-50ms以上 (最寄りのレプリカへのネットワーク)                    |
+| **書き込みレイテンシー**       | 20-100ms以上 (プライマリへのネットワーク)                  | 20-100ms以上 (プライマリへのネットワーク)                           |
+| **一貫性モデル**   | 強力 (書き込み)、最終的 (レプリカからの読み取り) | 強力 (すべての操作)                                  |
+| **データモデル**          | リレーショナル (SQLite方言)                     | リレーショナル (PostgreSQL方言)、JSONB                   |
+| **オフラインサポート**     | 非常に優れている (ローカルファイル同期)                     | 限定的 (クライアントサイドのキャッシュ/同期レイヤーが必要)        |
+| **スケーラビリティ**         | 読み取りはレプリカで水平にスケール          | 読み取りはレプリカで水平にスケール                   |
+| **複雑さ**          | エッジ向けにシンプル、レプリケーションを内部で管理| エッジ向けに複雑、オフラインには外部同期が必要|
+| **コストモデル**          | 使用量ベース (読み取り/書き込み/ストレージ)              | 使用量ベース (コンピューティング/ストレージ/データ転送)              |
+
+## 本番環境での落とし穴とトラブルシューティング
+
+1.  **「Database is locked」エラー：**
+    *   **原因：** SQLiteはファイルベースのデータベースです。複数のプロセスまたはスレッドから*同じ*ローカルSQLiteファイルへの同時書き込みは、ロックの問題を引き起こす可能性があります。
+    *   **解決策：**
+        *   特定のローカルデータベースファイルを管理する`libsql-client`インスタンスが1つだけであることを確認してください。
+        *   高並行性のエッジ環境では、ローカルファイルの代わりにリモートのTursoレプリカURLを直接使用するか、単一書き込み保証のためにDurable Objectsを活用することを検討してください。
+        *   ローカルファイルで接続する場合は、より高いビジータイムアウトパラメータを設定してください：`createClient({ url: 'file:my.db?busy_timeout=5000' })`。
+2.  **エッジレプリカからの古い読み取り：**
+    *   **原因：** `syncInterval`が高すぎるか、レプリカが最近同期されていない。
+    *   **解決策：**
+        *   より最新のデータのために`syncInterval`を減らしてください。
+        *   特定のクエリで最終的な一貫性が許容できない場合は、重要な読み取りの前に手動で`db.sync()`をトリガーしてください。
+        *   絶対的な鮮度を必要とする読み取りの場合は、プライマリデータベースに直接ルーティングしてください。
+3.  **`TURSO_DATABASE_URL`または`TURSO_AUTH_TOKEN`が見つからない：**
+    *   **原因：** デプロイ環境（例：Vercel、Cloudflare、Fly.io）で環境変数が正しく設定されていない。
+    *   **解決策：** 特定のプラットフォームの環境変数設定を再確認してください。実行時にアクセス可能であることを確認してください。
+4.  **サーバーレス/エッジでの`file:` URLの問題：**
+    *   **原因：** サーバーレス関数は、一時的または制限されたファイルシステムを持つことがよくあります。任意のパスへの書き込みは失敗したり、呼び出し間で失われたりする可能性があります。
+    *   **解決策：**
+        *   Cloudflare Workersの場合、Durable Objectsを使用してレプリカの永続的な状態を管理します。
+        *   Vercel Edge Functionsの場合、`/tmp`は書き込み可能ですが一時的です。これは、レプリカがコールドスタートごとに再同期され、最初の数リクエストのレイテンシーが増加することを意味します。
+        *   真のローカル永続性が実現できない場合は、`file:` URLの代わりにリモートのTursoリードレプリカURLに直接接続してください。これにより、地理的な近接性は維持されます。
+5.  **書き込みレイテンシーが高すぎる：**
+    *   **原因：** プライマリデータベースがエッジ関数から地理的に離れているか、ネットワークパスが混雑している。
+    *   **解決策：**
+        *   Tursoプライマリが、書き込みトラフィックの大部分に近い地理的リージョンにあることを確認してください。
+        *   書き込み操作を最小限に抑えるようにアプリケーションを最適化するか、可能な場合はバッチ処理してください。
+        *   書き込みの強力な一貫性が厳密に必要ではなく、書き込みレイテンシーの低さが最優先される場合は、異なる一貫性モデル（例：CRDT）を検討してください。ただし、これは複雑さを大幅に増します。
+
+## よくある質問
+
+1.  **Tursoを分析クエリに使用できますか？**
+    はい、Tursoは標準SQLをサポートしています。複雑な分析クエリの場合、専用のリードレプリカまたはプライマリに対して実行できます。ただし、非常に大規模な分析には、専用のOLAPソリューションがより適切かもしれません。
+2.  **Tursoはスキーマ移行をどのように処理しますか？**
+    スキーマ移行はプライマリデータベースに適用されます。レプリカは最終的に追いつきます。標準のSQL `ALTER TABLE`ステートメントを使用できます。より複雑な移行には、`sqldef`のようなツールやカスタムスクリプトを検討してください。
+3.  **プライマリデータベースがダウンした場合どうなりますか？**
+    書き込みは失敗します。既存の同期されたレプリカからの読み取りは引き続き機能しますが、ますます古くなります。Tursoはプライマリの高可用性を提供しますが、壊滅的なイベントが発生した場合、プライマリが復元されるか新しいプライマリが昇格されるまで、書き込みの可用性は影響を受けます。
+4.  **Tursoは高トランザクションワークロードに適していますか？**
+    Tursoは、エッジでの高読み取り、低レイテンシーワークロードに優れています。非常に高トランザクションの書き込みワークロード（単一テーブルへの毎秒数千の書き込み）の場合、単一プライマリモデルがボトルネックになる可能性があります。ただし、ほとんどのWebアプリケーションでは、Tursoのプライマリはかなりの書き込みスループットを処理できます。
+5.  **Tursoデータベースを監視するにはどうすればよいですか？**
+    Tursoは、読み取り/書き込み操作、ストレージ、レプリケーションステータスのメトリクスを含むダッシュボードを提供します。アプリケーションインスタンスからログとメトリクスを収集することで、外部監視ツールと統合することもできます。

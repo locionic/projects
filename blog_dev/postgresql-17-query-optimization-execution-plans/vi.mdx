@@ -1,0 +1,359 @@
+---
+title: "Tối ưu hóa truy vấn PostgreSQL 17: Kế hoạch thực thi, điều chỉnh bộ nhớ & EXPLAIN ANALYZE"
+images: ['/static/images/postgresql-17-query-optimization-execution-plans.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["database", "postgresql", "performance", "sql", "backend"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về tối ưu hóa truy vấn PostgreSQL 17: kế hoạch thực thi, điều chỉnh bộ nhớ & explain analyze với kiến trúc cấp độ sản xuất và ví dụ mã."
+---
+
+PostgreSQL 17 mang đến những cải tiến đáng kể cho bộ tối ưu hóa truy vấn và công cụ thực thi, đòi hỏi một cách tiếp cận tinh tế hơn để điều chỉnh hiệu suất. Hướng dẫn này đi sâu vào việc giải mã các kế hoạch thực thi, tận dụng các tính năng quản lý bộ nhớ mới và tối ưu hóa các mẫu truy vấn phức tạp để đạt được hiệu suất cao nhất.
+
+<AudioPlayer src="/static/audio/postgresql-17-query-optimization-execution-plans-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Hiểu rõ đầu ra `EXPLAIN ANALYZE`
+
+Nền tảng của việc tối ưu hóa truy vấn PostgreSQL nằm ở việc diễn giải đầu ra `EXPLAIN ANALYZE`. Lệnh này cung cấp kế hoạch thực thi ước tính của trình lập kế hoạch và số liệu thống kê thời gian chạy thực tế.
+
+### Giải mã cây kế hoạch
+
+Mỗi nút trong cây `EXPLAIN` đại diện cho một thao tác. Các số liệu chính bao gồm:
+
+-   **`cost`**: Chi phí ước tính của trình lập kế hoạch (khởi động..tổng cộng).
+-   **`rows`**: Số hàng ước tính của trình lập kế hoạch.
+-   **`actual time`**: Thời gian thực tế đã dành (khởi động..tổng cộng) tính bằng mili giây.
+-   **`actual rows`**: Số hàng thực tế được trả về.
+-   **`loops`**: Số lần nút được thực thi.
+-   **`Buffers`**: Chi tiết về quyền truy cập khối dùng chung, cục bộ và tạm thời (yêu cầu tùy chọn `BUFFERS`).
+-   **`Wal`**: Thống kê tạo bản ghi WAL (yêu cầu tùy chọn `WAL`).
+-   **`Settings`**: Các tham số GUC ảnh hưởng đến kế hoạch (yêu cầu tùy chọn `SETTINGS`).
+
+Xem xét một truy vấn đơn giản:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, SETTINGS, WAL)
+SELECT p.product_name, c.category_name
+FROM products p
+JOIN categories c ON p.category_id = c.category_id
+WHERE p.price > 100 AND c.category_name = 'Electronics';
+```
+
+Một đầu ra điển hình có thể trông như thế này:
+
+```
+                                      QUERY PLAN
+--------------------------------------------------------------------------------------
+ Hash Join  (cost=25.80..50.35 rows=10 width=64) (actual time=0.150..0.250 rows=5 loops=1)
+   Hash Cond: (p.category_id = c.category_id)
+   Buffers: shared hit=10 read=2
+   Wal: records=0, full_page_writes=0, bytes=0
+   ->  Seq Scan on products p  (cost=0.00..24.50 rows=20 width=36) (actual time=0.010..0.100 rows=15 loops=1)
+         Filter: (price > 100::numeric)
+         Rows Removed by Filter: 85
+         Buffers: shared hit=5 read=1
+   ->  Hash  (cost=25.75..25.75 rows=1 width=32) (actual time=0.030..0.030 rows=1 loops=1)
+         Buffers: shared hit=5 read=1
+         ->  Seq Scan on categories c  (cost=0.00..25.75 rows=1 width=32) (actual time=0.010..0.020 rows=1 loops=1)
+               Filter: (category_name = 'Electronics'::text)
+               Rows Removed by Filter: 99
+               Buffers: shared hit=5 read=1
+ Planning Time: 0.100 ms
+ Execution Time: 0.300 ms
+```
+
+**Giải thích:**
+
+1.  **`Hash Join`**: Thao tác cấp cao nhất. Mất `0.250 ms` để hoàn thành và trả về `5` hàng. Trình lập kế hoạch ước tính `10` hàng.
+2.  **`Seq Scan on products p`**: Đã quét bảng `products`. Đã lọc `85` hàng, giữ lại `15`. Quét này đã truy cập `5` khối dùng chung và đọc `1` từ đĩa.
+3.  **`Hash`**: Đã xây dựng một bảng băm từ quá trình quét bảng `categories`.
+4.  **`Seq Scan on categories c`**: Đã quét `categories`, đã lọc `99` hàng, giữ lại `1`. Quét này cũng đã truy cập `5` khối dùng chung và đọc `1` từ đĩa.
+
+Phần `Buffers` rất quan trọng. `shared hit` cho biết dữ liệu được tìm thấy trong bộ đệm dùng chung (bộ nhớ), `read` có nghĩa là dữ liệu phải được tìm nạp từ đĩa. Số lượng `read` cao thường chỉ ra các chỉ mục bị thiếu hoặc `shared_buffers` không đủ.
+
+### Lỗi ước tính hàng của trình lập kế hoạch
+
+Sự khác biệt giữa `rows` (ước tính) và `actual rows` là những dấu hiệu đáng báo động. Sự không khớp đáng kể cho thấy trình lập kế hoạch đã đưa ra một quyết định kém, thường là do:
+
+1.  **Thống kê cũ**: Chạy `ANALYZE` hoặc `VACUUM ANALYZE` thường xuyên.
+2.  **Vị ngữ phức tạp**: Trình lập kế hoạch gặp khó khăn với các mệnh đề `WHERE` phức tạp, đặc biệt là liên quan đến các hàm hoặc biểu thức.
+3.  **Độ lệch dữ liệu**: Phân phối dữ liệu không đồng nhất có thể đánh lừa trình lập kế hoạch. `ANALYZE` với `default_statistics_target` tăng lên có thể giúp ích.
+4.  **Thiếu thống kê**: Đối với các kiểu dữ liệu tùy chỉnh hoặc biểu thức phức tạp, `CREATE STATISTICS` có thể cung cấp thống kê phụ thuộc chức năng hoặc đa cột.
+
+**Ví dụ về một lỗi:**
+
+Nếu `actual rows` cho `Seq Scan on products p` là `10000` nhưng `rows` là `20`, trình lập kế hoạch có thể đã chọn `Nested Loop` thay vì `Hash Join` hoặc `Merge Join`, dẫn đến hiệu suất kém.
+
+## Điều chỉnh bộ nhớ: `work_mem` và `maintenance_work_mem`
+
+PostgreSQL 17 tiếp tục tinh chỉnh quản lý bộ nhớ. Việc điều chỉnh đúng `work_mem` và `maintenance_work_mem` là rất quan trọng.
+
+### `work_mem`
+
+Tham số này xác định lượng bộ nhớ tối đa được sử dụng bởi một thao tác truy vấn (ví dụ: sắp xếp, bảng băm) trước khi ghi dữ liệu tạm thời vào đĩa. Mỗi thao tác như vậy có thể sử dụng lượng này.
+
+-   **Quá thấp**: Dẫn đến I/O đĩa quá mức cho các thao tác sắp xếp và băm, hiển thị dưới dạng `spill` hoặc `disk` trong đầu ra `EXPLAIN ANALYZE` (ví dụ: `Sort Method: external merge Disk: 12345kB`).
+-   **Quá cao**: Có thể dẫn đến lỗi hết bộ nhớ nếu nhiều truy vấn phức tạp chạy đồng thời.
+
+**Chiến lược điều chỉnh:**
+
+1.  **Xác định tràn**: Tìm `Sort Method: external merge Disk` hoặc `HashAggregate  (actual time=... loops=1)  Memory: 12345kB, Disk: 67890kB` trong `EXPLAIN ANALYZE`.
+2.  **Tăng dần**: Bắt đầu với một giá trị thận trọng (ví dụ: `4MB` hoặc `8MB`). Nếu xảy ra tràn, hãy tăng nó. Một giá trị sản xuất phổ biến có thể là `64MB` đến `256MB` mỗi phiên, nhưng điều này phụ thuộc rất nhiều vào khối lượng công việc và RAM khả dụng.
+3.  **Ghi đè cấp phiên**: Đối với các truy vấn phức tạp cụ thể, `SET work_mem TO '256MB';` có thể được sử dụng.
+
+```sql
+-- Example: Observe a sort spill
+-- Assume 'large_table' has millions of rows and 'some_column' is not indexed
+SET work_mem TO '64kB'; -- Artificially low for demonstration
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT *
+FROM large_table
+ORDER BY some_column;
+
+-- Output might show:
+-- Sort  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+--   Sort Key: some_column
+--   Sort Method: external merge  Disk: 12345kB  <-- This indicates a spill
+--   Buffers: ...
+```
+
+```sql
+-- Increase work_mem to prevent spill
+SET work_mem TO '256MB'; -- Adjust based on actual spill size and available RAM
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT *
+FROM large_table
+ORDER BY some_column;
+
+-- Output should ideally show:
+-- Sort  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+--   Sort Key: some_column
+--   Sort Method: quicksort  Memory: 12345kB  <-- In-memory sort
+--   Buffers: ...
+```
+
+### `maintenance_work_mem`
+
+Được sử dụng cho các thao tác bảo trì như `VACUUM`, `CREATE INDEX`, `ALTER TABLE ADD FOREIGN KEY`. Các thao tác này thường ít thường xuyên hơn nhưng có thể rất tốn bộ nhớ.
+
+-   **Quá thấp**: Làm chậm việc tạo chỉ mục và dọn dẹp, đặc biệt trên các bảng lớn.
+-   **Quá cao**: Có thể tiêu thụ bộ nhớ đáng kể trong quá trình bảo trì, có khả năng ảnh hưởng đến các truy vấn đang hoạt động.
+
+**Chiến lược điều chỉnh:**
+
+-   Đặt giá trị này cao hơn `work_mem`. Các giá trị phổ biến dao động từ `256MB` đến `1GB` trở lên, tùy thuộc vào kích thước của các bảng lớn nhất của bạn và RAM khả dụng.
+-   Bộ nhớ này được cấp phát *cho mỗi thao tác bảo trì*, không phải mỗi phiên.
+
+```sql
+-- Example: Creating an index on a large table
+-- A low maintenance_work_mem can make this very slow.
+SET maintenance_work_mem TO '16MB'; -- Artificially low
+
+CREATE INDEX idx_large_table_col ON large_table (another_column);
+-- This might take a very long time and use temp files.
+
+-- Increase for faster index creation
+SET maintenance_work_mem TO '1GB'; -- Or higher, depending on table size
+CREATE INDEX idx_large_table_col_new ON large_table (yet_another_column);
+-- This should be significantly faster.
+```
+
+## Tối ưu hóa sắp xếp tăng dần và kết nối băm
+
+PostgreSQL 17 tăng cường khả năng của trình lập kế hoạch trong việc sử dụng sắp xếp tăng dần và cải thiện hiệu suất kết nối băm.
+
+### Sắp xếp tăng dần
+
+Khi một truy vấn yêu cầu sắp xếp trên một tập hợp con các cột đã được sắp xếp theo một chỉ mục, PostgreSQL có thể thực hiện "sắp xếp tăng dần". Điều này tránh một thao tác sắp xếp đầy đủ, giảm đáng kể chi phí.
+
+```sql
+-- Assume an index on (order_date, customer_id)
+CREATE INDEX idx_orders_date_customer ON orders (order_date, customer_id);
+
+-- Query that can benefit from incremental sort
+EXPLAIN (ANALYZE)
+SELECT *
+FROM orders
+WHERE order_date >= '2023-01-01'
+ORDER BY order_date, customer_id, order_total DESC;
+```
+
+Đầu ra `EXPLAIN` có thể hiển thị:
+
+```
+                                      QUERY PLAN
+--------------------------------------------------------------------------------------
+ Sort  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+   Sort Key: order_total DESC
+   Presorted Key: order_date, customer_id  <-- Indicates incremental sort
+   ->  Index Scan using idx_orders_date_customer on orders  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+         Index Cond: (order_date >= '2023-01-01'::date)
+```
+
+Dòng `Presorted Key` là chỉ báo chính. Để tối ưu hóa:
+
+-   Đảm bảo các chỉ mục của bạn bao gồm các cột dẫn đầu của mệnh đề `ORDER BY` của bạn.
+-   Các cột `Sort Key` còn lại sẽ được sắp xếp tăng dần.
+
+### Kết nối băm
+
+Kết nối băm hiệu quả để kết nối các tập dữ liệu lớn, không được sắp xếp. PostgreSQL 17 cải thiện việc sử dụng bộ nhớ và xử lý tràn của chúng.
+
+-   **Bộ nhớ**: Đảm bảo `work_mem` đủ để chứa bảng băm của quan hệ nhỏ hơn trong bộ nhớ. Nếu nó tràn ra đĩa, hiệu suất sẽ giảm.
+-   **Xây dựng so với thăm dò**: Trình lập kế hoạch thường xây dựng bảng băm trên quan hệ nhỏ hơn và thăm dò nó bằng quan hệ lớn hơn. Nếu trình lập kế hoạch chọn sai, nó có thể dẫn đến việc sử dụng bộ nhớ quá mức hoặc tràn.
+-   **`enable_hashjoin`**: Đảm bảo GUC này là `on` (mặc định).
+
+```sql
+-- Example: Hash Join
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT a.id, b.value
+FROM large_table_a a
+JOIN medium_table_b b ON a.b_id = b.id;
+```
+
+Đầu ra:
+
+```
+                                      QUERY PLAN
+--------------------------------------------------------------------------------------
+ Hash Join  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+   Hash Cond: (a.b_id = b.id)
+   Buffers: ...
+   ->  Seq Scan on large_table_a a  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+         Buffers: ...
+   ->  Hash  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+         Memory: 12345kB  <-- Hash table memory usage
+         Buffers: ...
+         ->  Seq Scan on medium_table_b b  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+               Buffers: ...
+```
+
+Nếu `Memory` trong nút `Hash` được theo sau bởi `Disk`, điều đó có nghĩa là bảng băm đã tràn. Tăng `work_mem`.
+
+## Thực thi truy vấn song song
+
+PostgreSQL 17 tiếp tục tăng cường khả năng truy vấn song song, cho phép nhiều lõi CPU hoạt động trên các phần của một truy vấn duy nhất.
+
+-   **`max_parallel_workers_per_gather`**: Kiểm soát số lượng worker song song tối đa có thể được khởi chạy cho một nút `Gather` hoặc `Gather Merge` duy nhất.
+-   **`max_parallel_workers`**: Tổng số worker song song được phép trên toàn hệ thống.
+-   **`min_parallel_table_scan_size`**: Kích thước bảng tối thiểu (tính bằng KB) để xem xét quét song song.
+-   **`parallel_setup_cost`**: Chi phí ước tính để khởi chạy các worker song song.
+-   **`parallel_tuple_cost`**: Chi phí ước tính để chuyển một tuple từ worker sang leader.
+
+**Xác định các kế hoạch song song:**
+
+Tìm các nút `Gather` hoặc `Gather Merge` trong đầu ra `EXPLAIN ANALYZE`.
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT COUNT(*)
+FROM very_large_table
+WHERE some_column > 100;
+```
+
+Đầu ra:
+
+```
+                                      QUERY PLAN
+--------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+   Buffers: ...
+   ->  Gather  (cost=... rows=... width=...) (actual time=... rows=... loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: ...
+         ->  Partial Aggregate  (cost=... rows=... width=...) (actual time=... rows=... loops=2)
+               Buffers: ...
+               ->  Parallel Seq Scan on very_large_table  (cost=... rows=... width=...) (actual time=... rows=... loops=2)
+                     Filter: (some_column > 100)
+                     Buffers: ...
+```
+
+**Tối ưu hóa:**
+
+-   Đảm bảo `max_parallel_workers_per_gather` được đặt phù hợp (ví dụ: `4` đến `8` trên một máy chủ hiện đại).
+-   Đối với các bảng thường xuyên được quét và lớn, đảm bảo `min_parallel_table_scan_size` không quá cao.
+-   Song song hóa hiệu quả nhất cho các thao tác bị giới hạn bởi CPU trên các tập dữ liệu lớn (ví dụ: quét tuần tự lớn, tổng hợp, kết nối băm). Nó ít hiệu quả hơn đối với quét chỉ mục hoặc các truy vấn trả về ít hàng.
+
+## So sánh kiến trúc và đánh đổi
+
+| Tính năng/Tham số | Mô tả | Mặc định (PG17) | Phạm vi khuyến nghị | Đánh đổi |
+|---|---|---|---|---|
+| `work_mem` | Bộ nhớ cho các thao tác sắp xếp/băm trên mỗi truy vấn. | 4MB | 64MB - 256MB | Quá thấp: tràn đĩa, truy vấn chậm. Quá cao: OOM cho các truy vấn đồng thời. |
+| `maintenance_work_mem` | Bộ nhớ cho VACUUM, CREATE INDEX. | 64MB | 256MB - 1GB+ | Quá thấp: bảo trì chậm. Quá cao: ảnh hưởng đến các truy vấn đang hoạt động trong quá trình bảo trì. |
+| `shared_buffers` | Bộ đệm dữ liệu chính. | 128MB | 25% - 40% RAM | Quá thấp: I/O đĩa cao. Quá cao: dư thừa bộ đệm OS, OOM. |
+| `effective_cache_size` | Ước tính của trình lập kế hoạch về OS + shared_buffers. | 4GB | 50% - 75% RAM | Thông tin cho trình lập kế hoạch; không cấp phát bộ nhớ. Giá trị không chính xác dẫn đến các kế hoạch kém. |
+| `max_parallel_workers_per_gather` | Số worker song song tối đa trên mỗi truy vấn. | 2 | 4 - 8 | Quá thấp: không tận dụng hết CPU. Quá cao: chuyển đổi ngữ cảnh quá mức, tranh chấp tài nguyên. |
+| `default_statistics_target` | Mức độ chi tiết của thống kê. | 100 | 200 - 1000 | Quá thấp: ước tính hàng kém. Quá cao: tăng thời gian ANALYZE, bảng `pg_statistic` lớn hơn. |
+
+## Các vấn đề và khắc phục sự cố trong sản xuất
+
+1.  **Vấn đề: Hiệu suất giảm đột ngột sau `VACUUM FULL` hoặc `REINDEX`**
+    *   **Chế độ lỗi**: Các truy vấn từng nhanh trở nên chậm, thường với `Seq Scan` thay thế `Index Scan`.
+    *   **Nguyên nhân gốc**: `VACUUM FULL` và `REINDEX` ghi lại các bảng/chỉ mục, có khả năng dẫn đến trạng thái tạm thời mà thống kê bị cũ hoặc bộ đệm của trình lập kế hoạch bị vô hiệu hóa.
+    *   **Khắc phục**: Chạy ngay `ANALYZE VERBOSE;` trên các bảng bị ảnh hưởng hoặc toàn bộ cơ sở dữ liệu sau các thao tác đó. Điều này buộc trình lập kế hoạch phải xây dựng lại thống kê chính xác. Đối với `REINDEX`, đảm bảo `ANALYZE` được chạy trên bảng sau khi chỉ mục được xây dựng lại.
+
+2.  **Vấn đề: `work_mem` tràn mặc dù cài đặt cao**
+    *   **Chế độ lỗi**: `EXPLAIN ANALYZE` hiển thị `Sort Method: external merge Disk` hoặc `HashAggregate ... Disk` ngay cả khi `work_mem` được đặt ở giá trị dường như cao (ví dụ: `256MB`).
+    *   **Nguyên nhân gốc**: `work_mem` được cấp phát *cho mỗi thao tác*. Một truy vấn phức tạp duy nhất có thể có nhiều thao tác sắp xếp hoặc băm, mỗi thao tác tiêu thụ `work_mem`. Ngoài ra, nếu nhiều truy vấn đồng thời đang chạy, tổng mức tiêu thụ bộ nhớ có thể vượt quá RAM hệ thống.
+    *   **Khắc phục**:
+        *   **Xác định thao tác cụ thể**: Xác định nút nào đang tràn.
+        *   **Tăng `work_mem` thêm**: Nếu đó là một truy vấn đơn lẻ, quan trọng, hãy thử tăng `work_mem` cho phiên đó.
+        *   **Tối ưu hóa truy vấn**: Có thể tránh sắp xếp/băm không? Thêm chỉ mục cho `ORDER BY` hoặc `GROUP BY`. Tái cấu trúc truy vấn để giảm kích thước tập dữ liệu trước khi sắp xếp/băm.
+        *   **Giám sát tổng bộ nhớ**: Sử dụng `pg_stat_activity` để xem `temp_bytes` cho các truy vấn đang hoạt động. Nếu tổng `temp_bytes` trên tất cả các truy vấn cao, bạn có thể đang đạt đến giới hạn hệ thống.
+
+3.  **Vấn đề: Trình lập kế hoạch chọn thứ tự kết nối không tối ưu**
+    *   **Chế độ lỗi**: Một truy vấn liên quan đến nhiều kết nối chạy rất chậm và `EXPLAIN ANALYZE` hiển thị thứ tự kết nối xử lý một tập hợp kết quả trung gian lớn sớm.
+    *   **Nguyên nhân gốc**: Ước tính hàng không chính xác cho các kết quả trung gian, thường do thống kê cũ hoặc các mệnh đề `WHERE` phức tạp mà trình lập kế hoạch không thể ước tính chính xác.
+    *   **Khắc phục**:
+        *   **`ANALYZE`**: Đảm bảo tất cả các bảng liên quan có thống kê cập nhật.
+        *   **`CREATE STATISTICS`**: Đối với các tương quan đa cột hoặc phụ thuộc chức năng, hãy tạo thống kê mở rộng.
+            ```sql
+            CREATE STATISTICS my_correlation_stats ON (col1, col2) FROM my_table;
+            ANALYZE my_table;
+            ```
+        *   **Đơn giản hóa các mệnh đề `WHERE`**: Nếu có thể, hãy chia nhỏ các vị ngữ phức tạp.
+        *   **`SET join_collapse_limit` / `SET from_collapse_limit`**: Tạm thời giảm các GUC này để buộc trình lập kế hoạch xem xét nhiều thứ tự kết nối hơn, mặc dù điều này có thể làm tăng thời gian lập kế hoạch.
+        *   **`SET enable_nestloop = off;`**: Tạm thời vô hiệu hóa các loại kết nối cụ thể để buộc trình lập kế hoạch xem xét các lựa chọn thay thế, hữu ích cho việc gỡ lỗi.
+
+4.  **Vấn đề: `Planning Time` cao trong `EXPLAIN ANALYZE`**
+    *   **Chế độ lỗi**: `Planning Time` liên tục cao (ví dụ: hàng trăm mili giây đến vài giây), ngay cả đối với các truy vấn đơn giản.
+    *   **Nguyên nhân gốc**:
+        *   **Truy vấn phức tạp**: Nhiều kết nối, truy vấn con hoặc các thao tác `UNION`.
+        *   **`default_statistics_target` cao**: Mặc dù tốt cho độ chính xác, các giá trị cao hơn có nghĩa là nhiều dữ liệu hơn để xử lý trong quá trình lập kế hoạch.
+        *   **`enable_seqscan = off`**: Buộc quét chỉ mục ở mọi nơi có thể khiến trình lập kế hoạch làm việc vất vả hơn để tìm một chỉ mục.
+        *   **Phiên bản PostgreSQL lỗi thời**: Các phiên bản cũ hơn có trình lập kế hoạch kém hiệu quả hơn cho một số kịch bản phức tạp nhất định.
+    *   **Khắc phục**:
+        *   **Đơn giản hóa truy vấn**: Chia nhỏ các truy vấn rất phức tạp thành các truy vấn nhỏ hơn, dễ quản lý hơn, có thể sử dụng CTE hoặc bảng tạm thời.
+        *   **Tham số hóa truy vấn**: Nếu cấu trúc truy vấn giống hệt nhau nhưng chỉ các giá trị thay đổi, hãy sử dụng các câu lệnh đã chuẩn bị để bù đắp chi phí lập kế hoạch.
+        *   **Xem xét GUC**: Đảm bảo `default_statistics_target` không quá cao đối với khối lượng công việc của bạn.
+        *   **Nâng cấp PostgreSQL**: Các phiên bản mới hơn thường có những cải tiến về trình lập kế hoạch.
+
+## Các câu hỏi thường gặp
+
+1.  **Làm cách nào để biết `work_mem` của tôi được đặt đúng cách?**
+    Kiểm tra đầu ra `EXPLAIN ANALYZE` để tìm `Sort Method: external merge Disk` hoặc `HashAggregate ... Disk`. Nếu chúng xuất hiện, `work_mem` quá thấp cho thao tác cụ thể đó. Ngoài ra, hãy giám sát `pg_stat_statements` để tìm `temp_bytes` và `temp_files` để xem tổng mức sử dụng tệp tạm thời.
+
+2.  **Khi nào tôi nên sử dụng `CREATE STATISTICS`?**
+    Sử dụng `CREATE STATISTICS` khi trình lập kế hoạch liên tục đưa ra các ước tính hàng kém cho các truy vấn liên quan đến nhiều cột trong các mệnh đề `WHERE`, điều kiện `JOIN` hoặc các mệnh đề `GROUP BY`, đặc biệt nếu các cột này có dữ liệu tương quan. Điều này giúp trình lập kế hoạch hiểu các mối quan hệ giữa các cột mà thống kê một cột bỏ qua.
+
+3.  **Sự khác biệt giữa `shared_buffers` và `effective_cache_size` là gì?**
+    `shared_buffers` là bộ nhớ thực tế mà PostgreSQL cấp phát cho bộ đệm dữ liệu của nó. `effective_cache_size` là một GUC cho trình lập kế hoạch truy vấn biết lượng bộ nhớ mà nó *mong đợi* có sẵn để lưu trữ dữ liệu, bao gồm `shared_buffers` và bộ đệm hệ thống tệp OS. Nó không cấp phát bộ nhớ mà ảnh hưởng đến ước tính chi phí I/O đĩa của trình lập kế hoạch.
+
+4.  **Truy vấn của tôi đang sử dụng `Seq Scan` thay vì `Index Scan` ngay cả khi có chỉ mục. Tại sao?**
+    Điều này thường xảy ra khi trình lập kế hoạch ước tính rằng quét tuần tự sẽ nhanh hơn quét chỉ mục. Các lý do phổ biến bao gồm:
+    *   **Tính chọn lọc cao**: Truy vấn đang truy xuất một tỷ lệ lớn các hàng từ bảng (ví dụ: >5-10%). Quét chỉ mục liên quan đến I/O ngẫu nhiên, có thể chậm hơn đọc tuần tự đầy đủ cho nhiều hàng.
+    *   **Thống kê cũ**: Ước tính hàng của trình lập kế hoạch không chính xác. Chạy `ANALYZE`.
+    *   **Kích thước bảng**: Đối với các bảng rất nhỏ, `Seq Scan` thường nhanh hơn do chi phí truy cập chỉ mục.
+    *   **`random_page_cost`**: Nếu GUC này được đặt quá cao, nó làm cho I/O ngẫu nhiên (quét chỉ mục) có vẻ tốn kém hơn.
+    *   **Phình chỉ mục**: Một chỉ mục bị phình to có thể làm cho việc quét chỉ mục không hiệu quả. `REINDEX` có thể giúp ích.
+
+5.  **Làm cách nào để buộc PostgreSQL sử dụng một kế hoạch cụ thể?**
+    Mặc dù nói chung không được khuyến khích vì nó có thể dẫn đến các kế hoạch không tối ưu nếu dữ liệu thay đổi, bạn có thể ảnh hưởng đến trình lập kế hoạch bằng cách tạm thời vô hiệu hóa một số loại kế hoạch nhất định bằng cách sử dụng GUC (ví dụ: `SET enable_seqscan = off;`, `SET enable_nestloop = off;`). Để kiểm soát chi tiết hơn, các công cụ như `pg_hint_plan` (một tiện ích mở rộng) cho phép các gợi ý cấp SQL, nhưng điều này nên được sử dụng hết sức thận trọng và chỉ sau khi thử nghiệm kỹ lưỡng. Cách tiếp cận tốt nhất là khắc phục các vấn đề về thống kê hoặc lập chỉ mục cơ bản.

@@ -1,0 +1,448 @@
+---
+title: "Tinh chỉnh DeepSeek R1 với Unsloth & LoRA: Các mô hình suy luận tiết kiệm bộ nhớ"
+images: ['/static/images/deepseek-r1-fine-tuning-unsloth-lora.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["ai", "deepseek", "machine-learning", "python", "llm"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về tinh chỉnh DeepSeek R1 với Unsloth & LoRA: các mô hình suy luận tiết kiệm bộ nhớ với kiến trúc cấp độ sản xuất và ví dụ mã."
+---
+
+Các mô hình DeepSeek-R1-Distill mang lại sự cân bằng hấp dẫn giữa khả năng suy luận và hiệu quả. Việc tinh chỉnh các mô hình này cho các miền hoặc tác vụ cụ thể thường đặt ra những thách thức về VRAM và thông lượng huấn luyện, đặc biệt với các biến thể lớn hơn. Hướng dẫn này trình bày chi tiết một phương pháp cấp độ sản xuất để tinh chỉnh DeepSeek-R1-Distill bằng cách sử dụng Unsloth và LoRA/QLoRA, tận dụng các nhân Triton tùy chỉnh để giảm đáng kể VRAM và tăng tốc độ huấn luyện. Chúng ta sẽ đề cập đến việc chuẩn bị dữ liệu, huấn luyện mô hình và các cân nhắc triển khai, bao gồm xuất GGUF và vLLM.
+
+<AudioPlayer src="/static/audio/deepseek-r1-fine-tuning-unsloth-lora-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Tổng quan kiến trúc DeepSeek-R1-Distill
+
+DeepSeek-R1-Distill là một loạt các mô hình suy luận mã nguồn mở, được chắt lọc từ các mô hình DeepSeek-R1 lớn hơn, có khả năng hơn. Chúng được thiết kế để vượt trội trong các tác vụ suy luận phức tạp, thường sử dụng một `<think>` token để phân định một quy trình suy luận chuỗi tư duy (CoT) rõ ràng trước khi đưa ra câu trả lời cuối cùng. Cấu trúc CoT rõ ràng này rất quan trọng cho khả năng diễn giải và gỡ lỗi, và việc bảo toàn nó trong quá trình tinh chỉnh là tối quan trọng. Các mô hình thường dựa trên kiến trúc transformer, sử dụng cơ chế chú ý đa đầu (multi-head attention) và mạng truyền thẳng (feed-forward networks).
+
+## Unsloth: Hiệu quả và tốc độ VRAM
+
+Unsloth là một thư viện được thiết kế để tăng tốc và tối ưu hóa việc tinh chỉnh LoRA/QLoRA cho các mô hình ngôn ngữ lớn. Nó đạt được khả năng tiết kiệm VRAM và tăng tốc đáng kể thông qua một số cải tiến chính:
+
+1.  **Nhân Triton tùy chỉnh:** Unsloth thay thế các nhân chú ý và tối ưu hóa PyTorch tiêu chuẩn bằng các triển khai Triton được tối ưu hóa cao. Các nhân này được thiết kế đặc biệt cho LoRA/QLoRA, giảm chi phí bộ nhớ và cải thiện hiệu quả tính toán.
+2.  **Tối ưu hóa Gradient Checkpointing:** Mặc dù gradient checkpointing của PyTorch giúp tiết kiệm bộ nhớ, Unsloth còn tối ưu hóa nó hơn nữa bằng cách chỉ checkpoint các kích hoạt cần thiết, giảm chi phí tính toán lại.
+3.  **Huấn luyện nhận biết lượng tử hóa (Quantization-Aware Training):** Tích hợp liền mạch với lượng tử hóa 4-bit và 8-bit (QLoRA) giúp giảm đáng kể yêu cầu VRAM.
+
+Những tối ưu hóa này giúp việc tinh chỉnh các mô hình như DeepSeek-R1-Distill trên các GPU cấp người tiêu dùng hoặc với kích thước lô lớn hơn trên phần cứng chuyên nghiệp trở nên khả thi.
+
+## Chuẩn bị dữ liệu: Bảo toàn CoT `<think>`
+
+Các mô hình DeepSeek-R1-Distill được huấn luyện để sử dụng một token `<think>` cụ thể để cấu trúc suy luận của chúng. Khi chuẩn bị dữ liệu tinh chỉnh, điều quan trọng là phải duy trì định dạng này. Việc tạo dữ liệu tổng hợp hoặc chú thích cẩn thận thường được yêu cầu.
+
+Một lượt hội thoại DeepSeek-R1-Distill điển hình với CoT trông như thế này:
+
+```
+User: <prompt>
+Assistant: <think>Thought process leading to the answer.</think><answer>Final answer.</answer>
+```
+
+Để tinh chỉnh, chúng ta cần định dạng dữ liệu của mình thành các lượt hội thoại, đảm bảo các thẻ `<think>` và `<answer>` được đặt đúng vị trí.
+
+### Ví dụ định dạng dữ liệu
+
+Hãy xem xét một tập dữ liệu các bài toán suy luận toán học. Mỗi mục phải được cấu trúc dưới dạng một danh sách các từ điển, đại diện cho một cuộc hội thoại.
+
+```json
+[
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is the sum of the first 10 prime numbers?"
+      },
+      {
+        "role": "assistant",
+        "content": "<think>The first 10 prime numbers are 2, 3, 5, 7, 11, 13, 17, 19, 23, 29. Summing them: 2+3+5+7+11+13+17+19+23+29 = 129.</think><answer>129</answer>"
+      }
+    ]
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "If a car travels at 60 mph for 2 hours, how far does it travel?"
+      },
+      {
+        "role": "assistant",
+        "content": "<think>Distance = Speed × Time. Speed = 60 mph, Time = 2 hours. Distance = 60 * 2 = 120 miles.</think><answer>120 miles</answer>"
+      }
+    ]
+  }
+]
+```
+
+Cấu trúc JSON này tương thích với thư viện `datasets` và bộ tải dữ liệu của Unsloth.
+
+## Tinh chỉnh DeepSeek-R1-Distill với Unsloth
+
+Phần này cung cấp một ví dụ hoàn chỉnh, có thể chạy được để tinh chỉnh `deepseek-ai/deepseek-r1-3b-base` bằng Unsloth. Các nguyên tắc này cũng áp dụng cho các mô hình DeepSeek-R1-Distill lớn hơn.
+
+### Thiết lập
+
+Đầu tiên, cài đặt Unsloth và các thư viện cần thiết khác.
+
+```bash
+pip install "unsloth[cu121] @ git+https://github.com/unslothai/unsloth.git"
+pip install transformers peft accelerate bitsandbytes trl datasets torch
+```
+
+### Tập lệnh huấn luyện
+
+```python
+import torch
+from unsloth import FastLanguageModel
+from trl import SFTTrainer
+from transformers import TrainingArguments, AutoTokenizer
+from datasets import load_dataset
+import os
+
+# 1. Configuration
+max_seq_length = 2048 # Max sequence length for DeepSeek-R1-Distill
+model_name = "deepseek-ai/deepseek-r1-3b-base" # Or deepseek-ai/deepseek-r1-7b-base
+dataset_path = "your_synthetic_reasoning_data.json" # Path to your JSON dataset
+
+# 2. Load Model and Tokenizer with Unsloth
+# Unsloth automatically handles 4-bit quantization (QLoRA)
+# and loads the model with optimized kernels.
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name = model_name,
+    max_seq_length = max_seq_length,
+    dtype = None, # None for auto detection (bfloat16 if supported, else float16)
+    load_in_4bit = True, # Enable QLoRA
+)
+
+# 3. Configure LoRA Adapters
+# Target all linear layers for optimal performance.
+model = FastLanguageModel.get_peft_model(
+    model,
+    r = 16, # LoRA rank
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                      "gate_proj", "up_proj", "down_proj"],
+    lora_alpha = 16,
+    lora_dropout = 0.05,
+    bias = "none",
+    use_gradient_checkpointing = "unsloth", # Use Unsloth's optimized gradient checkpointing
+    random_state = 3407,
+    max_seq_length = max_seq_length,
+)
+
+# 4. Load and Format Dataset
+# The dataset should be a JSON file with the structure described above.
+# We use `apply_chat_template` to format messages into the model's expected input format.
+# DeepSeek models typically use a specific chat template.
+# Ensure the tokenizer has a chat template or define one.
+# For DeepSeek, it's often similar to:
+# {% for message in messages %}{% if message['role'] == 'user' %}{{ '<|User|>
+# ' + message['content'] + '<|EOT|>
+# ' }}{% elif message['role'] == 'assistant' %}{{ '<|Bot|>
+# ' + message['content'] + '<|EOT|>
+# ' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<|Bot|>' }}{% endif %}
+
+# If your tokenizer doesn't have a default, you might need to set it:
+# tokenizer.chat_template = "{% for message in messages %}{% if message['role'] == 'user' %}{{ '<|User|>\n' + message['content'] + '<|EOT|>\n' }}{% elif message['role'] == 'assistant' %}{{ '<|Bot|>\n' + message['content'] + '<|EOT|>\n' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<|Bot|>' }}{% endif %}"
+
+def formatting_prompts_func(examples):
+    """
+    Formats the dataset examples into the model's expected chat template.
+    Ensures the <think> and <answer> tokens are preserved within the assistant's response.
+    """
+    texts = []
+    for i in range(len(examples["messages"])):
+        # Apply chat template to each conversation
+        # `add_generation_prompt=False` is crucial for fine-tuning to ensure
+        # the assistant's response is fully included, not just the prompt for generation.
+        formatted_text = tokenizer.apply_chat_template(
+            examples["messages"][i],
+            tokenize=False,
+            add_generation_prompt=False
+        )
+        texts.append(formatted_text)
+    return { "text" : texts }
+
+dataset = load_dataset("json", data_files=dataset_path, split="train")
+dataset = dataset.map(
+    formatting_prompts_func,
+    batched = True,
+)
+
+# 5. Configure Training Arguments
+trainer = SFTTrainer(
+    model = model,
+    tokenizer = tokenizer,
+    train_dataset = dataset,
+    dataset_text_field = "text", # Field containing the formatted text
+    max_seq_length = max_seq_length,
+    dataset_num_proc = os.cpu_count(), # Use all CPU cores for data processing
+    packing = False, # Set to True for more efficient packing of short sequences
+    args = TrainingArguments(
+        per_device_train_batch_size = 2, # Adjust based on VRAM
+        gradient_accumulation_steps = 4, # Accumulate gradients over 4 steps
+        warmup_steps = 5,
+        num_train_epochs = 3,
+        learning_rate = 2e-4,
+        fp16 = not torch.cuda.is_bf16_supported(), # Use fp16 if bfloat16 not supported
+        bf16 = torch.cuda.is_bf16_supported(), # Use bf16 if supported
+        logging_steps = 1,
+        optim = "adamw_8bit", # Use 8-bit AdamW optimizer
+        weight_decay = 0.01,
+        lr_scheduler_type = "linear",
+        seed = 3407,
+        output_dir = "outputs",
+        report_to = "none", # Disable reporting to W&B etc. for simplicity
+    ),
+)
+
+# 6. Train the Model
+trainer.train()
+
+# 7. Save the LoRA Adapters
+model.save_pretrained("deepseek_r1_lora_adapters")
+tokenizer.save_pretrained("deepseek_r1_lora_adapters")
+
+print("Fine-tuning complete. LoRA adapters saved to deepseek_r1_lora_adapters.")
+```
+
+### Giải thích các tham số chính:
+
+*   `max_seq_length`: Rất quan trọng đối với bộ nhớ. Các mô hình DeepSeek-R1-Distill thường được huấn luyện với các ngữ cảnh lớn hơn. Điều chỉnh dựa trên dữ liệu và VRAM của bạn.
+*   `load_in_4bit = True`: Kích hoạt QLoRA, tải mô hình cơ sở ở độ chính xác 4-bit. Đây là cơ chế tiết kiệm VRAM chính.
+*   `target_modules`: Chỉ định các lớp tuyến tính nào trong kiến trúc transformer sẽ được áp dụng bộ điều hợp LoRA. Nhắm mục tiêu `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj` là tiêu chuẩn cho việc tinh chỉnh toàn diện.
+*   `use_gradient_checkpointing = "unsloth"`: Tận dụng gradient checkpointing được tối ưu hóa của Unsloth.
+*   `formatting_prompts_func`: Hàm này rất quan trọng. Nó lấy dữ liệu có cấu trúc của bạn và chuyển đổi nó thành định dạng chuỗi chính xác mà mô hình mong đợi, bao gồm các thẻ `<think>` và `<answer>`. Phương pháp `tokenizer.apply_chat_template` là cách được khuyến nghị để thực hiện điều này.
+*   `per_device_train_batch_size` và `gradient_accumulation_steps`: Điều chỉnh các giá trị này để phù hợp với VRAM của GPU của bạn. Một `per_device_train_batch_size` nhỏ hơn kết hợp với `gradient_accumulation_steps` cho phép kích thước lô hiệu quả lớn hơn mà không làm tăng VRAM đỉnh.
+*   `optim = "adamw_8bit"`: Sử dụng bộ tối ưu hóa AdamW 8-bit, giảm thêm bộ nhớ trạng thái bộ tối ưu hóa.
+
+## Triển khai: Xuất GGUF và vLLM
+
+Sau khi tinh chỉnh, bạn sẽ có các bộ điều hợp LoRA. Để triển khai, bạn thường muốn hợp nhất các bộ điều hợp này trở lại trọng số mô hình cơ sở và sau đó chuyển đổi chúng sang định dạng phù hợp.
+
+### Hợp nhất bộ điều hợp LoRA
+
+```python
+import torch
+from unsloth import FastLanguageModel
+from transformers import AutoTokenizer
+
+model_name = "deepseek-ai/deepseek-r1-3b-base"
+lora_adapters_path = "deepseek_r1_lora_adapters"
+output_merged_path = "deepseek_r1_merged_model"
+
+# Load the base model and tokenizer
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name = model_name,
+    max_seq_length = 2048, # Must match training max_seq_length
+    dtype = None, # Use the same dtype as during training or float16/bfloat16
+    load_in_4bit = False, # Load in full precision for merging
+)
+
+# Load the LoRA adapters
+model = FastLanguageModel.get_peft_model(
+    model,
+    r = 16, # Must match training r
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                      "gate_proj", "up_proj", "down_proj"],
+    lora_alpha = 16,
+    lora_dropout = 0.05,
+    bias = "none",
+    use_gradient_checkpointing = False, # Not needed for inference/merging
+    random_state = 3407,
+    max_seq_length = 2048, # Must match training max_seq_length
+)
+model.load_adapter(lora_adapters_path)
+
+# Merge LoRA adapters and save the full model
+model.save_pretrained_merged(output_merged_path, tokenizer, save_method = "merged_16bit")
+print(f"Merged model saved to {output_merged_path}")
+```
+
+### Xuất GGUF để triển khai trên CPU/Edge
+
+GGUF là một định dạng được tối ưu hóa cho suy luận CPU với `llama.cpp` và các liên kết của nó. Nó hỗ trợ lượng tử hóa (ví dụ: Q4\_K\_M, Q5\_K\_M) để giảm bộ nhớ hơn nữa.
+
+```python
+import os
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from huggingface_hub import HfApi, create_repo
+from pathlib import Path
+
+merged_model_path = "deepseek_r1_merged_model"
+output_gguf_path = "deepseek_r1_merged_model_gguf"
+quantization_type = "q4_k_m" # Example: q4_k_m, q5_k_m, q8_0
+
+# Ensure llama.cpp is installed and converted.py is available
+# You might need to clone llama.cpp and build it:
+# git clone https://github.com/ggerganov/llama.cpp.git
+# cd llama.cpp && make
+
+# Load the merged model
+model = AutoModelForCausalLM.from_pretrained(
+    merged_model_path,
+    torch_dtype=torch.float16, # Or bfloat16
+    device_map="auto"
+)
+tokenizer = AutoTokenizer.from_pretrained(merged_model_path)
+
+# Save in a format compatible with llama.cpp's convert.py
+# This typically means saving as a standard Hugging Face model
+model.save_pretrained(output_gguf_path)
+tokenizer.save_pretrained(output_gguf_path)
+
+# Convert to GGUF using llama.cpp's convert.py
+# Make sure you have llama.cpp cloned and built, and its `convert.py` is accessible.
+# Adjust `llama_cpp_dir` to your llama.cpp installation path.
+llama_cpp_dir = "/path/to/llama.cpp" # IMPORTANT: Set this path
+convert_script = os.path.join(llama_cpp_dir, "convert.py")
+
+if not os.path.exists(convert_script):
+    raise FileNotFoundError(f"llama.cpp convert.py not found at {convert_script}. "
+                            "Please clone and build llama.cpp.")
+
+# Step 1: Convert PyTorch weights to ggml format (intermediate step for convert.py)
+# This step is often implicitly handled by newer convert.py versions,
+# but historically involved a separate script or specific arguments.
+# For DeepSeek, ensure convert.py supports its architecture.
+print(f"Converting {output_gguf_path} to GGUF...")
+os.system(f"python {convert_script} {output_gguf_path} --outfile {output_gguf_path}/model.gguf")
+
+# Step 2: Quantize the GGUF model
+quantize_script = os.path.join(llama_cpp_dir, "quantize")
+if not os.path.exists(quantize_script):
+    # For older llama.cpp versions, quantize might be part of convert.py or a separate script
+    # For newer versions, `quantize` is a compiled binary.
+    # If not found, try `python {convert_script} --quantize {quantization_type} ...`
+    raise FileNotFoundError(f"llama.cpp quantize binary not found at {quantize_script}. "
+                            "Please build llama.cpp or check its documentation for quantization.")
+
+os.system(f"{quantize_script} {output_gguf_path}/model.gguf {output_gguf_path}/model-{quantization_type}.gguf {quantization_type}")
+
+print(f"GGUF model ({quantization_type}) saved to {output_gguf_path}/model-{quantization_type}.gguf")
+
+# Optional: Upload to Hugging Face Hub
+# api = HfApi()
+# repo_id = "your_hf_username/deepseek-r1-3b-reasoning-gguf"
+# create_repo(repo_id, repo_type="model", exist_ok=True)
+# api.upload_file(
+#     path_or_fileobj=f"{output_gguf_path}/model-{quantization_type}.gguf",
+#     path_in_repo=f"deepseek-r1-3b-reasoning-{quantization_type}.gguf",
+#     repo_id=repo_id,
+# )
+# print(f"GGUF model uploaded to Hugging Face Hub: {repo_id}")
+```
+
+### Xuất vLLM để suy luận GPU thông lượng cao
+
+vLLM là một công cụ suy luận được tối ưu hóa cho LLM, cung cấp phân lô liên tục và PagedAttention cho thông lượng cao. Nó trực tiếp sử dụng các mô hình Hugging Face `transformers`.
+
+```python
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+merged_model_path = "deepseek_r1_merged_model"
+output_vllm_path = "deepseek_r1_vllm_model"
+
+# Load the merged model and tokenizer
+model = AutoModelForCausalLM.from_pretrained(
+    merged_model_path,
+    torch_dtype=torch.bfloat16, # Use bfloat16 for vLLM if supported, else float16
+    device_map="auto"
+)
+tokenizer = AutoTokenizer.from_pretrained(merged_model_path)
+
+# Save the model in a format vLLM can directly load
+# vLLM expects a standard Hugging Face model directory.
+model.save_pretrained(output_vllm_path)
+tokenizer.save_pretrained(output_vllm_path)
+
+print(f"vLLM-compatible model saved to {output_vllm_path}")
+
+# Example vLLM inference (requires vLLM to be installed)
+# from vllm import LLM, SamplingParams
+#
+# llm = LLM(model=output_vllm_path, dtype=torch.bfloat16)
+#
+# prompts = [
+#     "<|User|>\nWhat is the capital of France?<|EOT|>\n<|Bot|>",
+#     "<|User|>\nIf x = 5 and y = 3, what is x + y?<|EOT|>\n<|Bot|>"
+# ]
+#
+# sampling_params = SamplingParams(temperature=0.7, top_p=0.95, max_tokens=128)
+#
+# outputs = llm.generate(prompts, sampling_params)
+#
+# for output in outputs:
+#     prompt = output.prompt
+#     generated_text = output.outputs[0].text
+#     print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+```
+
+## Kiến trúc & Đánh đổi
+
+| Tính năng | Unsloth LoRA/QLoRA | Tinh chỉnh hoàn chỉnh | GGUF (llama.cpp) | vLLM |
+|---|---|---|---|---|
+| Sử dụng VRAM (Huấn luyện) | Rất thấp (4-bit) | Rất cao (16/32-bit) | N/A | N/A |
+| Tốc độ huấn luyện | Nhanh (nhân Triton) | Tiêu chuẩn | N/A | N/A |
+| Kích thước mô hình (Đĩa) | Chỉ bộ điều hợp (MB) | Mô hình hoàn chỉnh (GB) | Lượng tử hóa (GB) | Mô hình hoàn chỉnh (GB) |
+| Độ trễ suy luận | Trung bình (hợp nhất bộ điều hợp) | Thấp | Thấp (CPU) | Rất thấp (GPU) |
+| Thông lượng suy luận | Trung bình | Cao | Trung bình (CPU) | Rất cao (GPU) |
+| Phần cứng | GPU tiêu dùng | GPU cao cấp | CPU, thiết bị biên | GPU cao cấp |
+| Độ phức tạp | Thấp (trừu tượng Unsloth) | Trung bình | Trung bình (chuyển đổi) | Thấp (tương thích HF) |
+| Trường hợp sử dụng | Lặp lại nhanh, huấn luyện hạn chế tài nguyên | Hiệu suất tối đa, tập dữ liệu lớn | Cục bộ/ngoại tuyến, chỉ CPU | API quy mô lớn, chỉ GPU |
+
+## Những vấn đề và cách khắc phục trong sản xuất
+
+1.  **VRAM OOM trong quá trình huấn luyện:**
+    *   **Triệu chứng:** Lỗi `CUDA out of memory`.
+    *   **Cách khắc phục:**
+        *   Giảm `per_device_train_batch_size`.
+        *   Tăng `gradient_accumulation_steps` để bù cho kích thước lô nhỏ hơn.
+        *   Giảm `max_seq_length`.
+        *   Đảm bảo `load_in_4bit = True` và `optim = "adamw_8bit"` được đặt.
+        *   Xác minh `use_gradient_checkpointing = "unsloth"`.
+        *   Nếu sử dụng `packing=True`, hãy đảm bảo tập dữ liệu của bạn chứa các chuỗi đủ dài hoặc tắt đóng gói nếu các chuỗi rất ngắn, vì đóng gói đôi khi có thể làm tăng bộ nhớ đỉnh.
+2.  **Định dạng `<think>`/`<answer>` không chính xác:**
+    *   **Triệu chứng:** Mô hình tạo ra văn bản không có cấu trúc, bỏ qua các thẻ `<think>` hoặc tạo ra các phản hồi không đúng định dạng.
+    *   **Cách khắc phục:** Kiểm tra lại `formatting_prompts_func` và dữ liệu JSON thô của bạn. Đảm bảo các thẻ `<think>` và `<answer>` chính xác như mô hình cơ sở mong đợi và được bao quanh chính xác trong phản hồi của trợ lý trong dữ liệu huấn luyện. `tokenizer.apply_chat_template` là rất quan trọng ở đây.
+3.  **Huấn luyện chậm:**
+    *   **Triệu chứng:** Huấn luyện mất nhiều thời gian hơn đáng kể so với dự kiến.
+    *   **Cách khắc phục:**
+        *   Đảm bảo Unsloth được cài đặt đúng cách với hỗ trợ CUDA (`unsloth[cu121]`).
+        *   Xác minh `torch.cuda.is_available()` trả về `True`.
+        *   Kiểm tra mức sử dụng GPU bằng `nvidia-smi`. Mức sử dụng thấp có thể cho thấy nút thắt cổ chai tải dữ liệu (tăng `dataset_num_proc`).
+        *   Đảm bảo `packing=True` nếu các chuỗi của bạn ngắn, vì nó có thể cải thiện mức sử dụng GPU.
+4.  **Sự cố chuyển đổi GGUF:**
+    *   **Triệu chứng:** `convert.py` không thành công hoặc tạo ra tệp GGUF không sử dụng được.
+    *   **Cách khắc phục:**
+        *   Đảm bảo `llama.cpp` được sao chép và xây dựng đúng cách.
+        *   Xác minh tập lệnh `convert.py` và đường dẫn nhị phân `quantize` là chính xác.
+        *   Kiểm tra GitHub của `llama.cpp` để biết hướng dẫn chuyển đổi mới nhất cho các mô hình DeepSeek, vì sự hỗ trợ cho các kiến trúc mới đang phát triển.
+        *   Một số mô hình yêu cầu các phiên bản `convert.py` hoặc cờ cụ thể.
+5.  **Lỗi suy luận vLLM:**
+    *   **Triệu chứng:** vLLM không tải được mô hình hoặc tạo ra đầu ra không chính xác.
+    *   **Cách khắc phục:**
+        *   Đảm bảo mô hình đã hợp nhất được lưu ở định dạng Hugging Face tiêu chuẩn mà vLLM có thể nhận dạng.
+        *   Xác minh `torch_dtype` được sử dụng để tải trong vLLM khớp với dtype của mô hình đã hợp nhất (ví dụ: `bfloat16`).
+        *   Kiểm tra tài liệu của vLLM để biết khả năng tương thích mô hình cụ thể hoặc các vấn đề đã biết với DeepSeek.
+
+## Các câu hỏi thường gặp
+
+1.  **Tôi có thể tinh chỉnh DeepSeek-R1-Distill-7B bằng Unsloth trên một GPU 24GB duy nhất (ví dụ: RTX 3090/4090) không?**
+    Có, với QLoRA 4-bit của Unsloth và gradient checkpointing được tối ưu hóa, việc tinh chỉnh DeepSeek-R1-Distill-7B là khả thi trên một GPU 24GB duy nhất. Bạn có thể sẽ cần sử dụng một `per_device_train_batch_size` nhỏ (ví dụ: 1 hoặc 2) và bù đắp bằng `gradient_accumulation_steps`.
+2.  **Làm cách nào để đảm bảo mô hình tiếp tục sử dụng token `<think>` sau khi tinh chỉnh?**
+    Bước quan trọng nhất là đảm bảo tập dữ liệu tinh chỉnh của bạn bao gồm rõ ràng các token `<think>` và `<answer>` trong phản hồi của trợ lý, được định dạng chính xác như mô hình cơ sở mong đợi. Hàm `tokenizer.apply_chat_template`, khi được sử dụng đúng cách với `add_generation_prompt=False`, sẽ giúp thực thi điều này. Trong quá trình suy luận, bạn nên nhắc mô hình bằng cùng một mẫu trò chuyện và mong đợi nó tạo ra khối `<think>`.
+3.  **Tác động hiệu suất của lượng tử hóa 4-bit (QLoRA) đối với DeepSeek-R1-Distill là gì?**
+    Mặc dù lượng tử hóa 4-bit gây ra một chút mất mát độ chính xác, đối với nhiều tác vụ suy luận, sự suy giảm hiệu suất là tối thiểu và thường được bù đắp bởi việc tiết kiệm VRAM đáng kể và khả năng tinh chỉnh các mô hình lớn hơn. Các mô hình DeepSeek nói chung rất mạnh mẽ đối với lượng tử hóa. Nên đánh giá mô hình 4-bit đã tinh chỉnh dựa trên các số liệu tác vụ cụ thể của bạn.
+4.  **Tôi có thể sử dụng Unsloth để tinh chỉnh hoàn chỉnh (không chỉ LoRA) không?**
+    Unsloth chủ yếu được thiết kế để tinh chỉnh LoRA/QLoRA. Mặc dù nó cung cấp các nhân được tối ưu hóa, nhưng lợi ích chính của nó trong việc giảm VRAM và tốc độ gắn liền với bản chất tiết kiệm tham số của LoRA. Để tinh chỉnh hoàn chỉnh, bạn thường sử dụng huấn luyện `transformers` của Hugging Face tiêu chuẩn, điều này sẽ yêu cầu VRAM nhiều hơn đáng kể.
+5.  **Làm cách nào để xử lý các chuỗi suy luận rất dài vượt quá `max_seq_length`?**
+    Nếu các chuỗi suy luận của bạn thường xuyên vượt quá `max_seq_length`, bạn có một vài lựa chọn:
+    *   Tăng `max_seq_length` nếu VRAM cho phép.
+    *   Cắt bớt các chuỗi suy luận quá dài trong tập dữ liệu của bạn (mặc dù điều này có thể ảnh hưởng đến chất lượng suy luận).
+    *   Cân nhắc các kỹ thuật như "chú ý cửa sổ trượt" nếu kiến trúc mô hình hỗ trợ nó, hoặc tinh chỉnh trên một mô hình có cửa sổ ngữ cảnh gốc lớn hơn. Đối với DeepSeek-R1-Distill, việc tăng `max_seq_length` là cách tiếp cận trực tiếp nhất.
+
+Hướng dẫn này cung cấp một khuôn khổ mạnh mẽ để tinh chỉnh các mô hình DeepSeek-R1-Distill một cách hiệu quả. Bằng cách tận dụng các tối ưu hóa của Unsloth và quản lý cẩn thận định dạng dữ liệu, bạn có thể triển khai các mô hình suy luận mạnh mẽ, chuyên biệt ngay cả với tài nguyên phần cứng hạn chế.

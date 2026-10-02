@@ -1,0 +1,366 @@
+---
+title: 'Kubernetes Gateway API in Production: Migrating from Ingress-Nginx with Envoy'
+images: ['/static/images/kubernetes-gateway-api-vs-ingress-nginx-migration.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["kubernetes", "devops", "cloud", "networking", "envoy"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Intermediate"
+programmingLanguage: "TypeScript"
+summary: 'Comprehensive guide covering kubernetes gateway api in production: migrating from ingress-nginx with envoy with production-grade architecture and code examples.'
+---
+
+The Kubernetes Ingress API, while foundational, exhibits limitations in expressiveness, role separation, and extensibility for complex traffic management. The Gateway API, a successor, addresses these shortcomings by introducing a more granular, role-oriented design and a robust extension mechanism. This guide details a production migration strategy from `ingress-nginx` to an Envoy-based Gateway API implementation, focusing on `Envoy Gateway` or `Cilium Gateway` for their Envoy proxy foundation.
+
+<AudioPlayer src="/static/audio/kubernetes-gateway-api-vs-ingress-nginx-migration.mp3" title="Executive Audio Briefing" voice="Google Cloud en-US-Neural2-F" />
+
+
+## Understanding Gateway API Fundamentals
+
+The Gateway API introduces a hierarchical structure:
+
+1.  **`GatewayClass`**: Defines a class of Gateways, specifying the controller responsible for implementing it (e.g., `envoy-gateway-class`, `cilium-gateway-class`). This is typically managed by infrastructure providers or cluster administrators.
+2.  **`Gateway`**: Represents a specific instance of a load balancer, exposing ports and protocols. It's provisioned by infrastructure operators or platform teams.
+3.  **`HTTPRoute` / `GRPCRoute` / `TLSRoute` / `TCPRoute` / `UDPRoute`**: Define protocol-specific routing rules, attaching to Gateways. These are typically managed by application developers.
+
+This role-oriented design separates concerns: infrastructure teams manage `GatewayClass` and `Gateway` resources, while application teams manage `Route` resources, enabling self-service without direct infrastructure modification.
+
+## Migration Strategy Overview
+
+A phased, zero-downtime migration is critical. The strategy involves:
+
+1.  **Parallel Deployment**: Deploying the Gateway API controller and resources alongside existing `ingress-nginx`.
+2.  **DNS Cutover**: Gradually shifting traffic from the `ingress-nginx` LoadBalancer IP to the Gateway API LoadBalancer IP.
+3.  **Validation**: Thoroughly testing the new path before full cutover.
+4.  **Rollback Plan**: Maintaining `ingress-nginx` until the new system is fully validated.
+
+### Prerequisites
+
+*   A Kubernetes cluster (v1.20+ recommended for Gateway API).
+*   `cert-manager` installed for automated TLS.
+*   `kubectl` and `helm` CLI tools.
+*   Existing `ingress-nginx` deployment.
+
+## Step 1: Deploying the Gateway API Controller
+
+We'll use `Envoy Gateway` as the primary example, but `Cilium Gateway` follows a similar pattern, leveraging Cilium's eBPF data plane.
+
+### Option A: Envoy Gateway Deployment
+
+```yaml
+# gateway-api-crd-install.yaml
+# Install Gateway API CRDs if not already present in your cluster.
+# This is a prerequisite for any Gateway API controller.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gatewayclasses.gateway.networking.k8s.io
+spec:
+  group: gateway.networking.k8s.io
+  names:
+    kind: GatewayClass
+    listKind: GatewayClassList
+    plural: gatewayclasses
+    singular: gatewayclass
+  scope: Cluster
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+      subresources:
+        status: {}
+---
+# ... other Gateway API CRDs (Gateway, HTTPRoute, etc.) ...
+# For brevity, full CRD definitions are omitted.
+# You can find them at https://github.com/kubernetes-sigs/gateway-api/releases
+
+# Install Envoy Gateway via Helm
+# Add the Envoy Gateway Helm repository
+helm repo add envoy-gateway https://envoyproxy.github.io/envoy-gateway/
+helm repo update
+
+# Install Envoy Gateway into the 'envoy-gateway-system' namespace
+helm install envoy-gateway envoy-gateway/envoy-gateway \
+  --create-namespace \
+  --namespace envoy-gateway-system \
+  --version v0.8.0 # Use the latest stable version
+```
+
+Verify the deployment:
+
+```bash
+kubectl get pods -n envoy-gateway-system
+kubectl get gatewayclass
+```
+
+You should see an `EnvoyGateway` pod running and a `GatewayClass` named `eg` (default for Envoy Gateway) or similar.
+
+### Option B: Cilium Gateway Deployment (Alternative)
+
+If you are already using Cilium as your CNI, `Cilium Gateway` offers a highly integrated solution leveraging eBPF.
+
+```yaml
+# Install Cilium with Gateway API support
+helm upgrade --install cilium cilium/cilium \
+  --namespace kube-system \
+  --set gatewayAPI.enabled=true \
+  --set gatewayAPI.nodePort.enabled=true # Or LoadBalancer, depending on your cloud provider
+  # ... other Cilium configurations ...
+```
+
+Verify the deployment:
+
+```bash
+kubectl get pods -n kube-system -l k8s-app=cilium
+kubectl get gatewayclass
+```
+
+You should see a `GatewayClass` named `cilium` or similar.
+
+## Step 2: Defining Gateway and HTTPRoute Resources
+
+This step involves creating the `Gateway` resource, which provisions the external load balancer, and `HTTPRoute` resources to define routing rules.
+
+### Gateway Definition
+
+This `Gateway` resource will provision a cloud LoadBalancer and expose ports 80 and 443.
+
+```yaml
+# gateway.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-app-gateway
+  namespace: default # Or your designated ingress namespace
+spec:
+  gatewayClassName: eg # Use 'eg' for Envoy Gateway, 'cilium' for Cilium Gateway
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All # Allow HTTPRoutes from any namespace to attach
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: my-app-tls-secret # This secret will be provisioned by cert-manager
+      allowedRoutes:
+        namespaces:
+          from: All # Allow HTTPRoutes from any namespace to attach
+```
+
+Apply this: `kubectl apply -f gateway.yaml`
+
+Wait for the `Gateway` to be provisioned. Check its status:
+
+```bash
+kubectl get gateway my-app-gateway -n default -o yaml
+```
+
+Look for `status.addresses` to get the external IP or hostname of the provisioned LoadBalancer. This will be your new entry point.
+
+### Automated TLS with `cert-manager`
+
+Ensure `cert-manager` is installed and configured. We'll use a `Certificate` resource to provision the TLS secret.
+
+```yaml
+# cert-manager-certificate.yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: my-app-tls-certificate
+  namespace: default
+spec:
+  secretName: my-app-tls-secret # Matches the name in Gateway listener
+  dnsNames:
+    - myapp.example.com
+    - www.myapp.example.com
+  issuerRef:
+    name: letsencrypt-prod # Or your preferred ClusterIssuer/Issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+```
+
+Apply this: `kubectl apply -f cert-manager-certificate.yaml`
+
+Verify the secret is created: `kubectl get secret my-app-tls-secret -n default`
+
+### HTTPRoute Definition
+
+Now, define the `HTTPRoute` to direct traffic to your backend service. This example includes path-based routing and weighted traffic splitting for canary deployments.
+
+```yaml
+# httproute.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: my-app-route
+  namespace: default # Namespace where your application service resides
+spec:
+  parentRefs:
+    - name: my-app-gateway # Attach to the Gateway defined above
+      namespace: default
+  hostnames:
+    - "myapp.example.com"
+    - "www.myapp.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/v1/
+      backendRefs:
+        - name: my-app-service-v1 # Existing stable service
+          port: 80
+          weight: 90 # 90% of traffic to v1
+        - name: my-app-service-v2 # New canary service
+          port: 80
+          weight: 10 # 10% of traffic to v2
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: my-app-service-v1 # Default route for all other paths
+          port: 80
+```
+
+Apply this: `kubectl apply -f httproute.yaml`
+
+Ensure your `my-app-service-v1` and `my-app-service-v2` (and their corresponding Deployments) exist in the `default` namespace.
+
+## Step 3: DNS Cutover Strategy
+
+This is the most critical phase for zero-downtime.
+
+1.  **Identify New LoadBalancer IP/Hostname**: Get this from `kubectl get gateway my-app-gateway -n default -o jsonpath='{.status.addresses[0].value}'`.
+2.  **Update DNS Records**:
+    *   **CNAME (Recommended for Cloud LoadBalancers)**: If your Gateway provisions a hostname (e.g., `a123.us-east-1.elb.amazonaws.com`), update your `myapp.example.com` CNAME record to point to this new hostname.
+    *   **A Record**: If your Gateway provisions an IP address, update your `myapp.example.com` A record to point to this new IP.
+3.  **Staged DNS Update (Optional but Recommended)**:
+    *   **Lower TTL**: Before the cutover, reduce the TTL (Time To Live) of your DNS records for `myapp.example.com` to a very low value (e.g., 60 seconds). This ensures changes propagate quickly.
+    *   **Gradual Shift**: If possible, use a DNS provider that supports weighted DNS records (e.g., AWS Route 53 weighted routing policies) to gradually shift traffic from the old `ingress-nginx` IP to the new Gateway API IP. This allows for a controlled, percentage-based cutover.
+    *   **Blue/Green DNS**: A simpler approach is to update the DNS record directly. Due to DNS caching, this will still be a gradual shift for clients.
+
+**Example DNS Update (Conceptual, using `myapp.example.com`):**
+
+```
+# Before migration (pointing to ingress-nginx LB)
+myapp.example.com.  300 IN  A   192.0.2.100
+
+# During migration (after Gateway API LB is ready)
+# Option 1: CNAME (if Gateway provides hostname)
+myapp.example.com.  60  IN  CNAME   a123.us-east-1.elb.amazonaws.com.
+
+# Option 2: A Record (if Gateway provides IP)
+myapp.example.com.  60  IN  A   203.0.113.200
+
+# After full validation, revert TTL to a higher value (e.g., 3600)
+myapp.example.com.  3600 IN CNAME   a123.us-east-1.elb.amazonaws.com.
+```
+
+## Step 4: Validation and Monitoring
+
+Thorough validation is paramount.
+
+1.  **Direct Access**: Test the new Gateway API endpoint directly using its IP/hostname before DNS cutover.
+2.  **Health Checks**: Ensure all backend services are healthy.
+3.  **Application Logs**: Monitor application logs for errors.
+4.  **Metrics**: Compare latency, error rates, and throughput between the old `ingress-nginx` path and the new Gateway API path. Envoy Gateway exposes Prometheus metrics that can be scraped.
+5.  **Canary Testing**: Leverage the weighted traffic split in `HTTPRoute` to gradually expose a small percentage of users to the new path. Monitor closely.
+6.  **End-to-End Tests**: Run your automated E2E test suite against the new endpoint.
+
+## Production Gotchas & Troubleshooting
+
+### 1. `Gateway` Stuck in `Pending` State
+
+*   **Symptom**: `kubectl get gateway my-app-gateway` shows `status.conditions` with `Ready: False` and `message: "Gateway is not ready"`.
+*   **Cause**: The underlying cloud LoadBalancer failed to provision, or the Gateway controller encountered an error.
+*   **Fix**:
+    *   Check controller logs: `kubectl logs -n envoy-gateway-system -l app.kubernetes.io/name=envoy-gateway`. Look for errors related to cloud provider API calls.
+    *   Verify cloud provider quotas: Ensure you have enough LoadBalancer quota.
+    *   Check Kubernetes events: `kubectl describe gateway my-app-gateway`.
+
+### 2. `HTTPRoute` Not Attaching to `Gateway`
+
+*   **Symptom**: `kubectl get httproute my-app-route -o yaml` shows `status.parents` with `conditions` indicating `ResolvedRefs: False` or `Accepted: False`.
+*   **Cause**: Mismatch in `parentRefs` (name, namespace) or `allowedRoutes` configuration on the `Gateway`.
+*   **Fix**:
+    *   Ensure `parentRefs.name` and `parentRefs.namespace` in `HTTPRoute` exactly match the `Gateway`'s name and namespace.
+    *   Verify `Gateway.spec.listeners.allowedRoutes.namespaces.from` is set correctly (e.g., `All` or `Selector` matching the `HTTPRoute`'s namespace).
+    *   Check `Gateway` and `HTTPRoute` events: `kubectl describe gateway my-app-gateway` and `kubectl describe httproute my-app-route`.
+
+### 3. TLS Handshake Errors
+
+*   **Symptom**: Clients report `SSL_PROTOCOL_ERROR` or `certificate_unknown` errors.
+*   **Cause**: Incorrect `certificateRef` in `Gateway`, `cert-manager` failure, or incorrect `tls.mode`.
+*   **Fix**:
+    *   Verify `Gateway.spec.listeners.tls.certificateRefs` points to the correct `Secret` name and namespace.
+    *   Check `cert-manager` `Certificate` and `CertificateRequest` resources: `kubectl get certificate my-app-tls-certificate -n default -o yaml`. Ensure `Ready: True`.
+    *   Inspect `cert-manager` controller logs: `kubectl logs -n cert-manager -l app.kubernetes.io/instance=cert-manager`.
+    *   Ensure `tls.mode` is `Terminate` for edge TLS termination.
+
+### 4. Weighted Traffic Split Not Working
+
+*   **Symptom**: Traffic distribution doesn't match `weight` configuration, or all traffic goes to one backend.
+*   **Cause**: Misconfiguration in `backendRefs` or issues with service discovery.
+*   **Fix**:
+    *   Double-check `HTTPRoute.spec.rules.backendRefs.weight` values. Ensure they sum up correctly if multiple rules apply.
+    *   Verify `backendRefs.name` and `backendRefs.port` correctly point to your Kubernetes `Service` resources.
+    *   Check `Service` and `EndpointSlice` resources for your backend services to ensure they have healthy pods.
+    *   Monitor Envoy Gateway logs for routing errors.
+
+### 5. Performance Degradation After Migration
+
+*   **Symptom**: Increased latency, higher error rates, or reduced throughput.
+*   **Cause**: Resource constraints on the Gateway controller or Envoy proxy pods, misconfigured Envoy proxy settings, or network issues.
+*   **Fix**:
+    *   **Resource Limits**: Increase CPU/memory limits for Envoy Gateway controller and Envoy proxy pods.
+    *   **Envoy Configuration**: For advanced tuning, you might need to customize the `EnvoyProxy` resource (if using Envoy Gateway) to adjust buffer sizes, connection limits, or other Envoy-specific settings.
+    *   **Network Path**: Verify network connectivity and latency between the Gateway LoadBalancer and your backend pods.
+    *   **Metrics**: Use Prometheus/Grafana to monitor Envoy metrics (e.g., `envoy_cluster_upstream_rq_total`, `envoy_server_uptime`).
+
+## Architecture Comparison: Ingress-Nginx vs. Gateway API (Envoy)
+
+| Feature | Ingress-Nginx | Gateway API (Envoy Gateway) |
+|:--------|:--------------|:----------------------------|
+| **API Model** | Ingress, IngressClass | GatewayClass, Gateway, HTTPRoute, etc. |
+| **Role Separation** | Limited (admin manages IngressClass, dev manages Ingress) | Strong (Infra: GatewayClass, Operator: Gateway, Dev: Route) |
+| **Extensibility** | Annotations, Nginx ConfigMaps | Policy Attachment (e.g., `HTTPRouteFilter`), `EnvoyProxy` CRD |
+| **Traffic Splitting** | Annotations (e.g., `nginx.ingress.kubernetes.io/canary`) | First-class `backendRefs.weight` in `HTTPRoute` |
+| **Multi-Cluster** | Not natively supported | Designed for multi-cluster/multi-tenant |
+| **Protocol Support** | HTTP/HTTPS, TCP/UDP (via `externalName` or `stream-snippets`) | HTTP/HTTPS, gRPC, TCP, UDP, TLS (native CRDs) |
+| **Implementation** | Nginx | Envoy Proxy |
+| **TLS Management** | `cert-manager` via Ingress annotations | `cert-manager` via `Gateway.spec.listeners.tls.certificateRefs` |
+
+## Frequently Asked Questions
+
+### 1. Can I run `ingress-nginx` and Gateway API simultaneously?
+
+Yes, this is the recommended approach for a phased migration. They operate independently, each provisioning its own LoadBalancer. You'll manage DNS to direct traffic to one or the other.
+
+### 2. How do I handle advanced Nginx configurations like custom Lua scripts or specific Nginx directives?
+
+For `Envoy Gateway`, you'd typically use the `EnvoyProxy` custom resource to apply advanced Envoy configurations. This allows for direct manipulation of the underlying Envoy proxy's configuration. For `Cilium Gateway`, you'd leverage Cilium's network policies and potentially `CiliumEnvoyConfig` resources for advanced Envoy features. The Gateway API itself focuses on standard routing, while controller-specific CRDs provide extensibility.
+
+### 3. What is the impact on performance when migrating to Gateway API with Envoy?
+
+Envoy is a high-performance proxy, often outperforming Nginx for certain workloads, especially with HTTP/2 and gRPC. The performance impact is generally positive or neutral, assuming adequate resource allocation. The key is proper configuration and resource provisioning for the Envoy Gateway controller and the Envoy proxy pods.
+
+### 4. How does cross-namespace routing work with Gateway API?
+
+The `Gateway.spec.listeners.allowedRoutes` field controls which namespaces are permitted to attach `Route` resources to a specific `Gateway`. You can specify `All`, `Same`, or `Selector` to restrict or allow `Route` attachments, enabling secure multi-tenant environments. For example, `from: All` allows any namespace, while `from: Selector` with a `namespaceSelector` allows only namespaces matching specific labels.
+
+### 5. Is Gateway API production-ready?
+
+Yes, the Gateway API graduated to GA (Generally Available) for `v1` in October 2023. Controllers like `Envoy Gateway` and `Cilium Gateway` are actively developed and used in production environments. It's considered the future of ingress and traffic management in Kubernetes.
