@@ -1,0 +1,312 @@
+---
+title: "WireGuard Site-to-Site Kernel Mesh: Định tuyến mã hóa thông lượng cao & Tối ưu hóa MTU"
+images: ['/static/images/wireguard-kernel-mesh-site-to-site-vpn.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["networking", "linux", "security", "devops", "cloud"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về WireGuard site-to-site kernel mesh: định tuyến mã hóa thông lượng cao và tối ưu hóa MTU với kiến trúc cấp độ sản xuất cùng các ví dụ về mã."
+---
+
+Việc triển khai WireGuard trong nhân cung cấp một giải pháp hiệu suất cao, bảo mật và tinh gọn cho các VPN site-to-site, vượt trội đáng kể so với các triển khai IPsec truyền thống trong nhiều trường hợp. Hướng dẫn này trình bày chi tiết việc xây dựng một mạng lưới kernel WireGuard thông lượng cao, tập trung vào định tuyến khóa mật mã (cryptokey routing), xuyên NAT (NAT traversal), tối ưu hóa MTU và định tuyến nâng cao với `iproute2` và BGP.
+
+<AudioPlayer src="/static/audio/wireguard-kernel-mesh-site-to-site-vpn-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Các nguyên tắc cơ bản của WireGuard: Định tuyến khóa mật mã
+
+WireGuard hoạt động dựa trên nguyên tắc định tuyến khóa mật mã. Không giống như IPsec, thường dựa vào địa chỉ IP để nhận dạng ngang hàng và thực thi chính sách, WireGuard sử dụng khóa công khai. Mỗi peer được nhận dạng bằng khóa công khai của nó, và việc mã hóa/giải mã lưu lượng được liên kết chặt chẽ với khóa này. Điều này đơn giản hóa cấu hình và tăng cường bảo mật bằng cách làm cho danh tính dựa trên mật mã thay vì địa chỉ mạng.
+
+Một giao diện WireGuard, thường được đặt tên là `wg0` hoặc tương tự, hoạt động như một giao diện mạng ảo. Khi một gói tin được gửi đến một địa chỉ IP được cấu hình trong dải `AllowedIPs` của một peer, WireGuard tự động mã hóa nó bằng khóa công khai của peer đó và gửi đến endpoint của peer. Ngược lại, các gói tin được mã hóa đến sẽ được giải mã, và nếu IP nguồn của chúng khớp với dải `AllowedIPs` cho peer gửi, chúng sẽ được chấp nhận.
+
+### Ví dụ cấu hình Peer
+
+Xem xét hai site, `SiteA` và `SiteB`, mỗi site có một gateway WireGuard.
+
+**Gateway SiteA (wg0)**
+*   IP công cộng: `203.0.113.10`
+*   Mạng nội bộ: `10.0.1.0/24`
+*   IP WireGuard: `10.255.255.1/32`
+*   Khóa công khai: `SITEA_PUBLIC_KEY`
+
+**Gateway SiteB (wg0)**
+*   IP công cộng: `198.51.100.20`
+*   Mạng nội bộ: `10.0.2.0/24`
+*   IP WireGuard: `10.255.255.2/32`
+*   Khóa công khai: `SITEB_PUBLIC_KEY`
+
+Cấu hình WireGuard trên gateway của `SiteA` sẽ bao gồm một mục nhập peer cho `SiteB`:
+
+```ini
+# /etc/wireguard/wg0.conf on SiteA Gateway
+[Interface]
+PrivateKey = SITEA_PRIVATE_KEY
+Address = 10.255.255.1/32
+ListenPort = 51820 # Standard WireGuard port
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+[Peer]
+# SiteB Gateway
+PublicKey = SITEB_PUBLIC_KEY
+Endpoint = 198.51.100.20:51820
+AllowedIPs = 10.255.255.2/32, 10.0.2.0/24 # WireGuard IP of SiteB, and SiteB's internal network
+PersistentKeepalive = 25 # Important for NAT traversal
+```
+
+Và trên gateway của `SiteB`, một mục nhập peer cho `SiteA`:
+
+```ini
+# /etc/wireguard/wg0.conf on SiteB Gateway
+[Interface]
+PrivateKey = SITEB_PRIVATE_KEY
+Address = 10.255.255.2/32
+ListenPort = 51820
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+[Peer]
+# SiteA Gateway
+PublicKey = SITEA_PUBLIC_KEY
+Endpoint = 203.0.113.10:51820
+AllowedIPs = 10.255.255.1/32, 10.0.1.0/24 # WireGuard IP of SiteA, and SiteA's internal network
+PersistentKeepalive = 25
+```
+
+Các quy tắc `PostUp`/`PostDown` cho phép chuyển tiếp IP và NAT cho giao diện WireGuard, cho phép các mạng nội bộ giao tiếp qua tunnel. Lưu ý rằng `eth0` nên được thay thế bằng tên giao diện công cộng thực tế.
+
+## Xuyên NAT với Persistent Keepalive
+
+Khi một peer WireGuard nằm sau một thiết bị NAT (ví dụ: bộ định tuyến gia đình hoặc gateway NAT đám mây), ánh xạ NAT có thể hết hạn nếu không có lưu lượng truy cập trong một thời gian dài. Điều này dẫn đến việc mất kết nối cho đến khi lưu lượng được khởi tạo từ phía NAT. `PersistentKeepalive` giải quyết vấn đề này bằng cách gửi một gói tin keepalive nhỏ, được mã hóa đến peer cứ sau `N` giây. Điều này giữ cho ánh xạ NAT tồn tại, đảm bảo kết nối hai chiều. Giá trị `25` giây thường đủ cho hầu hết các thiết bị NAT.
+
+## Tối ưu hóa MTU và MSS Clamping
+
+WireGuard đóng gói các gói IP, thêm tiêu đề riêng của nó (thường là 20 byte cho IPv4, 40 byte cho IPv6) cộng với tiêu đề UDP (8 byte) và tiêu đề IP bên ngoài (20 byte cho IPv4, 40 byte cho IPv6). Chi phí này làm giảm Đơn vị truyền tối đa (MTU) hiệu quả có sẵn cho lưu lượng được đóng gói.
+
+MTU Ethernet tiêu chuẩn là 1500 byte.
+*   Tiêu đề IP bên ngoài: 20 byte
+*   Tiêu đề UDP: 8 byte
+*   Tiêu đề WireGuard: 20 byte (xấp xỉ)
+*   Tổng chi phí: ~48 byte
+
+Do đó, MTU hiệu quả cho gói tin bên trong trở thành `1500 - 48 = 1452` byte. Đặt MTU giao diện WireGuard thành `1452` (hoặc thấp hơn một chút, ví dụ: `1420` để an toàn hoặc nếu có liên quan đến IPv6) ngăn chặn sự phân mảnh của các gói WireGuard *bên ngoài*.
+
+```ini
+# /etc/wireguard/wg0.conf (excerpt)
+[Interface]
+# ...
+MTU = 1420 # Or 1452 if only IPv4 and no other overheads
+# ...
+```
+
+Tuy nhiên, chỉ đặt MTU giao diện WireGuard là không đủ. Các ứng dụng trên mạng nội bộ vẫn có thể gửi các gói lớn hơn `1420` byte, mong đợi mạng cơ bản sẽ xử lý việc phân mảnh. Điều này dẫn đến "lỗ đen khám phá MTU đường dẫn (PMTUD)" nếu các thông báo ICMP Fragmentation Needed bị chặn.
+
+Để giảm thiểu điều này, chúng tôi sử dụng **MSS Clamping**. Kích thước phân đoạn tối đa (MSS) là lượng dữ liệu lớn nhất, được chỉ định bằng byte, mà một máy tính hoặc thiết bị truyền thông có thể nhận trong một phân đoạn TCP duy nhất. MSS clamping sửa đổi các gói TCP SYN để quảng cáo một giá trị MSS nhỏ hơn hoặc bằng MTU hiệu quả của tunnel WireGuard trừ đi kích thước tiêu đề TCP/IP.
+
+Đối với MTU là `1420`:
+*   Tiêu đề IP: 20 byte
+*   Tiêu đề TCP: 20 byte
+*   MSS hiệu quả: `1420 - 20 - 20 = 1380` byte
+
+Điều này đảm bảo rằng các phiên TCP được khởi tạo qua tunnel sẽ đàm phán một MSS ngăn chặn sự phân mảnh trong tunnel.
+
+```bash
+# Add to PostUp section of wg0.conf on both gateways
+# For IPv4
+iptables -A FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380
+# For IPv6 (if applicable)
+ip6tables -A FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380
+```
+
+Các `PostUp`/`PostDown` hoàn chỉnh cho `wg0.conf` sẽ trông như thế này:
+
+```ini
+# /etc/wireguard/wg0.conf (excerpt)
+[Interface]
+# ...
+PostUp = \
+  iptables -A FORWARD -i %i -j ACCEPT; \
+  iptables -A FORWARD -o %i -j ACCEPT; \
+  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; \
+  iptables -A FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380; \
+  ip6tables -A FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380
+PostDown = \
+  iptables -D FORWARD -i %i -j ACCEPT; \
+  iptables -D FORWARD -o %i -j ACCEPT; \
+  iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE; \
+  iptables -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380; \
+  ip6tables -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380
+# ...
+```
+
+Thay thế `eth0` bằng giao diện công cộng thực tế của bạn.
+
+## Định tuyến nâng cao: `iproute2` và BGP với FRRouting
+
+Đối với các thiết lập site-to-site đơn giản, các tuyến tĩnh được định nghĩa trong `AllowedIPs` là đủ. Tuy nhiên, trong một mạng lưới với nhiều site và cấu trúc liên kết mạng động, hoặc khi tích hợp với cơ sở hạ tầng định tuyến hiện có, các giao thức định tuyến động như BGP là rất cần thiết.
+
+### `iproute2` cho các tuyến tĩnh
+
+Đối với các trường hợp BGP là quá mức cần thiết, `iproute2` có thể được sử dụng để quản lý các tuyến. `AllowedIPs` trong WireGuard tự động tạo các tuyến cho các mạng con được chỉ định thông qua giao diện WireGuard. Tuy nhiên, nếu bạn cần định tuyến lưu lượng *từ* giao diện WireGuard *đến* các mạng con nội bộ cụ thể không được kết nối trực tiếp với gateway, bạn sẽ sử dụng `ip route`.
+
+Ví dụ: gateway `SiteA` cần tiếp cận `10.0.3.0/24` thông qua một bộ định tuyến nội bộ `10.0.1.254`.
+
+```bash
+# On SiteA Gateway
+ip route add 10.0.3.0/24 via 10.0.1.254 dev eth1 # Assuming eth1 is internal interface
+```
+
+Điều này nằm ngoài cấu hình WireGuard nhưng rất quan trọng đối với kết nối đầu cuối.
+
+### Định tuyến động với BGP và FRRouting
+
+FRRouting (FRR) là một bộ giao thức định tuyến IP cho các nền tảng Linux và Unix, bao gồm BGP, OSPF, RIP, IS-IS và PIM. Chúng tôi sẽ sử dụng BGP để trao đổi các tuyến động giữa các gateway WireGuard.
+
+**Kiến trúc:**
+1.  Mỗi gateway WireGuard chạy FRR.
+2.  Các phiên BGP được thiết lập qua các IP tunnel WireGuard (ví dụ: `10.255.255.1` và `10.255.255.2`).
+3.  Mỗi gateway quảng bá các mạng nội bộ cục bộ của nó vào BGP.
+
+**Cài đặt (Debian/Ubuntu):**
+
+```bash
+sudo apt update
+sudo apt install frr frr-pythontools
+```
+
+**Cấu hình FRR (`/etc/frr/frr.conf`):**
+
+**Gateway SiteA (`10.255.255.1`):**
+
+```
+!
+hostname SiteA-WG-Gateway
+password zebra
+enable password zebra
+!
+router bgp 64512 # SiteA's ASN
+  bgp router-id 10.255.255.1
+  neighbor 10.255.255.2 remote-as 64513 # SiteB's ASN
+  neighbor 10.255.255.2 update-source wg0 # Use WireGuard interface for BGP session
+  !
+  address-family ipv4 unicast
+    network 10.0.1.0/24 # Advertise SiteA's internal network
+    neighbor 10.255.255.2 activate
+  exit-address-family
+!
+```
+
+**Gateway SiteB (`10.255.255.2`):**
+
+```
+!
+hostname SiteB-WG-Gateway
+password zebra
+enable password zebra
+!
+router bgp 64513 # SiteB's ASN
+  bgp router-id 10.255.255.2
+  neighbor 10.255.255.1 remote-as 64512 # SiteA's ASN
+  neighbor 10.255.255.1 update-source wg0 # Use WireGuard interface for BGP session
+  !
+  address-family ipv4 unicast
+    network 10.0.2.0/24 # Advertise SiteB's internal network
+    neighbor 10.255.255.1 activate
+  exit-address-family
+!
+```
+
+Sau khi cấu hình FRR, khởi động lại dịch vụ: `sudo systemctl restart frr`.
+Xác minh trạng thái BGP bằng cách sử dụng `vtysh`:
+
+```bash
+sudo vtysh
+show ip bgp summary
+show ip route
+```
+
+`AllowedIPs` trong WireGuard phải được cấu hình để cho phép lưu lượng phiên BGP (tức là chính các IP tunnel WireGuard) và các mạng được quảng bá bởi BGP. Nếu `AllowedIPs` chỉ chứa IP tunnel, BGP sẽ thiết lập, nhưng các tuyến cho các mạng nội bộ sẽ không được WireGuard cài đặt.
+
+Một mẫu phổ biến cho BGP qua WireGuard là đặt `AllowedIPs` chỉ thành IP WireGuard của peer (ví dụ: `10.255.255.2/32`). Điều này đảm bảo rằng chỉ lưu lượng BGP (và các lưu lượng mặt phẳng điều khiển khác) sử dụng tunnel WireGuard ban đầu. Sau đó, BGP quảng bá các mạng nội bộ thực tế (ví dụ: `10.0.2.0/24`). Khi FRR nhận được các tuyến này, nó sẽ cài đặt chúng vào bảng định tuyến của kernel, trỏ đến giao diện WireGuard.
+
+**Lưu ý quan trọng về `AllowedIPs` và BGP:**
+Nếu bạn sử dụng BGP, bạn thường muốn `AllowedIPs` ở mức tối thiểu, thường chỉ là IP tunnel WireGuard của peer. Điều này cho phép BGP thiết lập. BGP sau đó quảng bá các mạng nội bộ thực tế. `AllowedIPs` của WireGuard hoạt động như một chính sách định tuyến: nó quy định các dải IP mà WireGuard sẽ *giải mã* và *gửi* lưu lượng. Nếu `AllowedIPs` bao gồm `10.0.2.0/24`, WireGuard sẽ tự động tạo một tuyến cho nó. Nếu BGP cũng cố gắng cài đặt một tuyến cho `10.0.2.0/24` qua `wg0`, nó có thể xung đột hoặc thừa.
+
+Thực hành tốt nhất cho BGP qua WireGuard là:
+1.  Đặt `AllowedIPs` chỉ thành IP WireGuard của peer (ví dụ: `10.255.255.2/32`).
+2.  Đảm bảo `net.ipv4.ip_forward=1` được bật.
+3.  Để BGP xử lý việc quảng bá và cài đặt các tuyến cho các mạng nội bộ. WireGuard sau đó sẽ giải mã lưu lượng cho các mạng này vì chúng được định tuyến qua giao diện `wg0`, ngay cả khi không được chỉ định rõ ràng trong `AllowedIPs`.
+
+Thiết lập này cho phép cập nhật tuyến động mà không cần cấu hình lại WireGuard.
+
+## So sánh hiệu suất: WireGuard so với IPsec
+
+Thiết kế của WireGuard, đặc biệt là việc triển khai trong không gian kernel và bắt tay mật mã đơn giản hơn, thường mang lại thông lượng cao hơn đáng kể và độ trễ thấp hơn so với IPsec.
+
+| Tính năng | WireGuard (Kernel) | IPsec (StrongSwan/Libreswan) |
+|---|---|---|
+| **Hiệu suất** | Tuyệt vời (gần tốc độ đường truyền gốc) | Tốt (tốn CPU, chuyển đổi ngữ cảnh) |
+| **Độ phức tạp** | Thấp (cấu hình tối thiểu, giao thức đơn giản) | Cao (IKEv1/v2, ESP/AH, cấu hình phức tạp) |
+| **Bảo mật** | Mật mã hiện đại (ChaCha20, Poly1305) | Phạm vi rộng (AES, 3DES, SHA, MD5) |
+| **Xuyên NAT** | Tích hợp `PersistentKeepalive` | Yêu cầu NAT-T, có thể gặp vấn đề |
+| **Kích thước mã nguồn** | ~4.000 dòng | ~400.000 dòng |
+| **Xử lý MTU** | `MTU` thủ công và `MSS` clamping | PMTUD thường được dựa vào, có thể thất bại |
+| **Định tuyến** | `AllowedIPs` (tĩnh), BGP qua tunnel | Dựa trên chính sách (SPD/SAD), BGP qua tunnel |
+| **Tích hợp Kernel** | Module kernel gốc | Daemon không gian người dùng + module kernel |
+
+**So sánh thông lượng (Liên kết 10Gbps khái niệm):**
+
+Trên một liên kết 10Gbps với CPU hiện đại, WireGuard thường có thể đạt được 8-9 Gbps thông lượng được mã hóa. IPsec, tùy thuộc vào bộ mã hóa và CPU, có thể gặp khó khăn để vượt quá 3-5 Gbps mà không có tăng tốc phần cứng chuyên dụng. Việc triển khai trong không gian kernel của WireGuard giảm thiểu chi phí chuyển đổi ngữ cảnh, vốn là một nút thắt cổ chai hiệu suất lớn đối với các giải pháp VPN không gian người dùng.
+
+## Những vấn đề và cách khắc phục trong sản xuất
+
+1.  **Lỗi cấu hình `AllowedIPs`:**
+    *   **Triệu chứng:** Các phiên BGP không thiết lập, hoặc các mạng nội bộ không thể truy cập được.
+    *   **Vấn đề:** `AllowedIPs` trên một peer phải bao gồm IP WireGuard của peer để phiên BGP hình thành. Nếu bạn đang sử dụng BGP cho các mạng nội bộ, `AllowedIPs` *không nên* bao gồm các mạng nội bộ đó trên peer, mà chỉ IP tunnel. Nếu không, WireGuard sẽ cài đặt các tuyến tĩnh có thể xung đột với các tuyến được học từ BGP hoặc ngăn BGP cài đặt các tuyến riêng của nó.
+    *   **Khắc phục:** Đối với BGP, đặt `AllowedIPs = <PEER_WG_IP>/32`. Đảm bảo `net.ipv4.ip_forward=1` được bật.
+    *   **Xác minh:** `wg show wg0 dump` để xem cấu hình peer hiện tại và `ip route show table main` để kiểm tra các mục nhập bảng định tuyến.
+
+2.  **Sự cố MTU/MSS Clamping (Lỗ đen PMTUD):**
+    *   **Triệu chứng:** Truyền tệp lớn bị kẹt, kết nối SSH bị treo sau khi xác thực, một số trang web không tải được. `ping -M do -s 1472 <remote_host>` thất bại.
+    *   **Vấn đề:** Các gói tin đang bị phân mảnh, và các thông báo ICMP Fragmentation Needed bị chặn, hoặc MSS quá lớn.
+    *   **Khắc phục:** Đảm bảo `MTU` được đặt chính xác trên giao diện WireGuard (ví dụ: `1420`). Triển khai `TCPMSS` clamping trên script `PostUp` cho cả IPv4 và IPv6. Xác minh các quy tắc `iptables` đang hoạt động.
+    *   **Xác minh:** `iptables -t mangle -nvL FORWARD`. Sử dụng `tcpdump -i wg0 -n -s0 port 51820` để kiểm tra kích thước gói tin.
+
+3.  **Lỗi xuyên NAT:**
+    *   **Triệu chứng:** Mất kết nối sau khi không hoạt động, chỉ khôi phục khi lưu lượng được khởi tạo từ phía NAT.
+    *   **Vấn đề:** Ánh xạ của thiết bị NAT hết hạn.
+    *   **Khắc phục:** Đặt `PersistentKeepalive = 25` (hoặc tương tự) trong phần `[Peer]` cho các peer phía sau NAT.
+    *   **Xác minh:** `wg show wg0 latest-handshakes`. Nếu `latest-handshakes` đang cập nhật thường xuyên, keepalive đang hoạt động.
+
+4.  **Quy tắc tường lửa:**
+    *   **Triệu chứng:** Không có kết nối, ngay cả khi các peer WireGuard hiển thị bắt tay.
+    *   **Vấn đề:** Tường lửa (ví dụ: `ufw`, `firewalld`, `iptables`) chặn cổng UDP 51820 hoặc chặn lưu lượng được chuyển tiếp.
+    *   **Khắc phục:** Cho phép lưu lượng UDP trên cổng nghe của WireGuard. Đảm bảo các quy tắc chuỗi `FORWARD` cho phép lưu lượng giữa giao diện WireGuard và các giao diện nội bộ/bên ngoài.
+    *   **Xác minh:** `sudo iptables -nvL` hoặc `sudo ufw status verbose`.
+
+5.  **Chuyển tiếp IP bị tắt:**
+    *   **Triệu chứng:** Tunnel WireGuard thiết lập, nhưng các máy chủ trên mạng nội bộ không thể tiếp cận nhau.
+    *   **Vấn đề:** Chuyển tiếp IP của Kernel bị tắt.
+    *   **Khắc phục:** Bật `net.ipv4.ip_forward = 1` và `net.ipv6.conf.all.forwarding = 1` (nếu sử dụng IPv6) trong `/etc/sysctl.conf` và áp dụng với `sudo sysctl -p`.
+    *   **Xác minh:** `sysctl net.ipv4.ip_forward`.
+
+## Các câu hỏi thường gặp
+
+1.  **Tại sao WireGuard nhanh hơn IPsec?**
+    Lợi thế về hiệu suất của WireGuard xuất phát từ một số yếu tố: thiết kế tối giản, các thuật toán mật mã hiện đại (ChaCha20/Poly1305) được tối ưu hóa cho tốc độ, và việc triển khai gốc trong không gian kernel. Điều này giảm thiểu việc chuyển đổi ngữ cảnh giữa không gian người dùng và kernel, giảm chi phí mật mã, và đơn giản hóa máy trạng thái, dẫn đến thông lượng cao hơn và độ trễ thấp hơn.
+
+2.  **Tôi có thể chạy WireGuard trên hệ thống không phải Linux không?**
+    Có. WireGuard có các client chính thức cho macOS, Windows, Android và iOS. Mặc dù module kernel là dành riêng cho Linux, các client này sử dụng các triển khai trong không gian người dùng hoặc các tiện ích mở rộng mạng dành riêng cho hệ điều hành cung cấp chức năng tương tự, mặc dù có thể có các đặc tính hiệu suất khác so với module kernel Linux gốc.
+
+3.  **Làm cách nào để mở rộng một mạng lưới WireGuard ra nhiều site?**
+    Đối với một số lượng nhỏ các site (ví dụ: <10), một mạng lưới đầy đủ trong đó mỗi gateway kết nối với mọi gateway khác là có thể quản lý được. Đối với các triển khai lớn hơn, hãy xem xét mô hình hub-and-spoke với các gateway WireGuard trung tâm, hoặc tận dụng các giao thức định tuyến động như BGP qua các tunnel WireGuard. Mỗi gateway sẽ kết nối với một bộ định tuyến BGP trung tâm (hoặc các gateway khác) qua giao diện WireGuard của nó, quảng bá các mạng con cục bộ của nó. Điều này tránh các cấu hình peer `N^2`.
+
+4.  **Điều gì sẽ xảy ra nếu IP công cộng của tôi thay đổi (dynamic DNS)?**
+    Nếu `Endpoint` của một peer là một IP động, WireGuard có thể phân giải tên máy chủ DNS. Nếu IP thay đổi, WireGuard cuối cùng sẽ phân giải lại tên DNS. Tuy nhiên, `PersistentKeepalive` từ phía *khác* là rất quan trọng. Nếu peer có IP động nằm sau NAT, `PersistentKeepalive` của nó sẽ giữ cho ánh xạ NAT của nó tồn tại và thông báo cho phía bên kia về IP công cộng hiện tại của nó. Nếu peer có IP động *không* nằm sau NAT, nhưng IP của nó thay đổi, peer kia cuối cùng sẽ cập nhật endpoint của nó sau khi một bắt tay mới được khởi tạo. Để cập nhật endpoint động mạnh mẽ, hãy xem xét sử dụng một script tùy chỉnh cập nhật `Endpoint` qua `wg set` khi IP thay đổi, hoặc dựa vào `PersistentKeepalive` từ phía bên kia.
+
+5.  **Có an toàn không khi để cổng UDP của WireGuard tiếp xúc với internet?**
+    Có, WireGuard được thiết kế để an toàn ngay cả khi cổng UDP của nó tiếp xúc. Giao thức của nó có khả năng chống lại các cuộc tấn công phổ biến như quét cổng và từ chối dịch vụ. Nó chỉ phản hồi các gói tin được xác thực đúng cách, và các gói tin không được xác thực sẽ bị loại bỏ một cách im lặng. Hành vi "loại bỏ im lặng" này khiến kẻ tấn công khó xác định liệu một endpoint WireGuard có đang hoạt động hay không.

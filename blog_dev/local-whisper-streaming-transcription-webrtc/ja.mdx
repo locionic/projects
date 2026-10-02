@@ -1,0 +1,521 @@
+---
+title: "リアルタイム音声AI: RustでWebRTCとWebSocketを使ったWhisperのストリーミング転写"
+images: ['/static/images/local-whisper-streaming-transcription-webrtc.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["ai", "audio", "rust", "webrtc", "systems"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "本ガイドでは、RustでWebRTCとWebSocketを使ったWhisperのストリーミング転写によるリアルタイム音声AIについて、本番環境レベルのアーキテクチャとコード例を交えて解説します。"
+---
+
+このガイドでは、200ミリ秒未満のリアルタイム音声文字起こしパイプラインの構築について詳しく説明します。WebRTCとWebSocketを介したクライアント音声取り込み、音声チャンク化、Rust Cバインディングを使用したWhisper推論、Silero VAD、および部分的な音声テキスト変換トークンのストリーミングについて説明します。
+
+<AudioPlayer src="/static/audio/local-whisper-streaming-transcription-webrtc-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+### アーキテクチャの概要
+
+このシステムは、クライアント側のWebRTC/WebSocketインターフェースとRustベースのバックエンドで構成されています。クライアントは音声をキャプチャ、エンコードし、サーバーに送信します。サーバーは、Rustのパフォーマンス特性と`whisper.cpp`のCバインディングを活用し、量子化されたWhisperモデルを使用して音声をデコード、処理、文字起こしします。推論を最適化するために、音声活動検出（VAD）が統合されています。
+
+```mermaid
+graph TD
+    A[Client Browser] -->|WebRTC/WebSocket (Audio Stream)| B(Rust Backend)
+    B -->|Audio Chunking (16kHz PCM)| C{Audio Buffer}
+    C -->|VAD (Silero)| D{Voice Activity Detected?}
+    D -- No --> C
+    D -- Yes --> E(Whisper Inference - whisper.cpp)
+    E -->|Partial/Final Tokens| F[WebSocket (Transcription Stream)]
+    F --> A
+```
+
+### クライアント側の音声キャプチャと送信
+
+クライアントの音声キャプチャは、WebRTCの`MediaDevices.getUserMedia()`および`MediaRecorder` APIを介して処理されるか、よりきめ細かな処理制御のために`AudioContext`を介して直接処理されます。リアルタイムで低遅延のストリーミングには、生のオーディオバッファを送信するためにWebSocketが推奨されます。WebRTCはピアツーピア機能と組み込みのメディア処理を提供しますが、サーバー中心の文字起こしサービスの場合、オーディオデータ用のWebSocket接続の方が管理とスケーリングが容易なことがよくあります。
+
+生のPCMデータをキャプチャし、16kHzにリサンプリングしてWebSocket経由で送信するために、`AudioContext`を使用します。
+
+```typescript
+// client/src/audioStreamer.ts
+export class AudioStreamer {
+  private audioContext: AudioContext | null = null;
+  private mediaStream: MediaStream | null = null;
+  private audioInput: MediaStreamAudioSourceNode | null = null;
+  private processor: AudioWorkletNode | ScriptProcessorNode | null = null;
+  private ws: WebSocket | null = null;
+  private readonly sampleRate = 16000; // Target sample rate for Whisper
+  private readonly bufferSize = 4096; // Audio buffer size for processing
+
+  constructor(private websocketUrl: string) {}
+
+  public async start(): Promise<void> {
+    if (this.audioContext) {
+      console.warn("AudioStreamer already started.");
+      return;
+    }
+
+    this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({
+      sampleRate: this.sampleRate,
+    });
+
+    try {
+      this.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      this.audioInput = this.audioContext.createMediaStreamSource(this.mediaStream);
+
+      // Use AudioWorklet for better performance and off-main-thread processing
+      // Fallback to ScriptProcessorNode if AudioWorklet is not available
+      if (this.audioContext.audioWorklet) {
+        await this.audioContext.audioWorklet.addModule('/audio-processor.js');
+        this.processor = new AudioWorkletNode(this.audioContext, 'audio-processor');
+      } else {
+        console.warn("AudioWorklet not supported, falling back to ScriptProcessorNode.");
+        this.processor = this.audioContext.createScriptProcessor(this.bufferSize, 1, 1);
+        (this.processor as ScriptProcessorNode).onaudioprocess = this.handleAudioProcess.bind(this);
+      }
+
+      this.audioInput.connect(this.processor);
+      this.processor.connect(this.audioContext.destination); // Connect to destination to keep it alive
+
+      this.ws = new WebSocket(this.websocketUrl);
+      this.ws.binaryType = 'arraybuffer';
+
+      this.ws.onopen = () => console.log('WebSocket connected.');
+      this.ws.onclose = () => console.log('WebSocket disconnected.');
+      this.ws.onerror = (error) => console.error('WebSocket error:', error);
+
+      if (this.processor instanceof AudioWorkletNode) {
+        this.processor.port.onmessage = (event) => {
+          if (this.ws?.readyState === WebSocket.OPEN) {
+            this.ws.send(event.data); // Send raw PCM float32 data
+          }
+        };
+      }
+
+    } catch (error) {
+      console.error('Error starting audio stream:', error);
+      this.stop();
+      throw error;
+    }
+  }
+
+  private handleAudioProcess(event: AudioProcessingEvent): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      const inputBuffer = event.inputBuffer.getChannelData(0);
+      this.ws.send(inputBuffer.buffer); // Send raw PCM float32 data
+    }
+  }
+
+  public stop(): void {
+    if (this.processor) {
+      this.processor.disconnect();
+      this.processor = null;
+    }
+    if (this.audioInput) {
+      this.audioInput.disconnect();
+      this.audioInput = null;
+    }
+    if (this.mediaStream) {
+      this.mediaStream.getTracks().forEach(track => track.stop());
+      this.mediaStream = null;
+    }
+    if (this.audioContext) {
+      this.audioContext.close();
+      this.audioContext = null;
+    }
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    console.log('AudioStreamer stopped.');
+  }
+}
+
+// client/public/audio-processor.js (AudioWorklet module)
+// This file needs to be served by your web server
+class AudioProcessor extends AudioWorkletProcessor {
+  process(inputs, outputs, parameters) {
+    const input = inputs[0];
+    if (input.length > 0) {
+      const channelData = input[0]; // Get the first channel (mono)
+      this.port.postMessage(channelData.buffer, [channelData.buffer]); // Transfer ownership
+    }
+    return true; // Keep the processor alive
+  }
+}
+registerProcessor('audio-processor', AudioProcessor);
+```
+
+### Rustバックエンド：WebSockets、オーディオ処理、推論
+
+Rustバックエンドでは、非同期操作に`tokio`、WebSocketサーバーに`warp`または`axum`、WAVエンコーディング（デバッグ/ストレージに必要な場合）に`hound`を使用します。Whisperには`whisper-rs`（`whisper.cpp`のRustバインディング）を、VADには`silero-vad`を使用します。
+
+#### 依存関係
+
+```toml
+# Cargo.toml
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+warp = "0.3" # Or axum = { version = "0.6", features = ["ws"] }
+futures-util = "0.3"
+bytes = "1"
+log = "0.4"
+env_logger = "0.10"
+# For whisper.cpp bindings
+whisper-rs = { version = "0.1.1", features = ["full"] } # Ensure whisper.cpp is built with GGML_CUDA=1 if using GPU
+# For VAD
+silero-vad = "0.1.0" # Or a custom VAD implementation
+# For audio processing
+symphonia = { version = "0.5", features = ["all"] } # For potential audio decoding/resampling if not 16kHz PCM
+# For serialization/deserialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+```
+
+#### バックエンドの構造
+
+コアロジックは次のとおりです。
+1.  **WebSocketサーバー**: クライアント接続を受け入れ、受信オーディオフレームを処理します。
+2.  **オーディオバッファ管理**: 受信オーディオフレームをVADとWhisperに適したより大きなバッファに蓄積します。
+3.  **VAD**: Whisper推論をトリガーするために音声セグメントを検出します。
+4.  **Whisper推論**: 検出された音声を文字起こしします。
+5.  **結果ストリーミング**: 部分的および最終的な文字起こし結果をクライアントにストリーミングで返します。
+
+```rust
+// src/main.rs
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use futures_util::{StreamExt, SinkExt};
+use warp::ws::{Message, WebSocket};
+use warp::Filter;
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::time::{Instant, Duration};
+
+// --- Whisper and VAD related imports ---
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use silero_vad::{Vad, VadNode};
+
+const SAMPLE_RATE: u32 = 16000;
+const WHISPER_MODEL_PATH: &str = "path/to/ggml-medium.en.bin"; // Path to your quantized Whisper model
+const VAD_MODEL_PATH: &str = "path/to/silero_vad.onnx"; // Path to your Silero VAD ONNX model
+
+// Audio buffer for a single client
+struct ClientAudioBuffer {
+    buffer: VecDeque<f32>,
+    last_audio_activity: Instant,
+    is_speaking: bool,
+}
+
+impl ClientAudioBuffer {
+    fn new() -> Self {
+        ClientAudioBuffer {
+            buffer: VecDeque::new(),
+            last_audio_activity: Instant::now(),
+            is_speaking: false,
+        }
+    }
+
+    fn push_audio(&mut self, audio_data: &[f32]) {
+        self.buffer.extend(audio_data);
+        self.last_audio_activity = Instant::now();
+    }
+
+    fn get_audio_chunk(&mut self, duration_ms: u64) -> Option<Vec<f32>> {
+        let samples_needed = (SAMPLE_RATE as f32 * duration_ms as f32 / 1000.0) as usize;
+        if self.buffer.len() >= samples_needed {
+            let chunk: Vec<f32> = self.buffer.drain(0..samples_needed).collect();
+            Some(chunk)
+        } else {
+            None
+        }
+    }
+
+    fn clear_buffer(&mut self) {
+        self.buffer.clear();
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    env_logger::init();
+
+    // Load Whisper model once
+    let whisper_context = Arc::new(
+        WhisperContext::new_with_params(
+            WHISPER_MODEL_PATH,
+            WhisperContextParameters::default(),
+        )
+        .expect("Failed to load Whisper model"),
+    );
+    log::info!("Whisper model loaded: {}", WHISPER_MODEL_PATH);
+
+    // Load VAD model once
+    let vad_model = Arc::new(
+        Vad::builder()
+            .set_model_path(VAD_MODEL_PATH)
+            .set_sample_rate(SAMPLE_RATE)
+            .build()
+            .expect("Failed to load Silero VAD model"),
+    );
+    log::info!("Silero VAD model loaded: {}", VAD_MODEL_PATH);
+
+
+    let whisper_context_filter = warp::any().map(move || Arc::clone(&whisper_context));
+    let vad_model_filter = warp::any().map(move || Arc::clone(&vad_model));
+
+    let ws_route = warp::path("ws")
+        .and(warp::ws())
+        .and(whisper_context_filter)
+        .and(vad_model_filter)
+        .map(|ws: warp::ws::Ws, whisper_ctx: Arc<WhisperContext>, vad_model: Arc<Vad>| {
+            ws.on_upgrade(move |websocket| handle_websocket(websocket, whisper_ctx, vad_model))
+        });
+
+    let routes = ws_route.with(warp::log("websocket_server"));
+
+    log::info!("Server started on 127.0.0.1:8080");
+    warp::serve(routes).run(([127, 0, 0, 1], 8080)).await;
+}
+
+async fn handle_websocket(
+    websocket: WebSocket,
+    whisper_ctx: Arc<WhisperContext>,
+    vad_model: Arc<Vad>,
+) {
+    let (mut client_ws_tx, mut client_ws_rx) = websocket.split();
+
+    let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(100); // Channel for raw audio chunks
+    let (transcription_tx, mut transcription_rx) = mpsc::channel::<String>(10); // Channel for transcription results
+
+    // Spawn a task to send transcription results back to the client
+    tokio::spawn(async move {
+        while let Some(transcription) = transcription_rx.recv().await {
+            if let Err(e) = client_ws_tx.send(Message::text(transcription)).await {
+                log::error!("Failed to send transcription to client: {}", e);
+                break;
+            }
+        }
+        log::info!("Transcription sender task terminated.");
+    });
+
+    // Spawn a task to process audio and run VAD/Whisper
+    let whisper_ctx_clone = Arc::clone(&whisper_ctx);
+    let vad_model_clone = Arc::clone(&vad_model);
+    tokio::spawn(async move {
+        let mut client_audio_buffer = ClientAudioBuffer::new();
+        let mut vad_node = VadNode::new(vad_model_clone, SAMPLE_RATE, 512); // VAD processing frame size
+
+        let mut current_speech_buffer: Vec<f32> = Vec::new();
+        let mut last_vad_activity = Instant::now();
+        let vad_timeout = Duration::from_secs(2); // How long to wait after speech ends before transcribing
+
+        let mut whisper_session = whisper_ctx_clone.create_state().expect("Failed to create Whisper state");
+
+        while let Some(audio_chunk) = audio_rx.recv().await {
+            client_audio_buffer.push_audio(&audio_chunk);
+
+            // Process audio in smaller VAD-friendly chunks
+            while let Some(vad_chunk) = client_audio_buffer.get_audio_chunk(30) { // 30ms chunks for VAD
+                let speech_prob = vad_node.process(&vad_chunk).expect("VAD processing failed");
+
+                if speech_prob > 0.5 { // Threshold for speech detection
+                    current_speech_buffer.extend(vad_chunk);
+                    last_vad_activity = Instant::now();
+                    client_audio_buffer.is_speaking = true;
+                } else {
+                    // If not speaking, but we were recently, check for timeout
+                    if client_audio_buffer.is_speaking && last_vad_activity.elapsed() > vad_timeout {
+                        // Speech has ended, transcribe the accumulated buffer
+                        if !current_speech_buffer.is_empty() {
+                            log::info!("Speech ended, transcribing {} samples.", current_speech_buffer.len());
+                            let transcription = run_whisper_inference(
+                                &whisper_ctx_clone,
+                                &mut whisper_session,
+                                &current_speech_buffer,
+                            );
+                            if let Err(e) = transcription_tx.send(transcription).await {
+                                log::error!("Failed to send final transcription: {}", e);
+                            }
+                            current_speech_buffer.clear();
+                        }
+                        client_audio_buffer.is_speaking = false;
+                    } else if client_audio_buffer.is_speaking {
+                        // Still within timeout, keep accumulating non-speech for context
+                        current_speech_buffer.extend(vad_chunk);
+                    }
+                }
+            }
+
+            // Periodically transcribe partial results if speaking
+            if client_audio_buffer.is_speaking && current_speech_buffer.len() > (SAMPLE_RATE as usize * 1) { // Transcribe every 1 second of speech
+                let partial_transcription = run_whisper_inference(
+                    &whisper_ctx_clone,
+                    &mut whisper_session,
+                    &current_speech_buffer,
+                );
+                if let Err(e) = transcription_tx.send(format!("[partial] {}", partial_transcription)).await {
+                    log::error!("Failed to send partial transcription: {}", e);
+                }
+            }
+        }
+        // Handle any remaining speech in buffer when audio stream ends
+        if !current_speech_buffer.is_empty() {
+            log::info!("Stream ended, transcribing remaining {} samples.", current_speech_buffer.len());
+            let transcription = run_whisper_inference(
+                &whisper_ctx_clone,
+                &mut whisper_session,
+                &current_speech_buffer,
+            );
+            if let Err(e) = transcription_tx.send(transcription).await {
+                log::error!("Failed to send final transcription on stream end: {}", e);
+            }
+        }
+        log::info!("Audio processor task terminated.");
+    });
+
+    // Receive audio data from client
+    while let Some(result) = client_ws_rx.next().await {
+        match result {
+            Ok(msg) => {
+                if msg.is_binary() {
+                    let audio_bytes = msg.as_bytes();
+                    // Assuming client sends f32 raw PCM
+                    let audio_data: Vec<f32> = audio_bytes
+                        .chunks_exact(4)
+                        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                        .collect();
+
+                    if let Err(e) = audio_tx.send(audio_data).await {
+                        log::error!("Failed to send audio chunk to processor: {}", e);
+                        break;
+                    }
+                } else if msg.is_text() {
+                    log::debug!("Received text message from client: {}", msg.to_str().unwrap_or_default());
+                    // Handle control messages if any
+                }
+            }
+            Err(e) => {
+                log::error!("WebSocket receive error: {}", e);
+                break;
+            }
+        }
+    }
+    log::info!("Client WebSocket disconnected.");
+}
+
+fn run_whisper_inference(
+    ctx: &WhisperContext,
+    state: &mut whisper_rs::WhisperState,
+    audio_data: &[f32],
+) -> String {
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_print_progress(false);
+    params.set_print_special(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_language(Some("en"));
+    params.set_n_threads(4); // Adjust based on CPU cores
+
+    // Run the inference
+    state.full(params, audio_data).expect("Failed to run Whisper inference");
+
+    // Iterate over the segments and collect the text
+    let mut result = String::new();
+    let num_segments = state.full_n_segments().expect("Failed to get number of segments");
+    for i in 0..num_segments {
+        let text = state.full_get_segment_text(i).expect("Failed to get segment text");
+        result.push_str(&text);
+    }
+    result.trim().to_string()
+}
+```
+
+### パフォーマンスに関する考慮事項とトレードオフ
+
+| 機能/メトリック | WebRTCデータチャネル | WebSocket (生のPCM) | `whisper.cpp` (量子化) | Silero VAD |
+|---|---|---|---|---|
+| **レイテンシ** | 低 (P2P) | 低 (クライアント-サーバー) | 中 (モデルサイズ/CPU/GPUに依存) | 非常に低い |
+| **スループット** | 高 | 高 | N/A (推論時間) | N/A (推論時間) |
+| **複雑さ** | 高 (ICE, SDP, NAT) | 中 (サーバー-クライアント) | 中 (Cバインディング, モデル管理) | 低 (ONNXランタイム) |
+| **オーディオ品質** | 交渉済み (Opus) | 生 (設定可能) | 入力: 16kHz PCM | 入力: 16kHz PCM |
+| **CPU使用率** | 低 (クライアント側エンコーディング) | 低 (クライアント側エンコーディング) | 高 (CPU/GPU推論) | 低 |
+| **ネットワークオーバーヘッド** | 高い (プロトコル) | 低い (生データ) | N/A | N/A |
+| **スケーラビリティ** | 困難 (P2P) | 容易 (ロードバランシング) | 垂直スケーリング (GPU) | 水平スケーリング (インスタンスの増加) |
+| **デプロイ** | 複雑 | シンプル | モデルファイルが必要 | ONNXモデルが必要 |
+
+**レイテンシの内訳:**
+*   **クライアントオーディオキャプチャとエンコーディング**: 約10-30ms (ブラウザバッファ、`AudioContext`処理)。
+*   **ネットワークレイテンシ (クライアントからサーバー)**: 約10-100ms (ネットワーク状況に依存)。
+*   **サーバーオーディオバッファリング**: 約30-100ms (VAD/Whisperに十分なオーディオを蓄積するため)。
+*   **VAD処理**: チャンクあたり約5-10ms。
+*   **Whisper推論**: 約50-500ms (モデルサイズ、ハードウェア、オーディオチャンク長に依存)。200ms未満の場合、これがクリティカルパスです。高性能なCPUまたはGPUで`ggml-tiny.en`または`ggml-base.en`を使用することが不可欠です。
+*   **ネットワークレイテンシ (サーバーからクライアント)**: 約10-100ms。
+*   **クライアントレンダリング**: 約10ms。
+
+エンドツーエンドで200ms未満のレイテンシを達成するには、積極的なチャンク化、高速なVAD、および高度に最適化されたWhisper推論（例：強力なCPUまたはGPUでの`ggml-tiny.en`）が必要です。
+
+### 本番環境での落とし穴とトラブルシューティング
+
+1.  **Whisperモデルの読み込み失敗**:
+    *   **症状**: `Failed to load Whisper model`または`whisper_init_from_file: failed to open`
+    *   **原因**: `ggml-*.bin`モデルファイルへのパスが間違っている、ファイル権限の問題、またはモデルが破損している。
+    *   **修正**: `WHISPER_MODEL_PATH`を再確認してください。Rustプロセスに読み取りアクセス権があることを確認してください。破損している場合はモデルを再ダウンロードしてください。`whisper-rs`が互換性のある`whisper.cpp`バージョンに対してビルドされていることを確認してください。
+2.  **VADモデルの読み込み失敗**:
+    *   **症状**: `Failed to load Silero VAD model`
+    *   **原因**: `silero_vad.onnx`へのパスが間違っている、ONNXランタイムの依存関係が不足している、またはONNXモデルのバージョンが互換性がない。
+    *   **修正**: `VAD_MODEL_PATH`を確認してください。`silero-vad`がそれに依存している場合（通常は最小バージョンをバンドルしています）、`onnxruntime`が正しくインストールされ、リンクされていることを確認してください。
+3.  **オーディオリサンプリング/フォーマットの不一致**:
+    *   **症状**: 文字起こしが文字化けする、文字起こしされない、または`whisper_full: invalid audio length`エラーが発生する。
+    *   **原因**: クライアントが期待される（16kHz、f32）とは異なるサンプルレートまたはフォーマット（例：48kHz、int16）で音声を送信している。
+    *   **修正**: クライアントの`AudioContext`が16kHzに設定されていることを確認してください。サーバーでの`f32`変換を確認してください。クライアントが`int16`を送信する場合は、サーバーで`f32`に変換してください。
+        ```rust
+        // Example: converting i16 to f32
+        fn convert_i16_to_f32(audio_data_i16: &[i16]) -> Vec<f32> {
+            audio_data_i16.iter().map(|&s| s as f32 / 32768.0).collect()
+        }
+        ```
+4.  **高レイテンシ / 遅い文字起こし**:
+    *   **症状**: 文字起こしが著しく遅延しているように見える。
+    *   **原因**: Whisperに送信されるオーディオチャンクが大きい、CPU/GPUが遅い、Whisperモデルが大きい（`ggml-large`）、Whisperのスレッドが不足している、またはVADが十分に早く推論をトリガーしない。
+    *   **修正**:
+        *   より小さいWhisperモデル（`ggml-tiny.en`、`ggml-base.en`）を使用する。
+        *   Whisperの`params.set_n_threads()`を増やす（物理コア数まで）。
+        *   VADパラメータ（`vad_timeout`、`get_audio_chunk`サイズ）を最適化して、推論をより速くトリガーする。
+        *   GPUが利用可能で`whisper-rs`がそれを使用するように設定されている場合、`whisper.cpp`がGPUサポート（例：`GGML_CUDA=1`）でコンパイルされていることを確認する。
+5.  **WebSocket切断**:
+    *   **症状**: クライアントまたはサーバーのログに頻繁なWebSocketクローズイベントが表示される。
+    *   **原因**: ネットワークの不安定性、サーバーの過負荷、WebSocketハンドラでの未処理のエラー、または`destination`に接続されていない場合のクライアント側の`AudioContext`がガベージコレクションされる。
+    *   **修正**: クライアント側の再接続ロジックを実装する。サーバー側のエラー処理が堅牢であることを確認する。`AudioContext`を`destination`に接続したままにするか、`GainNode`を`destination`に接続して、それが破棄されないようにする。WebSocketハートビート（ping/pong）を実装して、切断された接続を検出する。
+6.  **メモリリーク**:
+    *   **症状**: サーバーのメモリ使用量が時間とともに着実に増加する。
+    *   **原因**: オーディオバッファがクリアされていない、Whisperの`WhisperState`が適切に管理されていない、または`VecDeque`が際限なく増加している。
+    *   **修正**: 適切なタイミングで`ClientAudioBuffer.clear_buffer()`が呼び出されることを確認する。`whisper-rs` `WhisperState`はセッションごとに再利用する必要がある。`VecDeque`のサイズを監視し、必要に応じて制限を実装する。
+
+### よくある質問
+
+1.  **オーディオストリーミングにWebRTCではなくWebSocketを使用する理由は何ですか？**
+    WebRTCはピアツーピア機能と組み込みのメディア処理を提供しますが、サーバー中心の文字起こしサービスの場合、WebSocketはアーキテクチャを簡素化することがよくあります。WebRTCのシグナリング、ICEネゴシエーション、NATトラバーサルは、かなりの複雑さを加えます。WebSocketは、生のオーディオバッファを中央サーバーに直接送信して処理するための全二重、低遅延チャネルを提供し、水平スケーリングが容易です。
+
+2.  **エンドツーエンドで200ms未満のレイテンシを達成するにはどうすればよいですか？**
+    これは困難な課題です。主な戦略は次のとおりです。
+    *   **クライアント側**: 小さなオーディオチャンク（例：30-50ms）をキャプチャしてすぐに送信します。
+    *   **ネットワーク**: ネットワークレイテンシを最小限に抑えます（例：サーバーをユーザーの地理的に近い場所にデプロイします）。
+    *   **サーバー側**:
+        *   高度に最適化された量子化Whisperモデル（例：`ggml-tiny.en`または`ggml-base.en`）を使用します。
+        *   利用可能な場合は、Whisper推論にGPUアクセラレーションを活用します。
+        *   積極的なVADを採用して、音声セグメントのみを文字起こしし、Whisper呼び出しを最小限に抑えます。
+        *   VAD用に小さな固定サイズのチャンクでオーディオを処理し、その後Whisper用に蓄積します。
+        *   Rustのパフォーマンスと`whisper.cpp`のCバインディングを利用して、オーバーヘッドを最小限に抑えます。
+        *   部分的な結果は、利用可能になり次第ストリーミングします。
+
+3.  **精度を向上させるために、より大きなWhisperモデルを使用できますか？**
+    はい、できますが、レイテンシが増加します。`ggml-medium.en`や`ggml-large.en`のような大きなモデルは、より高い精度を提供しますが、推論にははるかに多くの計算リソースと時間が必要です。厳密なレイテンシ要件を持つリアルタイムアプリケーションの場合、より小さなモデルがしばしば必要な妥協点となります。リアルタイムの部分的な結果にはより小さなモデルを使用し、精度が最優先される場合は最終的な後処理された文字起こしにはより大きなモデルを使用することを検討してください。
+
+4.  **VADは文字起こしパイプラインをどのように改善しますか？**
+    音声活動検出（VAD）は、リアルタイムパフォーマンスとリソース効率にとって非常に重要です。オーディオストリーム内の音声セグメントを識別し、Whisperモデルが関連するオーディオのみを処理できるようにします。これにより、Whisper推論の呼び出し回数が減り、CPU/GPUサイクルが節約され、無音やバックグラウンドノイズの文字起こしが防止され、より高速でクリーンな結果が得られます。また、連続した音声を意味のある発話にセグメント化するのにも役立ちます。
+
+5.  **クライアントオーディオが16kHz PCMでない場合はどうなりますか？**
+    Whisperモデルは16kHzモノラルPCM `f32`オーディオを期待しています。クライアントが異なるフォーマット（例：48kHz、ステレオ、`int16`）でオーディオを送信する場合、クライアント側またはサーバー側のいずれかでリサンプリングと変換を行う必要があります。クライアント側でこれを行うと（`AudioContext`の`sampleRate`プロパティを使用）、サーバーの負荷が軽減されます。サーバー側で行う場合、`symphonia`や`rubato`のようなライブラリがリサンプリングとフォーマット変換を効率的に処理できます。

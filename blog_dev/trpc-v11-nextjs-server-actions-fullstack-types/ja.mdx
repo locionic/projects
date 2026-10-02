@@ -1,0 +1,529 @@
+---
+title: "Next.js 15とtRPC v11: エンドツーエンドの型安全性、Server Actions、TanStack Query v5"
+images: ['/static/images/trpc-v11-nextjs-server-actions-fullstack-types.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["typescript", "nextjs", "trpc", "react", "frontend"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Intermediate"
+programmingLanguage: "TypeScript"
+summary: "Next.js 15とtRPC v11を組み合わせた、エンドツーエンドの型安全性、Server Actions、TanStack Query v5を網羅する、本番環境レベルのアーキテクチャとコード例を含む包括的なガイドです。"
+---
+
+tRPC v11は、Next.js 15のApp RouterおよびServer Actionsと組み合わせることで、フルスタックのTypeScriptアプリケーションを構築するための堅牢なフレームワークを提供します。このガイドでは、tRPCを活用した型安全なAPIインタラクション、特定のミューテーションパターンにServer Actionsを統合する方法、そしてTanStack Query v5によるデータフェッチングのオーケストレーションというアーキテクチャアプローチを詳述します。目標は、ProtobufやGraphQLのようなスキーマ生成ツールのオーバーヘッドなしに、コンパイル時エンドツーエンドの型安全性を実現することです。
+
+<AudioPlayer src="/static/audio/trpc-v11-nextjs-server-actions-fullstack-types-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+## アーキテクチャの概要
+
+提案するアーキテクチャは、tRPCのRPCスタイルのAPIとNext.js Server Actionsを組み合わせたものです。tRPCは、複雑なデータフェッチング、リアルタイム更新（サブスクリプション経由ですが、ここでは詳しく触れません）、および汎用的なミューテーションを処理します。Server Actionsは、シンプルなミューテーションでの楽観的UI更新、フォーム送信、および完全なAPIラウンドトリップなしに直接サーバーサイドでデータを操作することが有益なシナリオで利用されます。TanStack Query v5は、クライアントサイドのキャッシュ、再検証、同期を管理します。
+
+### コアコンポーネント
+
+1.  **tRPCサーバー**: Next.js APIルート（例: `app/api/trpc/[trpc]/route.ts`）内で定義され、型安全なプロシージャを公開します。
+2.  **tRPCクライアント**: Reactコンポーネント用に設定され、TanStack Queryと統合されます。
+3.  **Next.js Server Actions**: クライアントコンポーネントから直接サーバーサイドで実行される`use server`とマークされた関数。
+4.  **TanStack Query v5**: クライアントサイドのデータフェッチングおよびキャッシュ層。
+5.  **Zod**: tRPC入力およびServer Actionペイロードのスキーマ検証。
+
+### アーキテクチャの比較: tRPC vs. Server Actions
+
+| 機能 | tRPCプロシージャ | Next.js Server Actions |
+|---|---|---|
+| **呼び出し** | HTTP (POST/GET)、RPCスタイル | 直接関数呼び出し (RPCライク) |
+| **型安全性** | エンドツーエンド、コンパイル時 | エンドツーエンド、コンパイル時 |
+| **バッチ処理** | 自動 (HTTP) | ネイティブなバッチ処理なし |
+| **キャッシュ** | TanStack Query | React Cache, `revalidatePath`, `revalidateTag` |
+| **エラーハンドリング** | 標準HTTPエラー、tRPCトランスフォーマー | クライアント上の`try/catch`, `useFormStatus` |
+| **ミドルウェア** | 組み込み (認証、レート制限) | カスタムラッパー, `next/cache` |
+| **ユースケース** | 複雑なクエリ、ミューテーション、サブスクリプション、汎用API | フォーム送信、楽観的更新、シンプルなミューテーション |
+| **ネットワーク** | HTTPリクエスト/レスポンス | HTTP経由のシリアライズされた関数呼び出し |
+
+## tRPCサーバーのセットアップ
+
+tRPCサーバーは`app/api/trpc/[trpc]/route.ts`で定義されます。このファイルは、すべてのtRPCリクエストのエントリポイントとして機能します。
+
+```typescript filename="src/server/trpc.ts"
+// src/server/trpc.ts
+import { initTRPC, TRPCError } from '@trpc/server';
+import { ZodError } from 'zod';
+import superjson from 'superjson';
+import { type NextRequest } from 'next/server';
+
+interface CreateContextOptions {
+  headers: Headers;
+  // Add any other context properties you need, e.g., session
+  userId?: string;
+}
+
+/**
+ * This is the actual context you'll use in your router. It will be used to process every request
+ * that goes through your tRPC router.
+ */
+export const createTRPCContext = async (opts: CreateContextOptions) => {
+  // Simulate authentication or session retrieval
+  const userId = opts.headers.get('x-user-id') || undefined; // Example: get from header
+  return {
+    headers: opts.headers,
+    userId,
+  };
+};
+
+/**
+ * Initializer for tRPC.
+ * @see https://trpc.io/docs/v11/server/initialization
+ */
+const t = initTRPC.context<typeof createTRPCContext>().transformer(superjson).create({
+  errorFormatter({ shape, error }) {
+    return {
+      ...shape,
+      data: {
+        ...shape.data,
+        zodError:
+          error.code === 'BAD_REQUEST' && error.cause instanceof ZodError
+            ? error.cause.flatten()
+            : null,
+      },
+    };
+  },
+});
+
+/**
+ * Reusable middleware that enforces users are logged in.
+ */
+const enforceUserIsAuthed = t.middleware(({ ctx, next }) => {
+  if (!ctx.userId) {
+    throw new TRPCError({ code: 'UNAUTHORIZED' });
+  }
+  return next({
+    ctx: {
+      // Infers a new type for the context with `userId` now being non-nullable
+      userId: ctx.userId,
+    },
+  });
+});
+
+/**
+ * Export reusable router and procedure helpers
+ */
+export const createTRPCRouter = t.router;
+export const publicProcedure = t.procedure;
+export const protectedProcedure = t.procedure.use(enforceUserIsAuthed);
+```
+
+```typescript filename="src/server/routers/_app.ts"
+// src/server/routers/_app.ts
+import { z } from 'zod';
+import { createTRPCRouter, publicProcedure, protectedProcedure } from '../trpc';
+
+// Example: Simulate a database
+const posts: { id: string; title: string; content: string; authorId: string }[] = [];
+
+export const appRouter = createTRPCRouter({
+  post: createTRPCRouter({
+    getById: publicProcedure
+      .input(z.object({ id: z.string() }))
+      .query(({ input }) => {
+        const post = posts.find(p => p.id === input.id);
+        if (!post) {
+          throw new TRPCError({ code: 'NOT_FOUND', message: 'Post not found' });
+        }
+        return post;
+      }),
+    create: protectedProcedure
+      .input(z.object({ title: z.string().min(1), content: z.string().min(1) }))
+      .mutation(({ input, ctx }) => {
+        const newPost = {
+          id: Math.random().toString(36).substring(2, 9),
+          title: input.title,
+          content: input.content,
+          authorId: ctx.userId, // userId is guaranteed to be present by protectedProcedure
+        };
+        posts.push(newPost);
+        return newPost;
+      }),
+    getAll: publicProcedure
+      .query(() => {
+        return posts;
+      }),
+  }),
+  user: createTRPCRouter({
+    getProfile: protectedProcedure
+      .query(({ ctx }) => {
+        // In a real app, fetch user profile from DB using ctx.userId
+        return { id: ctx.userId, name: `User ${ctx.userId}` };
+      }),
+  }),
+});
+
+// Export type definition of API
+export type AppRouter = typeof appRouter;
+```
+
+```typescript filename="src/app/api/trpc/[trpc]/route.ts"
+// src/app/api/trpc/[trpc]/route.ts
+import { fetchRequestHandler } from '@trpc/server/adapters/fetch';
+import { appRouter } from '@/server/routers/_app';
+import { createTRPCContext } from '@/server/trpc';
+import { type NextRequest } from 'next/server';
+
+/**
+ * This wraps the `createTRPCContext` helper and provides the required context for the tRPC API when
+ * handling a HTTP request (e.g., when you make requests from the client).
+ */
+const createContext = async (req: NextRequest) => {
+  return createTRPCContext({
+    headers: req.headers,
+  });
+};
+
+const handler = (req: NextRequest) =>
+  fetchRequestHandler({
+    endpoint: '/api/trpc',
+    req,
+    router: appRouter,
+    createContext: () => createContext(req),
+    onError({ error, path }) {
+      console.error(`❌ tRPC failed on ${path ?? '<no-path>'}: ${error.message}`);
+    },
+  });
+
+export { handler as GET, handler as POST };
+```
+
+## TanStack Query v5を使用したtRPCクライアントのセットアップ
+
+クライアントのセットアップには、tRPCクライアントインスタンスの作成と、TanStack Queryの`QueryClientProvider`との統合が含まれます。ハイドレーションは、サーバーサイドレンダリング（SSR）または静的サイト生成（SSG）ページにとって非常に重要です。
+
+```typescript filename="src/trpc/react.tsx"
+// src/trpc/react.tsx
+'use client';
+
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { httpBatchLink, loggerLink } from '@trpc/client';
+import { createTRPCReact } from '@trpc/react-query';
+import { useState } from 'react';
+import superjson from 'superjson';
+
+import { type AppRouter } from '@/server/routers/_app';
+
+const createQueryClient = () => new QueryClient({
+  defaultOptions: {
+    queries: {
+      // With SSR, we usually want to set some default staleTime
+      // above 0 to avoid refetching on first mount.
+      staleTime: 60 * 1000,
+    },
+  },
+});
+
+let clientQueryClient: QueryClient | undefined = undefined;
+const getQueryClient = () => {
+  if (typeof window === 'undefined') {
+    // Server: always make a new query client
+    return createQueryClient();
+  } else {
+    // Browser: make a new query client if we don't already have one
+    // This is to make sure we use the same query client across the entire browser session
+    return (clientQueryClient ??= createQueryClient());
+  }
+};
+
+export const api = createTRPCReact<AppRouter>();
+
+export function TRPCReactProvider(props: { children: React.ReactNode }) {
+  const queryClient = getQueryClient();
+
+  const [trpcClient] = useState(() =>
+    api.createClient({
+      links: [
+        loggerLink({
+          enabled: (op) =>
+            process.env.NODE_ENV === 'development' ||
+            (op.direction === 'down' && op.result instanceof Error),
+        }),
+        httpBatchLink({
+          url: '/api/trpc', // Relative path for Next.js API routes
+          transformer: superjson,
+        }),
+      ],
+    }),
+  );
+
+  return (
+    <QueryClientProvider client={queryClient}>
+      <api.Provider client={trpcClient} queryClient={queryClient}>
+        {props.children}
+      </api.Provider>
+    </QueryClientProvider>
+  );
+}
+```
+
+```typescript filename="src/app/layout.tsx"
+// src/app/layout.tsx
+import { TRPCReactProvider } from '@/trpc/react';
+import './globals.css';
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en">
+      <body>
+        <TRPCReactProvider>{children}</TRPCReactProvider>
+      </body>
+    </html>
+  );
+}
+```
+
+## Server Actionsの統合
+
+Server Actionsは、特にフォームや楽観的更新において、直接的なサーバーインタラクションから恩恵を受けるミューテーションに使用できます。
+
+```typescript filename="src/app/actions.ts"
+// src/app/actions.ts
+'use server';
+
+import { z } from 'zod';
+import { revalidatePath } from 'next/cache';
+import { redirect } from 'next/navigation';
+
+// Simulate a database for Server Actions
+const serverActionPosts: { id: string; title: string; content: string }[] = [];
+
+const createPostSchema = z.object({
+  title: z.string().min(1, 'Title is required'),
+  content: z.string().min(1, 'Content is required'),
+});
+
+export async function createPostAction(prevState: any, formData: FormData) {
+  const rawFormData = {
+    title: formData.get('title'),
+    content: formData.get('content'),
+  };
+
+  const validatedFields = createPostSchema.safeParse(rawFormData);
+
+  if (!validatedFields.success) {
+    return {
+      errors: validatedFields.error.flatten().fieldErrors,
+      message: 'Failed to create post.',
+    };
+  }
+
+  const { title, content } = validatedFields.data;
+
+  // Simulate DB operation
+  const newPost = {
+    id: Math.random().toString(36).substring(2, 9),
+    title,
+    content,
+  };
+  serverActionPosts.push(newPost);
+
+  // Revalidate paths to show new data
+  revalidatePath('/server-actions-posts');
+  redirect('/server-actions-posts'); // Redirect after successful creation
+
+  return { message: 'Post created successfully.' };
+}
+
+export async function getPostsAction() {
+  // Simulate fetching posts
+  return serverActionPosts;
+}
+```
+
+## ハイブリッドなデータフェッチングとミューテーション
+
+tRPCとServer Actionsの組み合わせ。
+
+```typescript filename="src/app/page.tsx"
+// src/app/page.tsx
+import { api } from '@/trpc/react';
+import { createPostAction, getPostsAction } from './actions';
+import { PostForm } from './post-form'; // A client component for the form
+
+export default async function HomePage() {
+  // Fetch posts using tRPC on the server (SSR)
+  const trpcPosts = await api.ssr.post.getAll.fetch();
+
+  // Fetch posts using Server Action on the server (SSR)
+  const serverActionPosts = await getPostsAction();
+
+  return (
+    <main className="p-4">
+      <h1 className="text-2xl font-bold mb-4">Full-Stack Type Safety with tRPC & Server Actions</h1>
+
+      <section className="mb-8">
+        <h2 className="text-xl font-semibold mb-2">tRPC Posts (SSR)</h2>
+        <ul className="list-disc pl-5">
+          {trpcPosts.map((post) => (
+            <li key={post.id}>
+              <strong>{post.title}</strong> by {post.authorId}
+              <p className="text-sm text-gray-600">{post.content}</p>
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <section className="mb-8">
+        <h2 className="text-xl font-semibold mb-2">Server Action Posts (SSR)</h2>
+        <ul className="list-disc pl-5">
+          {serverActionPosts.map((post) => (
+            <li key={post.id}>
+              <strong>{post.title}</strong>
+              <p className="text-sm text-gray-600">{post.content}</p>
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <section className="mb-8">
+        <h2 className="text-xl font-semibold mb-2">Create Post (tRPC Mutation - Client)</h2>
+        <CreateTRPCPostForm />
+      </section>
+
+      <section>
+        <h2 className="text-xl font-semibold mb-2">Create Post (Server Action - Client)</h2>
+        <PostForm /> {/* This component uses `useFormState` and `createPostAction` */}
+      </section>
+    </main>
+  );
+}
+
+// Client component for tRPC mutation
+function CreateTRPCPostForm() {
+  const createPost = api.post.create.useMutation({
+    onSuccess: () => {
+      // Invalidate cache to refetch all posts after successful creation
+      api.post.getAll.invalidate();
+      alert('tRPC Post created!');
+    },
+    onError: (error) => {
+      alert(`Error creating tRPC post: ${error.message}`);
+    },
+  });
+
+  const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const formData = new FormData(e.currentTarget);
+    const title = formData.get('title') as string;
+    const content = formData.get('content') as string;
+    createPost.mutate({ title, content });
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="space-y-4">
+      <div>
+        <label htmlFor="trpc-title" className="block text-sm font-medium text-gray-700">Title</label>
+        <input type="text" id="trpc-title" name="title" required className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2" />
+      </div>
+      <div>
+        <label htmlFor="trpc-content" className="block text-sm font-medium text-gray-700">Content</label>
+        <textarea id="trpc-content" name="content" required className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"></textarea>
+      </div>
+      <button type="submit" disabled={createPost.isLoading} className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50">
+        {createPost.isLoading ? 'Creating...' : 'Create tRPC Post'}
+      </button>
+    </form>
+  );
+}
+```
+
+```typescript filename="src/app/post-form.tsx"
+// src/app/post-form.tsx
+'use client';
+
+import { useFormState, useFormStatus } from 'react-dom';
+import { createPostAction } from './actions';
+
+const initialState = {
+  message: '',
+  errors: undefined,
+};
+
+export function PostForm() {
+  const [state, formAction] = useFormState(createPostAction, initialState);
+  const { pending } = useFormStatus();
+
+  return (
+    <form action={formAction} className="space-y-4">
+      <div>
+        <label htmlFor="sa-title" className="block text-sm font-medium text-gray-700">Title</label>
+        <input type="text" id="sa-title" name="title" required className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2" />
+        {state.errors?.title && (
+          <p className="text-red-500 text-xs mt-1">{state.errors.title.join(', ')}</p>
+        )}
+      </div>
+      <div>
+        <label htmlFor="sa-content" className="block text-sm font-medium text-gray-700">Content</label>
+        <textarea id="sa-content" name="content" required className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"></textarea>
+        {state.errors?.content && (
+          <p className="text-red-500 text-xs mt-1">{state.errors.content.join(', ')}</p>
+        )}
+      </div>
+      <button type="submit" disabled={pending} className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 disabled:opacity-50">
+        {pending ? 'Creating...' : 'Create Server Action Post'}
+      </button>
+      {state.message && <p className="mt-2 text-sm text-green-600">{state.message}</p>}
+    </form>
+  );
+}
+```
+
+## 本番環境での注意点とトラブルシューティング
+
+1.  **`superjson`でのシリアライゼーションエラー**:
+    *   **問題**: クライアントとサーバー間で複雑なオブジェクト（例: `Date`, `Map`, `Set`）を渡す際に、「Cannot stringify arbitrary non-POJOs」や「Cannot deserialize value」のようなエラーに遭遇する可能性があります。
+    *   **原因**: tRPCはデフォルトで`superjson`を使用しますが、クライアントとサーバーの両方で設定を忘れた場合、またはServer Actionが非シリアライズ可能なオブジェクトを直接渡そうとした場合に問題が発生します。
+    *   **解決策**: サーバーの`initTRPC`とクライアントの`httpBatchLink`で`superjson`が設定されていることを確認してください。Server Actionsの場合、複雑な型を明示的にシリアライズ/デシリアライズするか、プレーンなJavaScriptオブジェクトであることを確認してください。
+
+2.  **サーバーサイド（SSR/RSC）での`TRPCClientError`**:
+    *   **問題**: サーバーコンポーネント（例: `await api.ssr.post.getAll.fetch()`）でtRPCデータをフェッチする際に、`TRPCClientError`やネットワーク関連のエラーが発生する可能性があります。
+    *   **原因**: SSR用に設定されたtRPCクライアントは、外部リクエストを行う場合は完全なURLを知っている必要があります。または、内部APIルートの場合は相対パスを使用するように設定する必要があります。
+    *   **解決策**: 内部APIルートの場合、`httpBatchLink`のURLが`/api/trpc`であることを確認してください。Vercelのような環境にデプロイする場合、`VERCEL_URL`環境変数を使用して外部呼び出しの完全なURLを構築できますが、Next.js内の内部呼び出しでは相対パスが推奨されます。`createTRPCReact`のセットアップは、サーバーとクライアント用に別々の`getQueryClient`を提供することでこれを処理します。
+
+3.  **Server ActionsによるNext.jsキャッシュの無効化**:
+    *   **問題**: Server Actionがデータを変更した後、クライアントサイドのコンポーネントがすぐに変更を反映しない、または`revalidatePath` / `revalidateTag`が機能しないように見える。
+    *   **原因**: `revalidatePath`と`revalidateTag`は、サーバーコンポーネントの**Next.jsデータキャッシュ**のみを無効化します。TanStack Queryのクライアントサイドキャッシュは自動的に無効化されません。
+    *   **解決策**: Server ActionがtRPC/TanStack Queryによってもフェッチされるデータを変更する場合、Server Actionの完了後にクライアントで関連するTanStack Queryキーを手動で無効化する必要があります。これは、Server Actionの状態を監視するクライアントサイドの`useEffect`で`queryClient.invalidateQueries()`を呼び出すか、無効化を行うtRPCミューテーションを実行することで可能です。
+
+4.  **tRPCミドルウェアでの認証コンテキスト**:
+    *   **問題**: ユーザーがログインしているにもかかわらず、`protectedProcedure`の`ctx.userId`が`undefined`である。
+    *   **原因**: `createTRPCContext`関数が、受信リクエストから認証情報を正しく抽出していない。
+    *   **解決策**: `createTRPCContext`が認証トークン（例: `Authorization`ヘッダー、クッキーから）を正しく読み取り、コンテキストに設定していることを確認してください。Next.js App Routerの場合、サーバーコンテキストの`next/headers`から`cookies().get('token')`を介してクッキーにアクセスできます。
+
+5.  **Zod検証エラーが伝播しない**:
+    *   **問題**: Server ActionsまたはtRPCを使用するクライアントサイドのフォームが、詳細な検証エラーを表示しない。
+    *   **原因**: tRPCのエラーフォーマッターまたはServer Actionsのエラーハンドリングが、詳細なZodエラーを返すように構造化されていない。
+    *   **解決策**: tRPCの場合、`initTRPC`の`errorFormatter`が`ZodError`の詳細を抽出していることを確認してください。Server Actionsの場合、示されているように`safeParse`を返し、`validatedFields.error.flatten().fieldErrors`を返すのが正しいアプローチです。その後、クライアントコンポーネントはこれらのエラーをレンダリングする必要があります。
+
+## よくある質問
+
+### 1. Next.js Server Actionsが型安全性を提供するのに、なぜtRPCを使用するのですか？
+
+tRPCとServer Actionsは、一部重複するものの、異なるニーズに対応します。tRPCは、自動バッチ処理、サブスクリプション、認証、ロギング、レート制限のための堅牢なミドルウェアシステムなどの機能を備えた本格的なRPCレイヤーを提供します。複雑なデータフェッチング、リアルタイム更新、および一般的なAPIインタラクションに最適です。Server Actionsは、フォーム送信、楽観的UI更新、および完全なAPIレイヤーが過剰になる可能性のある直接的なサーバーサイドミューテーションに優れています。型安全性は共通の利点ですが、tRPCのエコシステム（TanStack Query統合、トランスフォーマー）は、複雑なデータ管理においてより成熟しています。
+
+### 2. この設定で認証と認可をどのように処理しますか？
+
+tRPCの場合、ユーザーを識別するためにヘッダーまたはクッキーを解析することで、`createTRPCContext`に認証を実装します。次に、tRPCミドルウェア（例: `enforceUserIsAuthed`）を使用してプロシージャを保護します。Server Actionsの場合、認証はアクション自体の中で処理する必要があり、通常は`next/headers`ユーティリティを使用してクッキーまたはセッションデータを読み取ります。認可（ユーザーがアクションを実行する権限を持っているかどうかの確認）は、認証後、tRPCプロシージャとServer Actionsの両方で行う必要があります。
+
+### 3. サーバーコンポーネントでtRPCクエリを使用できますか？
+
+はい、`app/page.tsx`で示されているように可能です。サーバーコンポーネントで`await api.ssr.yourProcedure.fetch()`を直接使用できます。これにより、サーバー上で直接関数呼び出しが実行され、内部呼び出しの場合はHTTPをバイパスし、完全な型安全性が提供されます。これはSSR/SSGにとって強力な機能です。
+
+### 4. tRPCとServer Actions間で共有型を管理する最良の方法は何ですか？
+
+ZodスキーマとTypeScript型を共有ディレクトリ（例: `src/schemas`または`src/types`）に定義します。tRPC入力バリデーターとServer Actionペイロードバリデーターの両方がこれらのスキーマをインポートして使用できるため、アプリケーション全体で一貫性と型安全性が確保されます。
+
+### 5. Server ActionsとTanStack Queryで楽観的更新を実装するにはどうすればよいですか？
+
+Server ActionsはTanStack Queryの楽観的更新と直接統合されていませんが、それらを組み合わせることはできます。Server Actionがトリガーされたとき、Server Actionが完了する*前に*`queryClient.setQueryData`を使用してTanStack Queryキャッシュを手動で更新できます。Server Actionが失敗した場合は、キャッシュを元に戻すことができます。Server Actionが成功した後、通常は`queryClient.invalidateQueries()`を呼び出してデータを再フェッチし、一貫性を確保します。これにはクライアントサイドでの慎重なオーケストレーションが必要です。

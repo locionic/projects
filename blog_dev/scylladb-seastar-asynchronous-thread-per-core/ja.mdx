@@ -1,0 +1,322 @@
+---
+title: "ScyllaDBとSeastarのアーキテクチャ：スレッドパーコア実行、Shared-Nothing C++、P99レイテンシ"
+images: ['/static/images/scylladb-seastar-asynchronous-thread-per-core.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["database", "scylladb", "cassandra", "c++", "performance"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "ScyllaDBとSeastarのアーキテクチャ、スレッドパーコア実行、Shared-Nothing C++、P99レイテンシを、本番環境レベルのアーキテクチャとコード例で網羅的に解説するガイドです。"
+---
+
+ScyllaDBは、Apache CassandraおよびAmazon DynamoDB APIと互換性のある、高性能なNoSQL分散データベースです。そのアーキテクチャの独自性は、基盤となるC++非同期エンジンであるSeastarに由来します。このドキュメントでは、ScyllaDBの核となるアーキテクチャの原則である、スレッド・パー・コア実行、共有なし設計、NUMAアウェアネス、ユーザー空間I/Oスケジューリングを分析し、これらの原則がどのように連携して、極端な負荷下でも予測可能なサブミリ秒のP99レイテンシーを実現しているかを明らかにします。
+
+<AudioPlayer src="/static/audio/scylladb-seastar-asynchronous-thread-per-core-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+## Seastarエンジン：共有なし、スレッド・パー・コアモデル
+
+Apache Cassandraを含む従来のデータベースシステムは、多くの場合、スレッドプールがリクエストを処理するマルチスレッドアーキテクチャに依存しています。これらのスレッドは共有リソース（ロック、キャッシュ）を巡って競合し、オペレーティングシステムスケジューラの介入を受けるため、コンテキストスイッチングのオーバーヘッドや予測不能なレイテンシーの急増を引き起こします。さらに、CassandraのようなJVMベースのシステムは、ガベージコレクション（GC）の一時停止を導入し、P99レイテンシーに大きな影響を与える可能性があります。
+
+ScyllaDBを支える非同期C++フレームワークであるSeastarは、このモデルを根本的に再構築しています。それは「共有なし、スレッド・パー・コア」という実行パラダイムを採用しています。
+
+### スレッド・パー・コア実行
+
+Seastarでは、各CPUコアに専用のSeastarスレッド（「シャード」または「リアクター」とも呼ばれる）が割り当てられます。このスレッドはそのコアに固定され、イベントループを実行します。そのコアによって処理されるすべてのデータとロジックは、そのコアにローカルです。コア間で共有されるメモリや共有データ構造はなく、同時アクセスにロックやアトミック操作を必要としません。
+
+この設計により、以下が排除されます。
+1.  **コンテキストスイッチングのオーバーヘッド:** OSスケジューラは、アプリケーションレベルのスケジューリングではほとんどバイパスされます。各コアのスレッドは継続的に実行され、ローカルキューからのイベントを処理します。
+2.  **ロック競合:** 共有可能な可変状態がないため、コア間のデータアクセスにおいてミューテックス、セマフォ、その他の同期プリミティブはほとんど不要となり、並行処理が簡素化され、スループットが向上します。
+3.  **キャッシュ無効化:** データ局所性が最大化されます。コアは主に自身のL1/L2/L3キャッシュにあるデータを操作するため、キャッシュミスやコア間キャッシュコヒーレンシトラフィックが削減されます。
+
+### 共有なしアーキテクチャ
+
+「共有なし」の原則は、CPUコアだけでなく、他のリソースにも及びます。各Seastarスレッドは、独自の以下を管理します。
+*   **メモリプール:** NUMAアウェアなメモリ割り当てにより、コアがアクセスするメモリは、そのコアにローカルなNUMAノードから割り当てられることが保証されます。
+*   **ネットワークスタック:** Seastarは、DPDK（Data Plane Development Kit）やXDP（eXpress Data Path）などの技術を使用してカーネルのネットワークスタックをバイパスし、ネットワークインターフェースカード（NIC）に直接アクセスできます。これにより、各コアが独自のネットワークI/Oを処理できるようになり、カーネルのオーバーヘッドが削減され、パケット処理速度が向上します。
+*   **ディスクI/Oキュー:** 各コアは独自のディスクI/Oリクエストキューを管理し、Linux AIOや`io_uring`のような非同期I/Oメカニズムを活用します。
+
+リクエストが到着すると、通常はパーティションキーに基づいて特定のコアにハッシュされます。そのコアは、ネットワーク入力からディスクI/O、そして戻るまで、リクエストをエンドツーエンドで処理します。データが明示的に転送される必要がある場合（例：メッセージパッシングを介して処理されるクロスシャードクエリ）を除き、他のコアは関与しません。
+
+### 非同期プログラミングモデル
+
+Seastarは、Futureベースの非同期プログラミングモデルを採用しています。従来ブロックする可能性のある操作（例：ディスクI/O、ネットワークI/O）は、すぐに`future<T>`オブジェクトを返します。Seastarイベントループは、I/O操作が完了するまで、他の準備ができたタスクをスケジューリングします。I/Oが完了すると、対応するFutureが「履行」され、その継続（コールバックまたはチェーンされた操作）が同じコアで実行されるようにスケジューリングされます。
+
+この単一スレッド・パー・コア内での協調的マルチタスクは、OSコンテキストスイッチのオーバーヘッドを回避しつつ、高い並行性を可能にします。
+
+```cpp
+// Example: Seastar asynchronous I/O
+#include <seastar/core/app-template.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/file.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/thread.hh> // For seastar::thread
+
+// Function to write data asynchronously to a file
+seastar::future<> write_to_file(const seastar::sstring& filename, const seastar::sstring& data) {
+    // Open the file asynchronously. O_CREAT | O_TRUNC | O_WRONLY are standard flags.
+    // 0644 is file permissions.
+    return seastar::open_file_dma(filename, seastar::open_flags::rw_create | seastar::open_flags::truncate).then([data](seastar::file f) {
+        // Allocate a DMA-aligned buffer for efficient I/O
+        auto buffer = seastar::temporary_buffer<char>::aligned(4096, data.size());
+        std::copy(data.begin(), data.end(), buffer.begin());
+
+        // Write the buffer to the file asynchronously
+        return f.dma_write(buffer.get(), 0, buffer.size()).then([f = std::move(f), buffer = std::move(buffer)] (size_t bytes_written) {
+            std::cout << "Wrote " << bytes_written << " bytes to " << f.get_path() << std::endl;
+            // Close the file asynchronously
+            return f.close();
+        });
+    }).handle_exception([](std::exception_ptr ep) {
+        // Handle any exceptions during file operations
+        std::cerr << "Error writing to file: " << seastar::current_exception_better_what(ep) << std::endl;
+        return seastar::make_exception_future<>(ep);
+    });
+}
+
+// Function to read data asynchronously from a file
+seastar::future<seastar::sstring> read_from_file(const seastar::sstring& filename) {
+    return seastar::open_file_dma(filename, seastar::open_flags::ro).then([filename](seastar::file f) {
+        // Get file size to allocate buffer
+        return f.size().then([f = std::move(f), filename](uint64_t size) mutable {
+            auto buffer = seastar::temporary_buffer<char>::aligned(4096, size);
+            // Read into the buffer asynchronously
+            return f.dma_read(buffer.get(), 0, size).then([f = std::move(f), buffer = std::move(buffer)](size_t bytes_read) mutable {
+                std::cout << "Read " << bytes_read << " bytes from " << f.get_path() << std::endl;
+                // Close the file asynchronously
+                return f.close().then([buffer = std::move(buffer)]() mutable {
+                    return seastar::sstring(buffer.begin(), buffer.size());
+                });
+            });
+        });
+    }).handle_exception([](std::exception_ptr ep) {
+        std::cerr << "Error reading from file: " << seastar::current_exception_better_what(ep) << std::endl;
+        return seastar::make_exception_future<seastar::sstring>(ep);
+    });
+}
+
+int main(int argc, char** argv) {
+    seastar::app_template app;
+
+    // Define the application's main function
+    app.run(argc, argv, [] {
+        return seastar::make_ready_future().then([] {
+            seastar::sstring test_data = "Hello, Seastar asynchronous I/O!";
+            seastar::sstring filename = "test_async_io.txt";
+
+            // Chain asynchronous operations: write, then read, then print
+            return write_to_file(filename, test_data).then([filename] {
+                return read_from_file(filename);
+            }).then([](seastar::sstring content) {
+                std::cout << "File content: " << content << std::endl;
+            }).handle_exception([](std::exception_ptr ep) {
+                std::cerr << "Application failed: " << seastar::current_exception_better_what(ep) << std::endl;
+                return seastar::make_exception_future<>(ep);
+            });
+        });
+    });
+    return 0;
+}
+```
+このSeastarの例をコンパイルして実行するには：
+```bash
+# Assuming Seastar is installed and SEASTAR_HOME is set
+g++ -std=c++17 -Wall -Werror -O2 -I${SEASTAR_HOME}/include -L${SEASTAR_HOME}/build/lib -Wl,-rpath=${SEASTAR_HOME}/build/lib -o async_io async_io.cpp -lseastar -lfmt -lstdc++fs -lboost_program_options -lboost_thread -lboost_system -lboost_filesystem -lboost_chrono -lboost_context -lboost_atomic -lhwloc -latomic -lrt -lm -ldl -lucontext -lnuma -lz -lcryptopp -lgnutls -lprotobuf -ljsoncpp -lcap -luring
+./async_io --smp 1 # Run with 1 core
+```
+
+### NUMAアウェアネス
+
+最新のマルチソケットサーバーは、Non-Uniform Memory Access (NUMA) アーキテクチャを採用しています。メモリへのアクセス時間は、メモリがアクセスしているCPUにローカルであるか、別のNUMAノードにあるかによって異なります。ScyllaDBは明示的にNUMAアウェアです。メモリプールをパーティション化し、各Seastarスレッドが自身が常駐するNUMAノードからメモリを割り当てるようにします。これにより、より低速でソケット間帯域幅を消費するクロスNUMAノードメモリアクセスが大幅に削減されます。
+
+### ユーザー空間I/Oスケジューリング (Linux AIO / `io_uring`)
+
+ScyllaDBは、可能な限りカーネルのブロックレイヤーをバイパスしてディスクI/Oを行います。Linux AIO（Asynchronous I/O）のような非同期I/Oインターフェース、またはより最近では推奨される`io_uring`を使用します。`io_uring`は、非常に効率的でゼロコピーの非同期I/Oメカニズムを提供する最新のLinuxカーネルインターフェースです。
+
+各Seastarコアは、独自の`io_uring`提出キューと完了キューを維持します。これにより、ユーザー空間からカーネルへのI/Oリクエストの直接提出と、完了イベントの直接取得が可能になり、コンテキストスイッチとシステムコールオーバーヘッドが最小限に抑えられます。ScyllaDBはまた、ユーザー空間で独自のI/Oスケジューラを実装しており、I/Oの優先順位付けと公平性をきめ細かく制御できます。これは、混合ワークロード下で低レイテンシーを維持するために不可欠です。
+
+```cpp
+// Conceptual illustration of io_uring usage within Seastar (simplified)
+// In reality, Seastar abstracts this heavily.
+
+#include <liburing.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <iostream>
+#include <vector>
+#include <string>
+
+// This is a simplified, standalone example to demonstrate io_uring concepts.
+// Seastar integrates io_uring much more deeply into its reactor model.
+
+const int QUEUE_DEPTH = 64;
+const int BLOCK_SIZE = 4096;
+
+int main() {
+    struct io_uring ring;
+    int ret = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
+    if (ret < 0) {
+        std::cerr << "io_uring_queue_init: " << strerror(-ret) << std::endl;
+        return 1;
+    }
+
+    int fd = open("test_io_uring.txt", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        std::cerr << "open: " << strerror(errno) << std::endl;
+        io_uring_queue_exit(&ring);
+        return 1;
+    }
+
+    std::string write_data = "Hello from io_uring!";
+    std::vector<char> write_buffer(BLOCK_SIZE);
+    std::copy(write_data.begin(), write_data.end(), write_buffer.begin());
+
+    // Prepare a write request
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        std::cerr << "io_uring_get_sqe failed" << std::endl;
+        close(fd);
+        io_uring_queue_exit(&ring);
+        return 1;
+    }
+    io_uring_prep_write(sqe, fd, write_buffer.data(), write_buffer.size(), 0);
+    sqe->user_data = 1; // Unique identifier for this request
+
+    // Submit the request
+    io_uring_submit(&ring);
+
+    // Wait for completion
+    struct io_uring_cqe *cqe;
+    ret = io_uring_wait_cqe(&ring, &cqe);
+    if (ret < 0) {
+        std::cerr << "io_uring_wait_cqe: " << strerror(-ret) << std::endl;
+        close(fd);
+        io_uring_queue_exit(&ring);
+        return 1;
+    }
+
+    if (cqe->res < 0) {
+        std::cerr << "Write failed: " << strerror(-cqe->res) << std::endl;
+    } else {
+        std::cout << "Write completed: " << cqe->res << " bytes" << std::endl;
+    }
+
+    io_uring_cqe_seen(&ring, cqe); // Mark completion as seen
+
+    // Prepare a read request
+    std::vector<char> read_buffer(BLOCK_SIZE);
+    sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        std::cerr << "io_uring_get_sqe failed for read" << std::endl;
+        close(fd);
+        io_uring_queue_exit(&ring);
+        return 1;
+    }
+    io_uring_prep_read(sqe, fd, read_buffer.data(), read_buffer.size(), 0);
+    sqe->user_data = 2; // Unique identifier for this request
+
+    // Submit the request
+    io_uring_submit(&ring);
+
+    // Wait for completion
+    ret = io_uring_wait_cqe(&ring, &cqe);
+    if (ret < 0) {
+        std::cerr << "io_uring_wait_cqe for read: " << strerror(-ret) << std::endl;
+        close(fd);
+        io_uring_queue_exit(&ring);
+        return 1;
+    }
+
+    if (cqe->res < 0) {
+        std::cerr << "Read failed: " << strerror(-cqe->res) << std::endl;
+    } else {
+        std::cout << "Read completed: " << cqe->res << " bytes. Content: " << std::string(read_buffer.data(), cqe->res) << std::endl;
+    }
+
+    io_uring_cqe_seen(&ring, cqe);
+
+    close(fd);
+    io_uring_queue_exit(&ring);
+    return 0;
+}
+```
+この`io_uring`の例をコンパイルして実行するには：
+```bash
+g++ -std=c++17 -Wall -Werror -O2 -o io_uring_example io_uring_example.cpp -luring
+./io_uring_example
+```
+注：`io_uring`は、最新のLinuxカーネル（基本的な機能には5.1以降、高度な機能には5.8以降）が必要です。
+
+## ScyllaDB vs. Apache Cassandra: アーキテクチャ比較
+
+| 機能 | ScyllaDB (Seastar) | Apache Cassandra (JVM) |
+|---|---|---|
+| **実行モデル** | スレッド・パー・コア、共有なし | マルチスレッド、共有メモリ |
+| **並行処理** | 協調的マルチタスク (Future) | プリエンプティブマルチタスク (OSスレッド) |
+| **言語** | C++ | Java |
+| **メモリ管理** | 手動 (NUMAアウェアなアロケータ) | JVM GC (Stop-the-world/並行) |
+| **I/Oモデル** | ユーザー空間AIO/io_uring、直接 | カーネルバッファードAIO/NIO、OSスケジューラ |
+| **ネットワークスタック** | オプションのカーネルバイパス (DPDK/XDP) | 標準カーネルTCP/IPスタック |
+| **レイテンシー予測可能性** | 高い (サブミリ秒P99) | 低い (GC一時停止、コンテキストスイッチ) |
+| **リソース利用率** | ほぼ100% CPU、高いI/O効率 | 可変、GCオーバーヘッド、コンテキストスイッチ |
+| **起動時間** | 速い | 遅い (JVM JIT、クラスローディング) |
+| **フットプリント** | 小さい | 大きい (JVMランタイム) |
+
+## 予測可能なP99レイテンシーの達成
+
+ScyllaDBのアーキテクチャ上の選択は、高スループット（例：500,000 writes/sec）下で予測可能なサブミリ秒のP99レイテンシーを維持する能力に直接貢献しています。
+
+*   **GC一時停止の排除:** C++で書かれているため、ScyllaDBはJVMのガベージコレクションに内在する予測不能な「stop-the-world」一時停止を回避します。メモリ管理は決定論的で制御されています。
+*   **コンテキストスイッチングの削減:** スレッド・パー・コアの固定と協調的マルチタスクモデルにより、レイテンシーのジッターの主要な原因であるOSレベルのコンテキストスイッチが劇的に削減されます。
+*   **データ局所性とキャッシュ効率:** 共有なし設計により、データとコードが処理コアに局所化され、CPUキャッシュヒット率が最大化され、高価なメモリアクセスが最小限に抑えられます。
+*   **効率的なI/O:** `io_uring`によるユーザー空間I/Oスケジューリングは、ストレージデバイスへの直接的で低レイテンシーなアクセスを提供し、カーネルオーバーヘッドをバイパスし、ScyllaDBが重要なI/O操作を優先することを可能にします。
+*   **NUMA最適化:** クロスNUMAトラフィックを最小限に抑えることで、一貫したメモリアクセス時間を確保し、リモートメモリフェッチによるレイテンシーの急増を防ぎます。
+*   **バックプレッシャーと負荷分散:** ScyllaDBは、コアとノード間のバックプレッシャーと負荷分散のための洗練された内部メカニズムを組み込んでおり、単一のコンポーネントがボトルネックになるのを防ぎ、過負荷時の段階的な性能低下を保証します。
+
+## 本番環境での落とし穴とトラブルシューティング
+
+1.  **CPUピンニング/分離の誤設定:**
+    *   **症状:** 予測不能なレイテンシー、予想を下回るスループット、高いCPUスティールタイム、または`top`がScyllaDBプロセスがコア間をジャンプしていることを示す。
+    *   **原因:** ScyllaDBは専用のCPUコアに依存しています。OSスケジューラがScyllaDBスレッドを移動させたり、他のプロセスが同じコアを競合したりすると、パフォーマンスが低下します。
+    *   **修正:** `isolcpus`または`cpuset`カーネルパラメータが`/etc/default/grub`（または同等）でScyllaDB用にコアを分離するように正しく設定されていることを確認してください。RHEL/CentOSでは`tuned-adm profile scylla`を使用するか、`irqbalance`を手動で設定してScyllaDBコアへの割り込みルーティングを避けてください。`lscpu -e`と`taskset -cp <pid>`で確認してください。
+
+2.  **NUMAの不整合:**
+    *   **症状:** `numastat -m`で高い`numa_hit`と`numa_miss`メトリクス、または`perf`が顕著なリモートメモリアクセスを示している。
+    *   **原因:** ScyllaDBプロセスがそれぞれのNUMAノードに正しくバインドされていないか、メモリがリモートノードから割り当てられている。
+    *   **修正:** ScyllaDBは通常、NUMAバインディングを自動的に処理します。`numactl`がインストールされていることを確認してください。NUMA関連の警告がないかScyllaDBログをチェックしてください。`scylla.yaml` `smp`および`memory`の設定がハードウェアに適していることを確認してください。例えば、2つのNUMAノードがある場合、`smp`は総コア数の半分、メモリは総RAMの半分であるべきです。
+
+3.  **`io_uring` / AIOリソースの不足:**
+    *   **症状:** ログにI/Oキュー深度の警告、高速ストレージにもかかわらず高いディスクI/Oレイテンシー、`iostat`が高い`await`時間を示している。
+    *   **原因:** カーネルの`io_uring`またはAIO制限が低すぎるか、基盤となるストレージが飽和している。
+    *   **修正:** `io_uring`の場合、カーネルが十分に新しいことを確認してください。古いAIOの場合、`/etc/sysctl.conf`の`fs.aio-max-nr`を増やしてください（例：`fs.aio-max-nr = 1048576`）。ディスクI/Oメトリクスを綿密に監視してください。より高速なストレージ（NVMe）またはより多くのI/Oパスを検討してください。
+
+4.  **ネットワークスタックの競合（DPDK/XDPなしの場合）:**
+    *   **症状:** 高いネットワークレイテンシー、パケットドロップ、`netstat -s`がエラーを示している、特に高スループットノードで。
+    *   **原因:** カーネルのデフォルトのネットワークスタックは、極端なパケットレート下でボトルネックになり、コンテキストスイッチやバッファの肥大化を引き起こす可能性があります。
+    *   **修正:** 重要な高パフォーマンスのデプロイメントでは、ScyllaDBでDPDKまたはXDPを有効にすることを検討してください。これには特定のNICとカーネルモジュールが必要です。それ以外の場合は、ネットワークバッファサイズが調整されていることを確認してください（`net.core.rmem_max`、`net.core.wmem_max`、`net.ipv4.tcp_rmem`、`net.ipv4.tcp_wmem`）。
+
+5.  **コアの過剰プロビジョニング/過少プロビジョニング:**
+    *   **症状:** 一部のコアでCPU使用率が低い、他のコアで負荷が高い、または全体的にパフォーマンスが低い。
+    *   **原因:** `scylla.yaml` `smp`設定が利用可能な分離コアと一致しないか、ワークロードが不均一に分散されている。
+    *   **修正:** `smp`をScyllaDB専用の分離コアの数に設定してください。OSとバックグラウンドタスク用に少なくとも1つのコアを残してください。データモデルとパーティションキーが、ノードとコア間でデータとリクエストを均等に分散するようにしてください。
+
+## よくある質問
+
+1.  **ScyllaDBはなぜJavaやGoのようなガベージコレクション言語ではなくC++を使用するのですか？**
+    ScyllaDBは、決定論的なパフォーマンスとシステムリソースのきめ細かな制御を実現するためにC++を使用しています。これにより、ガベージコレクションの一時停止（Java/Goで一般的）によって引き起こされる予測不能なレイテンシーの急増を回避し、スケールでのサブミリ秒P99レイテンシーに不可欠な直接メモリ管理、NUMAアウェアネス、ユーザー空間I/Oを可能にします。
+
+2.  **ScyllaDBは従来のロックやOSスレッドなしでどのように並行処理を扱いますか？**
+    ScyllaDBは「共有なし、スレッド・パー・コア」モデルを採用しています。各CPUコアは、独自のローカルメモリ、ネットワーク、I/Oキューを持つ専用のSeastarスレッドを実行します。コア内の並行処理は、Futureと継続を使用した協調的マルチタスクによって管理されます。コア間の通信は、明示的なメッセージパッシングを介して行われ、共有メモリの競合やロックを回避します。
+
+3.  **`io_uring`とは何ですか？ScyllaDBのパフォーマンスにとってなぜ重要なのでしょうか？**
+    `io_uring`は、非同期I/Oのための最新のLinuxカーネルインターフェースです。これにより、ScyllaDBは各操作でシステムコールやコンテキストスイッチなしに、ユーザー空間からI/Oリクエストを直接発行および完了できます。これにより、従来のカーネルバッファードI/Oや古いAIOインターフェースと比較して、I/Oオーバーヘッドが大幅に削減され、スループットが向上し、レイテンシーが低下します。
+
+4.  **ScyllaDBはどのようにデータ局所性とNUMAアウェアネスを確保していますか？**
+    ScyllaDBのSeastarエンジンはNUMAアウェアに設計されています。メモリプールとI/Oキューをパーティション化し、各Seastarスレッド（CPUコアに固定されている）が主にローカルNUMAノードからメモリを割り当ててアクセスするようにします。これにより、マルチソケットサーバーで一貫した高パフォーマンスを実現するために不可欠な、より低速なクロスNUMAノードメモリアクセスが最小限に抑えられます。
+
+5.  **ScyllaDBと同じサーバーで他のアプリケーションを実行できますか？**
+    技術的には可能ですが、本番環境のScyllaDBデプロイメントでは強く推奨されません。ScyllaDBは、最適なパフォーマンスのために、専用コア上の利用可能なCPU、メモリ、I/Oリソースのほぼすべてを消費するように設計されています。同じサーバー、特に同じ分離されたコアで他のアプリケーションを実行すると、リソースの競合、予測不能なレイテンシー、ScyllaDBのパフォーマンス低下につながります。専用ハードウェアまたはCPUピンニングを備えた分離された仮想マシンが推奨されます。

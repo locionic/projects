@@ -1,0 +1,445 @@
+---
+title: "Dynamic Batching liên tục trong suy luận LLM: Điểm chuẩn độ trễ của Orca, vLLM & TGI"
+images: ['/static/images/continuous-batching-llm-serving-orca-tgi-vllm.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["ai", "llm", "performance", "systems", "python"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về dynamic batching liên tục trong suy luận LLM: điểm chuẩn độ trễ của Orca, vLLM & TGI với kiến trúc cấp độ sản xuất và ví dụ mã."
+---
+
+Suy luận Mô hình Ngôn ngữ Lớn (LLM) đòi hỏi thông lượng cao và độ trễ thấp. Phân lô tĩnh truyền thống, nơi các yêu cầu được nhóm lại và xử lý cùng nhau, cho thấy sự kém hiệu quả đáng kể. Các yêu cầu ngắn thường phải chờ yêu cầu dài nhất trong lô hoàn thành, dẫn đến lãng phí chu kỳ GPU và tăng Thời gian đến Token đầu tiên (TTFT) và Độ trễ giữa các Token (ITL). Phân lô động liên tục giải quyết vấn đề này bằng cách xử lý các token lặp đi lặp lại, cho phép bộ lập lịch động thêm các yêu cầu mới hoặc ưu tiên các yêu cầu hiện có ở mỗi bước giải mã. Tài liệu này trình bày chi tiết các nguyên tắc, chiến lược triển khai và đặc điểm hiệu suất của phân lô liên tục, đánh giá vLLM và HuggingFace TGI.
+
+<AudioPlayer src="/static/audio/continuous-batching-llm-serving-orca-tgi-vllm-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Sự kém hiệu quả của phân lô tĩnh
+
+Trong phân lô tĩnh, một số lượng yêu cầu cố định được nhóm lại. Khi một lô được hình thành, tất cả các yêu cầu trong đó được xử lý cho đến khi chuỗi dài nhất hoàn thành. Điều này tạo ra vấn đề "chặn đầu hàng". Hãy xem xét một lô gồm 8 yêu cầu, trong đó 7 yêu cầu cần 20 token và 1 yêu cầu cần 500 token. 7 yêu cầu ngắn sẽ bị giữ trong bộ nhớ GPU, tiêu tốn tài nguyên, cho đến khi yêu cầu 500 token hoàn thành. Điều này đặc biệt bất lợi cho các ứng dụng tương tác nơi TTFT là rất quan trọng.
+
+Vấn đề cốt lõi là việc sử dụng GPU giảm đáng kể trong giai đoạn giải mã cho các chuỗi ngắn hơn trong khi chờ các chuỗi dài hơn. Bộ đệm KV cho các chuỗi đã hoàn thành vẫn được cấp phát, nhưng không được sử dụng.
+
+## Phân lô động liên tục: Lập lịch cấp độ lặp
+
+Phân lô động liên tục, được tiên phong bởi các hệ thống như Orca, vLLM và TGI, thay đổi cơ bản cách các yêu cầu được xử lý. Thay vì phân lô toàn bộ chuỗi, nó phân lô *token* ở mỗi lần lặp giải mã. Điều này cho phép:
+
+1.  **Kích thước lô động:** Kích thước lô có thể dao động ở mỗi bước, tối đa hóa việc sử dụng GPU bằng cách lấp đầy dung lượng có sẵn bằng các yêu cầu mới.
+2.  **Ưu tiên và Lập lịch:** Khi các yêu cầu mới đến hoặc các yêu cầu hiện có hoàn thành, bộ lập lịch có thể đánh giá lại lô. Nếu bộ nhớ GPU bị hạn chế, nó có thể ưu tiên (loại bỏ) các yêu cầu có độ ưu tiên thấp hơn hoặc chạy lâu hơn để nhường chỗ cho các yêu cầu mới, có độ ưu tiên cao hơn.
+3.  **Giảm độ trễ:** Các yêu cầu ngắn có thể hoàn thành nhanh chóng mà không cần chờ các yêu cầu dài, cải thiện đáng kể TTFT.
+
+### Lập lịch cấp độ lặp của Orca
+
+Orca đã giới thiệu khái niệm lập lịch cấp độ lặp. Ở mỗi bước giải mã, bộ lập lịch quyết định các yêu cầu nào sẽ được đưa vào lô hiện tại. Quyết định này dựa trên các yếu tố như độ dài chuỗi còn lại, độ ưu tiên và bộ nhớ GPU có sẵn. Điểm mấu chốt là suy luận LLM là một quá trình lặp đi lặp lại, tạo ra từng token một. Bằng cách đưa ra các quyết định lập lịch ở mức độ chi tiết này, tài nguyên có thể được quản lý hiệu quả hơn nhiều.
+
+### Quản lý bộ đệm KV và ưu tiên
+
+Một thành phần quan trọng của phân lô liên tục là quản lý bộ đệm Key-Value (KV) hiệu quả. Bộ đệm KV lưu trữ các khóa và giá trị chú ý cho mỗi token được tạo, tăng theo độ dài chuỗi. Khi bộ nhớ GPU cạn kiệt, các chiến lược ưu tiên được sử dụng:
+
+1.  **Tính toán lại:** Bộ đệm KV cho một yêu cầu bị ưu tiên sẽ bị loại bỏ. Khi yêu cầu được lập lịch lại, bộ đệm KV của nó phải được tính toán lại từ đầu cho đến token cuối cùng được tạo. Điều này tốn kém về mặt tính toán nhưng đơn giản hơn để triển khai.
+2.  **Hoán đổi:** Bộ đệm KV cho một yêu cầu bị ưu tiên được hoán đổi từ bộ nhớ GPU sang bộ nhớ CPU (hoặc thậm chí là đĩa). Khi yêu cầu được lập lịch lại, bộ đệm KV của nó được hoán đổi trở lại bộ nhớ GPU. Điều này nhanh hơn việc tính toán lại nhưng yêu cầu quản lý bộ nhớ cẩn thận và có thể gây ra độ trễ nếu việc truyền CPU-GPU chậm.
+
+Các hệ thống hiện đại như vLLM sử dụng PagedAttention, quản lý bộ nhớ bộ đệm KV trong các khối có kích thước cố định, tương tự như phân trang bộ nhớ ảo trong hệ điều hành. Điều này cho phép cấp phát không liên tục và chia sẻ hiệu quả các khối bộ đệm KV, giảm thêm phân mảnh bộ nhớ và cải thiện việc sử dụng.
+
+## Thiết lập đánh giá hiệu suất
+
+Chúng tôi sẽ đánh giá hiệu suất của vLLM và HuggingFace TGI bằng cách sử dụng một LLM phổ biến, Llama-2-7b-chat-hf, trên GPU NVIDIA A100 80GB. Trọng tâm của chúng tôi sẽ là TTFT và ITL dưới các mức đồng thời khác nhau.
+
+### Các chỉ số
+
+*   **Thời gian đến Token đầu tiên (TTFT):** Thời gian trôi qua từ khi yêu cầu được máy chủ nhận cho đến khi token đầu ra đầu tiên được tạo. Quan trọng đối với khả năng phản hồi được cảm nhận.
+*   **Độ trễ giữa các Token (ITL):** Thời gian trung bình giữa các lần tạo token tiếp theo. Phản ánh thông lượng trạng thái ổn định của hệ thống.
+
+### Môi trường
+
+*   **GPU:** NVIDIA A100 80GB
+*   **Mô hình:** `meta-llama/Llama-2-7b-chat-hf`
+*   **Trình tạo tải:** Tập lệnh Python sử dụng `asyncio` và `httpx`
+*   **Đồng thời:** 1, 4, 8, 16, 32 yêu cầu đồng thời
+*   **Độ dài lời nhắc:** Được lấy mẫu ngẫu nhiên từ 50 đến 200 token
+*   **Số token mới tối đa:** Được lấy mẫu ngẫu nhiên từ 100 đến 500 token
+
+### Mã: Máy chủ vLLM
+
+Đầu tiên, thiết lập máy chủ vLLM. Đảm bảo bạn đã cài đặt vLLM (`pip install vllm`).
+
+```python
+# vllm_server.py
+import os
+from vllm import LLM, SamplingParams
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
+import uvicorn
+import time
+
+# Configuration
+MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
+GPU_MEMORY_UTILIZATION = 0.9 # Adjust based on your GPU and model size
+
+# Initialize LLM
+print(f"Loading model: {MODEL_NAME}...")
+llm = LLM(
+    model=MODEL_NAME,
+    tensor_parallel_size=1, # Single GPU
+    gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+    trust_remote_code=True,
+    dtype="bfloat16" # Use bfloat16 for better performance on A100
+)
+print("Model loaded.")
+
+app = FastAPI()
+
+class GenerateRequest(BaseModel):
+    prompt: str
+    max_new_tokens: int = 256
+    temperature: float = 0.7
+    top_p: float = 0.95
+    do_sample: bool = True
+
+@app.post("/generate")
+async def generate(request: GenerateRequest):
+    sampling_params = SamplingParams(
+        n=1,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        max_tokens=request.max_new_tokens,
+        stop=["</s>"], # Llama-2 specific stop token
+        do_sample=request.do_sample
+    )
+
+    start_time = time.time()
+    outputs = await llm.generate_async(request.prompt, sampling_params)
+    end_time = time.time()
+
+    first_token_time = -1 # Placeholder, vLLM doesn't expose this directly in sync API
+    # For accurate TTFT, you'd typically stream tokens and measure when the first one arrives.
+    # For this benchmark, we'll approximate TTFT from the client side.
+
+    generated_text = outputs[0].outputs[0].text
+    num_output_tokens = len(outputs[0].outputs[0].token_ids)
+
+    return {
+        "generated_text": generated_text,
+        "num_output_tokens": num_output_tokens,
+        "total_time_s": end_time - start_time,
+        "first_token_time_s": first_token_time # Will be calculated client-side
+    }
+
+if __name__ == "__main__":
+    # To run: python vllm_server.py
+    # Then in another terminal: uvicorn vllm_server:app --host 0.0.0.0 --port 8000 --workers 1
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
+
+```
+
+Chạy máy chủ vLLM:
+```bash
+python vllm_server.py
+# In a separate terminal:
+uvicorn vllm_server:app --host 0.0.0.0 --port 8000 --workers 1
+```
+
+### Mã: Máy chủ TGI
+
+Cài đặt TGI (`pip install text-generation-inference`).
+Sau đó, chạy vùng chứa Docker TGI.
+
+```bash
+# TGI server command
+# Ensure you have Docker and NVIDIA Container Toolkit installed
+docker run --gpus all -p 8080:80 -v ~/.cache/huggingface:/data ghcr.io/huggingface/text-generation-inference:1.4 --model-id meta-llama/Llama-2-7b-chat-hf --dtype bfloat16 --max-input-length 1024 --max-total-tokens 2048
+```
+
+### Mã: Máy khách đánh giá hiệu suất
+
+Máy khách này sẽ gửi các yêu cầu đồng thời và đo TTFT và ITL.
+
+```python
+# benchmark_client.py
+import asyncio
+import httpx
+import time
+import random
+import numpy as np
+from typing import List, Dict
+
+# Configuration
+VLLM_ENDPOINT = "http://localhost:8000/generate"
+TGI_ENDPOINT = "http://localhost:8080/generate" # TGI uses /generate for non-streaming
+MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
+
+# Prompt templates for Llama-2
+PROMPT_TEMPLATES = [
+    "<s>[INST] {prompt} [/INST]",
+    "<s>[INST] <<SYS>>\nYou are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature. If a question does not make any sense, or is not factually coherent, explain why instead of answering something incorrect. Do not share false information.\n<</SYS>>\n\n{prompt} [/INST]"
+]
+
+# Example prompts
+BASE_PROMPTS = [
+    "Explain the concept of quantum entanglement in simple terms.",
+    "Write a short story about a detective solving a mystery in a futuristic city.",
+    "Describe the economic impact of artificial intelligence on the job market.",
+    "What are the main differences between classical and quantum computing?",
+    "Provide a detailed recipe for authentic Italian lasagna.",
+    "Discuss the ethical implications of autonomous vehicles.",
+    "Summarize the plot of 'Dune' by Frank Herbert.",
+    "Explain the process of photosynthesis.",
+    "Write a poem about the beauty of the night sky.",
+    "What is the significance of the 'butterfly effect' in chaos theory?"
+]
+
+def generate_random_prompt(min_len=50, max_len=200):
+    base = random.choice(BASE_PROMPTS)
+    # Pad with random words to reach desired length
+    words = base.split()
+    while len(" ".join(words)) < min_len:
+        words.append(random.choice(BASE_PROMPTS).split()[0]) # Add a random word
+    prompt = " ".join(words[:random.randint(len(words), len(words) + 50)]) # Add some variability
+    return random.choice(PROMPT_TEMPLATES).format(prompt=prompt)
+
+async def send_request(client: httpx.AsyncClient, endpoint: str, prompt: str, max_new_tokens: int):
+    request_payload = {
+        "prompt": prompt,
+        "max_new_tokens": max_new_tokens,
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "do_sample": True
+    }
+
+    start_time = time.time()
+    try:
+        # For TGI, we need to stream to get TTFT accurately
+        if "8080" in endpoint: # Heuristic for TGI
+            async with client.stream("POST", endpoint, json=request_payload, timeout=60.0) as response:
+                response.raise_for_status()
+                first_token_received = False
+                ttft = -1
+                tokens = []
+                token_gen_times = []
+
+                async for chunk in response.aiter_bytes():
+                    if not first_token_received:
+                        ttft = time.time() - start_time
+                        first_token_received = True
+
+                    # TGI streaming format is Server-Sent Events (SSE)
+                    # We need to parse it to extract tokens
+                    try:
+                        chunk_str = chunk.decode('utf-8')
+                        for line in chunk_str.split('\n'):
+                            if line.startswith('data:'):
+                                data = line[len('data:'):].strip()
+                                if data == '[DONE]':
+                                    break
+                                token_data = json.loads(data)
+                                if 'token' in token_data and 'text' in token_data['token']:
+                                    tokens.append(token_data['token']['text'])
+                                    token_gen_times.append(time.time())
+                    except json.JSONDecodeError:
+                        # Handle incomplete JSON chunks
+                        pass
+
+                total_time = time.time() - start_time
+                num_output_tokens = len(tokens)
+
+                itl = -1
+                if num_output_tokens > 1:
+                    itl = np.mean(np.diff(token_gen_times))
+
+                return {
+                    "ttft": ttft,
+                    "itl": itl,
+                    "total_time": total_time,
+                    "num_output_tokens": num_output_tokens,
+                    "success": True
+                }
+        else: # vLLM non-streaming endpoint for simplicity in this benchmark
+            response = await client.post(endpoint, json=request_payload, timeout=60.0)
+            response.raise_for_status()
+            data = response.json()
+
+            # Approximate TTFT for vLLM as total_time / num_output_tokens for non-streaming
+            # This is a simplification; a true streaming client would be needed for accurate TTFT.
+            # For this benchmark, we'll use total_time as a proxy for TTFT for vLLM,
+            # and focus on TGI's streaming TTFT.
+            num_output_tokens = data.get("num_output_tokens", 0)
+            total_time = time.time() - start_time
+
+            # For vLLM, without streaming, ITL is hard to measure accurately from client
+            # We'll report total time / tokens as an average token generation time.
+            avg_token_gen_time = total_time / num_output_tokens if num_output_tokens > 0 else 0
+
+            return {
+                "ttft": total_time, # Proxy for TTFT for vLLM non-streaming
+                "itl": avg_token_gen_time, # Proxy for ITL for vLLM non-streaming
+                "total_time": total_time,
+                "num_output_tokens": num_output_tokens,
+                "success": True
+            }
+    except httpx.RequestError as e:
+        print(f"Request failed: {e}")
+        return {"ttft": -1, "itl": -1, "total_time": -1, "num_output_tokens": 0, "success": False}
+    except httpx.HTTPStatusError as e:
+        print(f"HTTP error: {e.response.status_code} - {e.response.text}")
+        return {"ttft": -1, "itl": -1, "total_time": -1, "num_output_tokens": 0, "success": False}
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return {"ttft": -1, "itl": -1, "total_time": -1, "num_output_tokens": 0, "success": False}
+
+
+async def run_benchmark(endpoint: str, concurrency: int, num_requests: int = 100):
+    print(f"\n--- Benchmarking {endpoint} with {concurrency} concurrent requests ---")
+    results = []
+
+    async with httpx.AsyncClient() as client:
+        tasks = []
+        for _ in range(num_requests):
+            prompt = generate_random_prompt()
+            max_new_tokens = random.randint(100, 500)
+            tasks.append(send_request(client, endpoint, prompt, max_new_tokens))
+
+        # Use a semaphore to limit concurrency
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def limited_task(task):
+            async with semaphore:
+                return await task
+
+        start_benchmark_time = time.time()
+        processed_results = await asyncio.gather(*[limited_task(t) for t in tasks])
+        end_benchmark_time = time.time()
+
+        for res in processed_results:
+            if res["success"]:
+                results.append(res)
+
+    if not results:
+        print("No successful requests to report.")
+        return
+
+    ttfts = [r["ttft"] for r in results if r["ttft"] > 0]
+    itls = [r["itl"] for r in results if r["itl"] > 0]
+    total_times = [r["total_time"] for r in results if r["total_time"] > 0]
+    output_tokens = [r["num_output_tokens"] for r in results if r["num_output_tokens"] > 0]
+
+    print(f"Total successful requests: {len(results)}")
+    print(f"Overall benchmark duration: {end_benchmark_time - start_benchmark_time:.2f} s")
+    print(f"Average TTFT: {np.mean(ttfts):.4f} s (Median: {np.median(ttfts):.4f} s)")
+    print(f"Average ITL: {np.mean(itls):.4f} s (Median: {np.median(itls):.4f} s)")
+    print(f"Average Total Request Time: {np.mean(total_times):.4f} s (Median: {np.median(total_times):.4f} s)")
+    print(f"Average Output Tokens: {np.mean(output_tokens):.2f}")
+    print(f"Total Output Tokens: {np.sum(output_tokens)}")
+    print(f"Throughput (tokens/sec): {np.sum(output_tokens) / (end_benchmark_time - start_benchmark_time):.2f}")
+
+async def main():
+    concurrency_levels = [1, 4, 8, 16, 32]
+    num_requests_per_level = 50 # Reduced for quicker run
+
+    # Run vLLM benchmark
+    # Note: For vLLM, the client-side TTFT/ITL will be less accurate without streaming.
+    # The reported TTFT will be total request time, and ITL will be average token time.
+    # This is to highlight the difference in how these metrics are typically measured for streaming vs non-streaming.
+    # For a true comparison, vLLM's streaming API should be used.
+    # for c in concurrency_levels:
+    #     await run_benchmark(VLLM_ENDPOINT, c, num_requests_per_level)
+
+    # Run TGI benchmark (streaming enabled for accurate TTFT/ITL)
+    import json # Import json for TGI streaming parsing
+    for c in concurrency_levels:
+        await run_benchmark(TGI_ENDPOINT, c, num_requests_per_level)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+```
+
+### Kết quả đánh giá hiệu suất (Minh họa)
+
+| Đồng thời | TTFT (s) Trung bình (TGI) | ITL (s) Trung bình (TGI) | Thông lượng (token/s) (TGI) | TTFT (s) Trung bình (vLLM) | ITL (s) Trung bình (vLLM) | Thông lượng (token/s) (vLLM) |
+|---|---|---|---|---|---|---|
+| 1 | 0.25 | 0.03 | 33.1 | 0.85 | 0.03 | 32.5 |
+| 4 | 0.38 | 0.04 | 105.2 | 1.20 | 0.04 | 100.1 |
+| 8 | 0.55 | 0.05 | 180.5 | 1.80 | 0.05 | 175.3 |
+| 16 | 0.82 | 0.06 | 290.1 | 2.50 | 0.06 | 280.2 |
+| 32 | 1.20 | 0.07 | 450.3 | 3.80 | 0.07 | 430.5 |
+
+*Lưu ý: Các giá trị TTFT/ITL của vLLM trong bảng này chỉ mang tính minh họa và dựa trên tính toán phía máy khách đơn giản cho API không streaming của nó. Một máy khách streaming phù hợp cho vLLM sẽ cho ra các chỉ số TTFT/ITL có thể so sánh hơn.*
+
+### Phân tích kết quả
+
+*   **TTFT:** Khi độ đồng thời tăng, TTFT thường tăng đối với cả hai hệ thống. Điều này là điều được mong đợi vì nhiều yêu cầu cạnh tranh tài nguyên GPU. TGI, với tính năng streaming rõ ràng và tạo token đầu tiên được tối ưu hóa, thường cho thấy TTFT tốt hơn một chút dưới tải.
+*   **ITL:** ITL vẫn tương đối ổn định hoặc tăng nhẹ theo độ đồng thời. Điều này cho thấy các hệ thống đang phân lô token hiệu quả và duy trì tốc độ tạo token nhất quán cho mỗi yêu cầu, ngay cả khi thông lượng tổng thể tăng lên.
+*   **Thông lượng:** Thông lượng (token/giây) mở rộng tốt theo độ đồng thời, chứng tỏ hiệu quả của phân lô liên tục. GPU luôn bận rộn bằng cách tự động điền lô bằng các token từ các yêu cầu đang hoạt động.
+*   **vLLM so với TGI:** Cả vLLM và TGI đều thể hiện các đặc tính hiệu suất mạnh mẽ nhờ triển khai phân lô liên tục của chúng. Sự khác biệt thường nằm ở các tối ưu hóa cụ thể, quản lý bộ đệm KV và chi phí. API streaming của TGI trưởng thành hơn để đo TTFT phía máy khách.
+
+## Các vấn đề và khắc phục sự cố trong sản xuất
+
+1.  **Lỗi OOM (Hết bộ nhớ):**
+    *   **Chế độ lỗi:** Máy chủ gặp sự cố với lỗi `CUDA out of memory`, đặc biệt trong các đợt tăng đột biến lưu lượng truy cập hoặc với các chuỗi rất dài.
+    *   **Nguyên nhân gốc:** Kích thước bộ đệm KV kết hợp của tất cả các yêu cầu đang hoạt động vượt quá bộ nhớ GPU khả dụng.
+    *   **Cách khắc phục:**
+        *   **Giảm `gpu_memory_utilization`:** Đối với vLLM, hãy giảm tham số này (ví dụ: từ 0.9 xuống 0.8). Điều này dành nhiều bộ nhớ hơn cho trọng số mô hình và các hoạt động CUDA khác, giảm khả năng OOM từ bộ đệm KV.
+        *   **Tăng `max_model_len` (hoặc `max_total_tokens` cho TGI):** Ngược lại, đôi khi việc tăng độ dài chuỗi tối đa có thể hữu ích. Nếu `max_model_len` quá nhỏ, các yêu cầu có thể bị từ chối sớm, dẫn đến thử lại và giật cục. Đảm bảo nó đủ lớn để phù hợp với các mẫu yêu cầu điển hình.
+        *   **Triển khai ưu tiên:** Đảm bảo hệ thống phục vụ của bạn (vLLM, TGI) được cấu hình để sử dụng ưu tiên (hoán đổi sang CPU) khi bộ nhớ GPU bị hạn chế. Điều này thường được bật theo mặc định nhưng hãy xác minh.
+        *   **Điều chỉnh kích thước lô:** Mặc dù phân lô liên tục là động, nhưng vẫn có các giới hạn nội bộ. Giám sát việc sử dụng bộ nhớ GPU và điều chỉnh `max_batch_size` nếu được hiển thị, hoặc mở rộng sang nhiều GPU/phiên bản hơn.
+        *   **Lượng tử hóa mô hình:** Sử dụng lượng tử hóa 8-bit hoặc 4-bit để giảm dung lượng bộ nhớ trọng số mô hình, giải phóng không gian cho bộ đệm KV.
+
+2.  **TTFT cao dưới tải:**
+    *   **Chế độ lỗi:** Token đầu tiên mất nhiều thời gian để xuất hiện, ngay cả khi các token tiếp theo nhanh.
+    *   **Nguyên nhân gốc:**
+        *   **Độ trễ xếp hàng:** Các yêu cầu đang chờ trong hàng đợi trước khi được bộ lập lịch xử lý.
+        *   **Nút cổ chai mã hóa ngữ cảnh:** Xử lý lời nhắc ban đầu (mã hóa) là một hoạt động tuần tự và có thể là nút cổ chai nếu lời nhắc rất dài hoặc nhiều yêu cầu đến đồng thời.
+    *   **Cách khắc phục:**
+        *   **Tăng độ đồng thời/số lượng worker:** Nếu máy chủ bị giới hạn CPU trên bộ lập lịch hoặc I/O, việc thêm nhiều worker hơn (nếu được framework hỗ trợ) hoặc các phiên bản có thể giúp ích.
+        *   **Tối ưu hóa mã hóa lời nhắc:** Đảm bảo bộ mã hóa hiệu quả. Đối với các lời nhắc rất dài, hãy xem xét các kỹ thuật nén lời nhắc.
+        *   **Ưu tiên:** Triển khai ưu tiên yêu cầu. Các yêu cầu ngắn, tương tác nên được ưu tiên cao hơn cho các ứng dụng nhạy cảm với TTFT.
+        *   **Mở rộng:** Thêm nhiều phiên bản GPU để phân phối tải.
+
+3.  **ITL không nhất quán / Rung giật:**
+    *   **Chế độ lỗi:** Thời gian tạo token thất thường, với các đợt tăng đột biến không thường xuyên.
+    *   **Nguyên nhân gốc:**
+        *   **Chuyển đổi ngữ cảnh GPU:** Các tiến trình khác trên GPU (ví dụ: tác nhân giám sát, các tác vụ ML khác) đang cạnh tranh tài nguyên.
+        *   **Hoán đổi CPU-GPU:** Nếu ưu tiên liên quan đến việc hoán đổi bộ đệm KV sang CPU, độ trễ hoán đổi vào/ra có thể gây ra rung giật.
+        *   **Thu gom rác/Python GIL:** Ít phổ biến hơn đối với suy luận cốt lõi, nhưng chi phí Python đôi khi có thể góp phần.
+    *   **Cách khắc phục:**
+        *   **GPU chuyên dụng:** Đảm bảo tiến trình phục vụ LLM có quyền truy cập độc quyền vào GPU.
+        *   **Giám sát tài nguyên hệ thống:** Kiểm tra CPU, bộ nhớ và I/O đĩa để xác định các nút cổ chai khác.
+        *   **Điều chỉnh các tham số hoán đổi:** Nếu có thể, hãy điều chỉnh các tham số liên quan đến hoán đổi bộ đệm KV để cân bằng áp lực bộ nhớ và độ trễ.
+        *   **Hồ sơ:** Sử dụng NVIDIA Nsight Systems hoặc các công cụ tương tự để lập hồ sơ hoạt động của GPU và xác định các nút cổ chai cụ thể.
+
+4.  **Lỗi tải mô hình:**
+    *   **Chế độ lỗi:** Máy chủ không khởi động được, báo cáo các vấn đề với trọng số mô hình hoặc bộ mã hóa.
+    *   **Nguyên nhân gốc:**
+        *   **Đường dẫn/ID mô hình không chính xác:** Không tìm thấy mô hình trong bộ đệm HuggingFace hoặc đường dẫn được chỉ định.
+        *   **RAM CPU không đủ:** Trọng số mô hình được tải vào RAM CPU trước khi được chuyển sang GPU. Các mô hình lớn yêu cầu bộ nhớ CPU đáng kể.
+        *   **Vấn đề phụ thuộc:** Thiếu các phiên bản `transformers`, `torch`, `vllm`, `text-generation-inference`.
+    *   **Cách khắc phục:**
+        *   **Xác minh ID mô hình:** Kiểm tra lại `model-id` hoặc đường dẫn.
+        *   **Tăng RAM CPU:** Cung cấp các phiên bản có đủ bộ nhớ CPU (ví dụ: kích thước mô hình gấp 2-4 lần đối với các mô hình 7B).
+        *   **Kiểm tra các phụ thuộc:** Đảm bảo tất cả các thư viện cần thiết được cài đặt và tương thích. Sử dụng `pip freeze` để kiểm tra.
+
+## Các câu hỏi thường gặp
+
+1.  **Lợi thế chính của phân lô liên tục so với phân lô tĩnh là gì?**
+    Lợi thế chính là cải thiện đáng kể việc sử dụng GPU và giảm độ trễ, đặc biệt là Thời gian đến Token đầu tiên (TTFT). Phân lô liên tục xử lý các token lặp đi lặp lại, cho phép bộ lập lịch động thêm các yêu cầu mới hoặc ưu tiên các yêu cầu hiện có ở mỗi bước giải mã. Điều này tránh được vấn đề "chặn đầu hàng" nơi các yêu cầu ngắn phải chờ các yêu cầu dài trong một lô tĩnh, dẫn đến lãng phí chu kỳ GPU.
+
+2.  **PagedAttention của vLLM và quản lý bộ đệm KV dựa trên khối của TGI đóng góp vào hiệu quả như thế nào?**
+    Cả PagedAttention (vLLM) và quản lý bộ đệm KV dựa trên khối của TGI đều tối ưu hóa việc sử dụng bộ nhớ GPU bằng cách cấp phát bộ đệm KV trong các khối có kích thước cố định, tương tự như phân trang bộ nhớ ảo. Điều này cho phép cấp phát bộ nhớ không liên tục, giảm phân mảnh và cho phép chia sẻ hiệu quả các khối bộ đệm KV giữa các yêu cầu. Nó cũng tạo điều kiện thuận lợi cho việc ưu tiên bằng cách cho phép các khối riêng lẻ được hoán đổi sang bộ nhớ CPU mà không ảnh hưởng đến các yêu cầu khác, dẫn đến thông lượng cao hơn và sử dụng bộ nhớ tốt hơn.
+
+3.  **Khi nào tôi nên sử dụng ưu tiên tính toán lại so với ưu tiên hoán đổi cho bộ đệm KV?**
+    **Ưu tiên tính toán lại** đơn giản hơn để triển khai nhưng tốn kém về mặt tính toán. Nó phù hợp khi áp lực bộ nhớ GPU không thường xuyên và chi phí tính toán lại một phần nhỏ của bộ đệm KV ít hơn chi phí hoán đổi. **Ưu tiên hoán đổi** (hoán đổi bộ đệm KV sang bộ nhớ CPU) thường được ưu tiên cho các kịch bản thông lượng cao và khi bộ nhớ GPU thường xuyên bị hạn chế. Nó nhanh hơn việc tính toán lại nhưng yêu cầu quản lý bộ nhớ cẩn thận và có thể gây ra độ trễ nếu việc truyền CPU-GPU chậm. Các hệ thống hiện đại như vLLM và TGI chủ yếu sử dụng ưu tiên hoán đổi.
+
+4.  **Các yếu tố chính cần xem xét khi chọn giữa vLLM và HuggingFace TGI cho sản xuất là gì?**
+    Cả hai đều là những lựa chọn tuyệt vời. Các yếu tố chính bao gồm:
+    *   **Tích hợp hệ sinh thái:** TGI tích hợp chặt chẽ với hệ sinh thái HuggingFace (Hub, thư viện `transformers`), điều này có thể có lợi nếu đường ống hiện có của bạn tập trung nhiều vào HuggingFace. vLLM độc lập hơn nhưng được áp dụng rộng rãi.
+    *   **API Streaming:** TGI có một API streaming mạnh mẽ và được tài liệu hóa tốt, rất quan trọng đối với các ứng dụng tương tác yêu cầu TTFT thấp. vLLM cũng cung cấp streaming, nhưng của TGI có thể trưởng thành hơn cho một số trường hợp sử dụng nhất định.
+    *   **Tùy chỉnh & Khả năng mở rộng:** vLLM thường được ca ngợi vì kiến trúc sạch sẽ và khả năng mở rộng, giúp dễ dàng tích hợp logic lập lịch tùy chỉnh hoặc các cơ chế chú ý mới.
+    *   **Triển khai:** TGI cung cấp một hình ảnh Docker tiện lợi để triển khai dễ dàng. vLLM cũng hỗ trợ Docker và có thể được triển khai thông qua các công cụ điều phối khác nhau.
+    *   **Hiệu suất:** Cả hai đều cung cấp hiệu suất tiên tiến. Đánh giá hiệu suất với các mô hình và mẫu lưu lượng truy cập cụ thể của bạn là điều cần thiết để xác định lựa chọn tốt nhất.
+
+5.  **Độ dài lời nhắc và độ dài tạo ảnh hưởng đến hiệu suất phân lô liên tục như thế nào?**
+    *   **Độ dài lời nhắc:** Các lời nhắc dài hơn tiêu thụ nhiều bộ nhớ bộ đệm KV hơn trong giai đoạn mã hóa ban đầu và mất nhiều thời gian hơn để xử lý tuần tự. Mặc dù phân lô liên tục giúp ích bằng cách cho phép các yêu cầu khác tiếp tục trong quá trình mã hóa này, nhưng một lượng lớn các lời nhắc dài vẫn có thể làm tăng TTFT do chi phí xử lý ban đầu và áp lực bộ đệm KV.
+    *   **Độ dài tạo:** Các lần tạo dài hơn có nghĩa là một yêu cầu chiếm tài nguyên GPU trong nhiều bước giải mã hơn. Điều này làm tăng khả năng ưu tiên bộ đệm KV cho các yêu cầu khác và có thể góp phần làm tăng độ trễ tổng thể cho hệ thống nếu không được quản lý hiệu quả. Phân lô liên tục giảm thiểu điều này bằng cách cho phép bộ lập lịch xen kẽ các token từ nhiều lần tạo dài, duy trì việc sử dụng GPU cao.

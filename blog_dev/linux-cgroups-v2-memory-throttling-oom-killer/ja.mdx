@@ -1,0 +1,258 @@
+---
+title: "KubernetesにおけるLinuxcgroupsv2:PSI、メモリ制限、OOMシールド"
+images: ['/static/images/linux-cgroups-v2-memory-throttling-oom-killer.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["linux", "kubernetes", "devops", "systems", "performance"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "KubernetesにおけるLinuxcgroupsv2のPSI(PressureStallInformation)、メモリ制限、OOMシールドについて、本番環境レベルのアーキテクチャとコード例を交えて解説する包括的なガイド。"
+---
+
+Linux cgroups v2は、リソース管理における根本的なアーキテクチャの変革を意味します。v1の断片化された階層から、統一されたツリー状の構造へと移行しました。この進化は、Kubernetesのような最新のコンテナオーケストレーションプラットフォームにとって極めて重要であり、より正確で予測可能なリソース分離を可能にします。このガイドでは、cgroups v2の運用上の影響について、メモリ管理、PSI（Pressure Stall Information）、およびKubernetesにおけるOOM保護戦略に焦点を当てて詳しく説明します。
+
+<AudioPlayer src="/static/audio/linux-cgroups-v2-memory-throttling-oom-killer-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+## Cgroups v1 vs. v2: アーキテクチャのパラダイムシフト
+
+Cgroups v1は、断片化された階層の問題を抱えていました。各コントローラー（例: `cpu`、`memory`、`blkio`）はそれぞれ独立した階層を持つことができ、単一のプロセスに対して複雑でしばしば競合するリソース割り当てを引き起こしていました。プロセスは異なるリソースタイプに対して異なるcgroupに属することができ、一貫したリソース管理を困難にしていました。
+
+Cgroups v2は、統一された階層を導入します。すべてのコントローラーは単一のツリー状の階層にアタッチされます。プロセスはこの階層内の厳密に1つのcgroupに属し、そのcgroupに適用されるすべてのリソースコントローラーがプロセスに適用されます。この簡素化により、より一貫性があり堅牢なリソース管理モデルが提供されます。
+
+### 主要なアーキテクチャの違い
+
+| 機能 | Cgroups v1 | Cgroups v2 |
+|---|---|---|
+| 階層 | 複数、独立 | 単一、統一 |
+| プロセスメンバーシップ | 複数のcgroup（コントローラーごとに1つ） | 単一のcgroup |
+| コントローラーのアタッチ | 任意のcgroup | リーフノードのみ（例外あり） |
+| 委譲 | 複雑、エラーが発生しやすい | 簡素化、明示的 |
+| リソースファイル | 一貫性のない命名 | 標準化された命名（`cgroup.<controller>.<metric>`） |
+| メモリアカウンティング | 精度が低い | より詳細、`memory.stat` |
+| PSI | 利用不可 | 統合済み |
+
+v2の統一された階層は、委譲とリソースアカウンティングを簡素化します。親cgroupはサブツリーを子に委譲でき、子は階層の他の部分に影響を与えることなく、そのサブツリー内のリソース管理を完全に制御できます。これは、個々のPodやコンテナのcgroupを管理するcontainerdやCRI-Oのようなコンテナランタイムにとって非常に重要です。
+
+## Cgroups v2におけるメモリ管理
+
+Cgroups v2は、プログレッシブなスロットリングのための`memory.high`の導入と、OOM動作の改善により、メモリ管理機能を大幅に強化します。
+
+### `memory.max`: ハードリミット
+
+`memory.max`は、cgroupの絶対的なメモリ制限を定義します。cgroupのメモリ使用量がこの値を超えると、カーネルのOOMキラーが呼び出され、そのcgroup内のプロセスが終了されます。これはcgroups v1の`memory.limit_in_bytes`に相当します。
+
+### `memory.high`: ソフトリミットとスロットリングメカニズム
+
+`memory.high`はcgroups v2における重要な追加機能です。これはソフトメモリリミットとして機能します。cgroupのメモリ使用量が`memory.high`を超えると、カーネルは`memory.max`に達する*前に*そのcgroupからメモリを再利用しようとします。これは以下の方法で達成されます。
+
+1.  **ページキャッシュの排出**: クリーンなページキャッシュページを積極的に破棄します。
+2.  **スワップアウト**: 匿名メモリページをディスクにスワップします（スワップが有効な場合）。
+3.  **直接再利用**: cgroup内のプロセスにメモリを同期的に再利用するよう強制します。
+
+このプログレッシブなスロットリングメカニズムは、メモリを大量に消費するプロセスの速度を落とすことでOOMキルを防ぎ、フットプリントを削減する機会を与えたり、他のプロセスがリソースを解放するのを可能にしたりすることを目的としています。これは、`memory.max`によってトリガーされる突然のOOMキルと比較して、メモリプレッシャー下でのより優雅な劣化を提供します。
+
+### 実践例: メモリ制限の設定
+
+メモリリクエストとリミットを持つKubernetes Podを考えてみましょう。Kubernetesはこれらをcgroup v2の設定に変換します。
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: memory-intensive-app
+spec:
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh", "-c", "while true; do sleep 1; done"]
+    resources:
+      requests:
+        memory: "256Mi"
+      limits:
+        memory: "512Mi"
+```
+
+cgroup v2が有効なシステムと、cgroups v2を使用するように設定された`kubelet`を前提とすると、コンテナランタイム（例: containerd）はこのPodのcgroupを作成します。コンテナのcgroupの`memory.max`は512Miに設定されます。`memory.high`の値は通常、`memory.request`または`memory.max`のパーセンテージから派生します。これはコンテナランタイムの設定によります。containerdの場合、`memory.high`は明示的に設定されていないか、`memory.request`が指定されていない限り、デフォルトで`memory.max`に設定されることがよくあります。
+
+実行中のコンテナのcgroup v2設定を手動で確認してみましょう。
+
+```bash
+# Find the cgroup path for a container (e.g., from a pod named 'memory-intensive-app')
+# First, get the container ID
+CONTAINER_ID=$(kubectl get pod memory-intensive-app -o jsonpath='{.status.containerStatuses[0].containerID}' | cut -d'/' -f2)
+
+# Assuming containerd, the cgroup path is typically under /sys/fs/cgroup/system.slice/containerd.service/
+# and then a path derived from the container ID.
+# A more robust way is to use systemd-cgls or findmnt
+CGROUP_PATH=$(find /sys/fs/cgroup -name "*${CONTAINER_ID}*" -type d | head -n 1)
+
+echo "Cgroup path: $CGROUP_PATH"
+
+# Read memory limits
+cat "${CGROUP_PATH}/memory.max"
+cat "${CGROUP_PATH}/memory.high"
+cat "${CGROUP_PATH}/memory.current"
+cat "${CGROUP_PATH}/memory.stat"
+```
+
+`memory.stat`ファイルは、`anon`（匿名メモリ）、`file`（ページキャッシュ）、`kernel_stack`、`slab`、その他様々なメトリックを含む詳細なメモリアカウンティングを提供します。この詳細なデータは、メモリ問題のデバッグに非常に役立ちます。
+
+## PSI（Pressure Stall Information）
+
+PSIは、Linux 4.20で導入されたカーネル機能で、タスクがCPU、メモリ、I/Oリソースを待機するのに費やした時間の集計メトリックを提供します。リソース使用率（例: CPU使用率）を示す従来のメトリックとは異なり、PSIは*リソース競合*と*スタベーション*を定量化します。「リソースが利用できないために、私のプロセスはどれくらいの時間停止しているのか？」という問いに答えます。
+
+PSIメトリックは`/proc/pressure/`およびcgroup v2ディレクトリ内で公開されます。
+
+### PSIメトリックの説明
+
+各リソース（CPU、メモリ、I/O）について、PSIは3つのメトリックを提供します。
+
+*   **`some`**: 少なくとも1つのタスクがこのリソースを待機して停止していた時間の割合。
+*   **`full`**: *すべての*タスクがこのリソースを待機して停止していた時間の割合。これは、システム全体またはcgroup全体の完全なボトルネックを示します。
+*   **`total`**: タスクが停止していた累積時間（マイクロ秒単位）。
+
+`/proc/pressure/memory`からの出力例:
+
+```
+some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+```
+
+ここで、`avg10`、`avg60`、`avg300`はそれぞれ10秒、60秒、300秒間の平均停止割合を表します。
+
+### Cgroups v2におけるPSI
+
+各cgroup v2ディレクトリには、`cpu.pressure`、`memory.pressure`、および`io.pressure`ファイルが含まれています。これらのファイルは、そのcgroupとその子孫内のタスクに特化したPSIメトリックを報告します。これにより、個々のPodやアプリケーション内のリソース競合をきめ細かく監視できます。
+
+```bash
+# Example: Read memory pressure for a specific cgroup
+cat "${CGROUP_PATH}/memory.pressure"
+```
+
+### 可観測性のためのPSIの利用
+
+PSIは、OOMキルやアプリケーションの応答不能といった壊滅的な障害につながる*前に*リソースボトルネックを検出するための強力なシグナルです。
+
+*   **高い`memory.pressure some`**: cgroup内の一部のプロセスがメモリ競合を経験していることを示します。これは`memory.high`スロットリング、さらにはOOMキルの前兆となる可能性があります。
+*   **高い`memory.pressure full`**: cgroup全体が深刻なメモリ不足に陥っており、アプリケーションのフリーズにつながる可能性があることを示唆しています。
+*   **高い`cpu.pressure some`**: 一部のタスクがCPUを待機しています。CPUスロットリングまたはCPUの過負荷を示している可能性があります。
+*   **高い`io.pressure full`**: すべてのタスクがI/Oを待機しています。I/Oボトルネックの明確な兆候です。
+
+KubernetesでPSIメトリックを監視することで、リソース飽和に対する早期警告を提供し、プロアクティブなスケーリングやリソース調整を可能にします。Prometheusエクスポーターは、集中監視のためにcgroupパスからこれらのメトリックをスクレイピングできます。
+
+## OOMシールドと`systemd-oomd`
+
+`memory.high`はスロットリングメカニズムを提供しますが、深刻なメモリプレッシャーは依然としてOOMキルにつながる可能性があります。Kubernetesクラスターでは、重要なシステムデーモン（例: `kubelet`、`containerd`、`kube-proxy`、`node-exporter`）をユーザーワークロードによるOOMキルから保護する必要があります。
+
+### ノードアロケータブルとクリティカルPod
+
+Kubernetesは「ノードアロケータブル（Node Allocatable）」機能を使用して、システムデーモンのリソースを予約します。これは`kubelet`フラグを介して設定されます。
+
+*   `--kube-reserved`: Kubernetesシステムデーモン（例: `kubelet`、`kube-proxy`）のために予約されたリソース。
+*   `--system-reserved`: OSシステムデーモン（例: `sshd`、`journald`）のために予約されたリソース。
+*   `--eviction-hard`: エビクションのしきい値を定義します。
+
+これらの予約は、Podリクエストの合計がアロケータブル容量を超えないようにし、重要なコンポーネントのための余裕を確保します。しかし、これはスケジューリングメカニズムであり、厳密なOOM保護ではありません。ユーザーPodがその制限を超えて消費したり、システムデーモン自体がメモリリークを起こしたりした場合でも、OOMは発生する可能性があります。
+
+### `systemd-oomd`: プロアクティブなOOM防止
+
+`systemd-oomd`は、cgroups v2とPSIと連携して動作するユーザー空間OOMキラーです。カーネルOOMキラー（リアクティブでしばしば「間違った」プロセスをキルする）を待つのではなく、`systemd-oomd`はPSIメトリックと`memory.high`イベントを使用してcgroupのメモリプレッシャーを監視します。持続的なメモリプレッシャーを検出すると、設定可能なポリシーに基づいて、プレッシャーに最も貢献しているプロセスまたはcgroupをプロアクティブに終了します。
+
+`systemd-oomd`は以下のように設定できます。
+
+*   **特定のcgroupを監視**: 重要なシステムcgroupを保護します。
+*   **OOMしきい値を定義**: PSI `some`または`full`の割合、または`memory.high`イベントに基づきます。
+*   **キルポリシーを指定**: どのプロセスを最初にキルするか（例: 最大のメモリ消費者、最も古いプロセス）。
+
+#### `systemd-oomd`設定例（`/etc/systemd/oomd.conf`）
+
+```ini
+[OOM]
+# Enable oomd
+Enable=true
+
+# Global memory pressure thresholds
+# If memory.pressure.some reaches 20% for 30s, consider action
+MemoryPressureDurationSec=30s
+MemoryPressureThreshold=20%
+
+# Action to take when pressure is detected
+# Can be 'kill', 'warn', 'none'
+DefaultMemoryPressureAction=kill
+
+# Protect system services from being killed by oomd
+# This is crucial for Kubernetes nodes
+ProtectSystem=true
+
+# Protect specific cgroups (e.g., kubelet)
+# This is typically handled by ProtectSystem=true if kubelet is a systemd service
+# or by configuring specific cgroup paths.
+# Example: Protect the cgroup for kubelet.service
+# CGroup=/system.slice/kubelet.service
+```
+
+Kubernetesの場合、`systemd-oomd`は`kubelet.service`、`containerd.service`、およびその他の重要なコンポーネントのcgroupを保護するように設定できます。これにより、ユーザーワークロードからの深刻なメモリプレッシャー下でも、コントロールプレーンとノードインフラストラクチャが安定した状態を保つことができます。
+
+### `systemd-oomd`とKubernetesの統合
+
+1.  **cgroups v2を有効にする**: Linuxディストリビューションとカーネルがcgroups v2をサポートし、設定されていることを確認します。ほとんどの最新ディストリビューション（例: Fedora 31+、Ubuntu 20.04+、RHEL 8+）はデフォルトでcgroups v2を使用するか、サポートしています。
+    *   確認: `stat -f /sys/fs/cgroup`は`Type: cgroup2fs`と表示されるはずです。
+    *   `kubelet`がcgroup v2モードで実行されていることを確認: `kubelet`ログで`cgroupfs`ドライバーと`systemd` cgroupドライバーを確認します。
+2.  **`systemd-oomd`のインストールと設定**: `systemd-oomd`パッケージをインストールします。システムサービスを保護するように`/etc/systemd/oomd.conf`を設定します。
+3.  **PSIの監視**: PSIメトリックを監視スタック（例: Prometheus Node Exporter）に統合します。高い`memory.pressure`値でアラートを設定します。
+4.  **ノードアロケータブル**: 重要なコンポーネントのリソースを予約するために、`--kube-reserved`と`--system-reserved`を`kubelet`で適切に設定します。
+
+## 本番環境での落とし穴とトラブルシューティング
+
+1.  **Cgroups v1とv2の不一致**:
+    *   **症状**: `kubelet`が起動しない、またはコンテナがcgroupエラーで起動しない。`kubectl describe node`にcgroupドライバーの警告が表示される。
+    *   **原因**: ホストOSがcgroups v1で実行されているが、`kubelet`がv2用に設定されている、またはその逆。あるいは、カーネルはv2だが、`kubelet`が`cgroupfs`ドライバーではなく`systemd`ドライバー用に設定されている。
+    *   **修正**: ホストOSがcgroups v2（カーネル5.x+）で実行されていることを確認します。`kubelet`をcgroups v2に推奨される`systemd` cgroupドライバーを使用するように設定します。
+        ```yaml
+        # /etc/kubernetes/kubelet.conf (or similar kubelet config file)
+        apiVersion: kubelet.config.k8s.io/v1beta1
+        kind: KubeletConfiguration
+        cgroupDriver: systemd
+        ```
+        必要に応じて、cgroupモードの変更後にノードを再起動します。
+
+2.  **積極的な`memory.high`スロットリング**:
+    *   **症状**: アプリケーションが中程度のメモリ負荷で応答しなくなる、または高いレイテンシを経験するが、OOMキルされない。
+    *   **原因**: `memory.high`が低すぎるため、時期尚早なスロットリングが発生している。これは、`memory.request`が実際のワーキングセットよりも大幅に低く、`memory.high`が`memory.request`から派生している場合に発生する可能性があります。
+    *   **修正**: アプリケーションの典型的なメモリ使用量をよりよく反映するように`memory.request`を調整します。重要なアプリケーションの場合、`memory.high`を`memory.max`に近づけるか、アプリケーションがスロットリングに敏感な場合は無効にすることを検討します（ただし、これによりOOMのリスクが増加します）。containerdのようなコンテナランタイムには、`memory.high`の設定方法を調整するための設定オプションがある場合があります。
+
+3.  **`systemd-oomd`による予期しないプロセスのキル**:
+    *   **症状**: ユーザーワークロードではなく、重要なアプリケーションプロセスが`systemd-oomd`によってキルされる。
+    *   **原因**: `systemd-oomd`の設定が積極的すぎるか、重要なcgroupを適切に除外していない。
+    *   **修正**: `oomd.conf`を確認します。`ProtectSystem=true`が設定されていることを確認します。特定の重要なアプリケーションがユーザーサービスとして実行されている場合、それらのcgroupが明示的に保護されているか、`oomd`のポリシーが重要度の低いワークロードのキルを優先するように設定されていることを確認します。`oomctl`を使用して、`systemd-oomd`の状態と決定を検査します。
+
+4.  **PSIメトリックの誤解釈**:
+    *   **症状**: PSIメトリックでアラートが発生するが、実際のパフォーマンス低下は観察されない。
+    *   **原因**: `some`と`full`の意味を誤解しているか、アラートしきい値が低すぎる。`some`プレッシャーの短いスパイクは、しばしば正常です。
+    *   **修正**: 重要なサービスについては、持続的な高い`full`プレッシャーに焦点を当てます。`some`プレッシャーについては、傾向を調べ、他のメトリック（例: レイテンシ、エラー率）と相関させます。観察されたベースラインと許容可能なパフォーマンス低下に基づいてアラートしきい値を調整します。
+
+5.  **カーネルOOMキラーが依然としてアクティブ**:
+    *   **症状**: `systemd-oomd`が有効になっているにもかかわらず、カーネルOOMキラーが介入する。
+    *   **原因**: `systemd-oomd`のしきい値が十分に積極的でないか、メモリプレッシャーが`oomd`が反応するには速すぎる。カーネルOOMキラーは究極のフォールバックです。
+    *   **修正**: `systemd-oomd`の`MemoryPressureThreshold`と`MemoryPressureDurationSec`をよりプロアクティブになるように調整します。`oomd`が正しいcgroupを監視していることを確認します。急速なメモリプレッシャーの根本原因を調査します。
+
+## よくある質問
+
+1.  **なぜcgroups v2に移行すべきなのですか？**
+    Cgroups v2は、統一された階層を提供し、リソース管理を簡素化し、委譲を改善し、`memory.high`によるより詳細なメモリアカウンティングとプロアクティブなスロットリングを提供します。これはLinuxリソース制御の未来であり、PSIや`systemd-oomd`のような機能には必須です。最新のKubernetesバージョンとコンテナランタイムは、cgroups v2向けに最適化が進んでいます。
+
+2.  **`memory.high`は`memory.max`とどう違いますか？**
+    `memory.max`はハードリミットであり、これを超えるとカーネルOOMキラーがトリガーされます。`memory.high`はソフトリミットであり、これを超えるとcgroup*内*でプロアクティブなメモリ再利用とスロットリングがトリガーされ、`memory.max`への到達とOOMキルを防ぐことを目指します。`memory.high`は、メモリプレッシャー下でのより優雅な劣化を提供します。
+
+3.  **cgroups v1と`systemd-oomd`でKubernetesを実行できますか？**
+    いいえ。`systemd-oomd`はcgroups v2の統一された階層とPSIメトリックに大きく依存しており、これらはcgroups v1では完全に利用可能または一貫して公開されていません。プロアクティブなOOM防止のために`systemd-oomd`を活用するには、cgroups v2環境が必須です。
+
+4.  **cgroups v2で`memory.request`と`memory.limit`を設定するためのベストプラクティスは何ですか？**
+    `memory.request`をアプリケーションの典型的なワーキングセットサイズに設定します。これは`memory.high`に影響を与え、適切なスケジューリングを保証します。`memory.limit`（`memory.max`となる）を、アプリケーションが不安定になることなく消費できる絶対最大メモリに設定します。`memory.limit`を高く設定しすぎると、ノードのリソース枯渇につながる可能性があるため避けてください。一般的な戦略は、`memory.request`をある程度のバーストを許容する値に設定し、`memory.limit`を暴走するメモリ使用を防ぐ値に設定することです。
+
+5.  **KubernetesでPSIメトリックを監視するにはどうすればよいですか？**
+    Prometheus Node Exporterは、`/proc/pressure/`およびcgroup v2パスからPSIメトリックを公開できます。Prometheusを設定してこれらのメトリックをスクレイピングし、`node_pressure_cpu_some_total`、`node_pressure_memory_full_total`、および特定のcgroupの同様のメトリックに基づいてGrafanaダッシュボードとアラートルールを設定できます。これにより、リソース競合に関する重要な洞察が得られます。

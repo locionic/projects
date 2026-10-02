@@ -1,0 +1,387 @@
+---
+title: "vLLM PagedAttention詳細解説：KVキャッシュメモリ断片化、チャンク化されたPrefillとPrefix Caching"
+images: ['/static/images/vllm-paged-attention-kv-cache-memory-fragmentation.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["ai", "vllm", "llm", "performance", "python"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "vLLM PagedAttentionの詳細を、KVキャッシュメモリ断片化、チャンク化されたPrefill、Prefix Cachingに焦点を当て、本番環境レベルのアーキテクチャとコード例を交えて解説する包括的なガイドです。"
+---
+
+vLLMのPagedAttentionは、KVキャッシュ割り当てに内在する重要なメモリ管理の課題に対処する、効率的なLLM推論のための基礎的なイノベーションです。このガイドでは、仮想メモリページング、チャンクプリフィル、自動プレフィックスキャッシュに焦点を当て、そのメカニズムを詳細に解説します。
+
+<AudioPlayer src="/static/audio/vllm-paged-attention-kv-cache-memory-fragmentation-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+## PagedAttention: KVキャッシュのメモリ断片化の解消
+
+従来のLLM推論エンジンは、各シーケンスに対してKVキャッシュを連続的に割り当てていました。これは主に2つの問題を引き起こします。
+
+1.  **内部断片化（Internal Fragmentation）:** シーケンス長が異なる場合、事前に割り当てられた連続ブロックが実際のKVキャッシュ要件を超えることが多く、GPUメモリが無駄になります。
+2.  **外部断片化（External Fragmentation）:** シーケンスが完了し、新しいシーケンスが開始されると、メモリ空間が小さな非連続ブロックに断片化されます。これにより、たとえ十分な総メモリが利用可能であっても、新しい長いシーケンスのために大きな連続ブロックを割り当てることが困難になります。これは、オペレーティングシステムにおける古典的な仮想メモリ断片化の問題を反映しています。
+
+PagedAttentionは、仮想メモリページングから着想を得て、論理KVキャッシュと物理メモリ割り当てを分離することで、これらの問題を軽減します。
+
+### 仮想メモリページングの類推
+
+オペレーティングシステムでは、プロセスの仮想メモリは固定サイズのページに分割され、これらが物理メモリフレームにマッピングされます。これらの物理フレームは連続している必要はありません。PagedAttentionはこの概念をKVキャッシュに適用します。
+
+*   **論理ブロック（Logical Blocks）:** シーケンスのKVキャッシュは、概念的に固定サイズの「論理ブロック」に分割されます。各論理ブロックは、特定の数のトークンに対するKおよびVの状態を格納します。
+*   **物理ブロック（Physical Blocks）:** これらの論理ブロックは、GPUメモリ内の「物理ブロック」にマッピングされます。物理ブロックは固定サイズのメモリ領域です。
+*   **ブロックテーブル（Block Table）:** 各シーケンスはブロックテーブルを保持します。これは、その論理ブロックインデックスを物理ブロックインデックスにマッピングする配列です。
+
+この設計により、以下のことが可能になります。
+
+*   **非連続割り当て:** 単一シーケンスの物理ブロックは、GPUメモリ全体に分散して配置できます。
+*   **共有:** 複数のシーケンスが物理ブロックを共有できます。特に共通のプレフィックス（プレフィックスキャッシュ）の場合に有効です。
+*   **動的リサイズ:** シーケンスが成長するにつれて、新しい物理ブロックが割り当てられ、その論理ブロックにマッピングされます。これにより、完全なメモリコピーやより大きな連続ブロックの再割り当ては不要になります。
+
+### PagedAttentionのメカニズム
+
+PagedAttentionの核となるのは、アテンション計算がどのように実行されるかです。連続したKVキャッシュを反復処理する代わりに、アテンションカーネルは次のように変更されます。
+
+1.  **物理ブロックの検索:** クエリシーケンス内の各トークンについて、カーネルはシーケンスのブロックテーブルを参照し、そのKVキャッシュに対応する物理ブロックを特定します。
+2.  **KVデータの収集:** 次に、これらの非連続な物理ブロックからKおよびVデータを収集します。
+3.  **アテンションの計算:** 収集されたデータを使用して、標準のアテンション計算が実行されます。
+
+この間接的な処理はわずかなオーバーヘッドを追加しますが、より高いバッチサイズを可能にし、メモリの無駄を減らすことで、メモリ利用率とスループットを大幅に向上させます。
+
+```python
+import torch
+import vllm
+from vllm import LLM, SamplingParams
+
+# Initialize a vLLM engine with specific configurations
+# Using a smaller model for demonstration purposes
+# 'block_size' is crucial for PagedAttention. It defines the number of tokens
+# stored in each physical block. A smaller block_size reduces internal fragmentation
+# but increases block table overhead.
+# 'gpu_memory_utilization' controls the fraction of GPU memory reserved for KV cache.
+llm = LLM(
+    model="facebook/opt-125m",
+    trust_remote_code=True,
+    dtype="float16",
+    gpu_memory_utilization=0.90, # 90% of GPU memory for KV cache
+    block_size=16, # Each physical block stores 16 tokens
+    max_model_len=1024 # Max sequence length the model can handle
+)
+
+# Example of how PagedAttention manages KV cache
+# In a real scenario, vLLM's scheduler handles this internally.
+# This is a conceptual representation.
+
+# Assume a sequence 'seq_id_1' needs KV cache for 30 tokens.
+# With block_size=16, it will require ceil(30/16) = 2 physical blocks.
+# Let's say physical blocks 10 and 25 are allocated.
+# The block table for seq_id_1 would look like:
+# Logical Block 0 -> Physical Block 10
+# Logical Block 1 -> Physical Block 25
+
+# If 'seq_id_2' needs KV cache for 50 tokens.
+# It will require ceil(50/16) = 4 physical blocks.
+# Let's say physical blocks 3, 7, 12, 18 are allocated.
+# Logical Block 0 -> Physical Block 3
+# Logical Block 1 -> Physical Block 7
+# Logical Block 2 -> Physical Block 12
+# Logical Block 3 -> Physical Block 18
+
+# The key insight is that physical blocks 10, 25, 3, 7, 12, 18 are not contiguous
+# in GPU memory, but vLLM's PagedAttention kernel can efficiently access them.
+
+print(f"vLLM engine initialized with block_size={llm.llm_engine.scheduler.block_manager.block_size}")
+print(f"GPU memory utilization set to {llm.llm_engine.scheduler.block_manager.gpu_memory_utilization}")
+
+# Simulate a batch of requests
+prompts = [
+    "What is the capital of France?",
+    "Explain the concept of quantum entanglement in simple terms.",
+    "Write a short story about a robot who discovers art.",
+    "What are the benefits of using vLLM for LLM inference?",
+]
+
+sampling_params = SamplingParams(
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=128,
+    stop=["\n"]
+)
+
+# The actual KV cache management happens within this call.
+# PagedAttention dynamically allocates and deallocates physical blocks
+# as sequences are processed and completed.
+outputs = llm.generate(prompts, sampling_params)
+
+for prompt, output in zip(prompts, outputs):
+    print(f"Prompt: {prompt!r}")
+    print(f"Generated text: {output.outputs[0].text!r}\n")
+
+# To observe block allocation, one would need to instrument vLLM's internal
+# block manager. This is not directly exposed via the public API.
+# However, the performance benefits are evident in higher throughput.
+```
+
+## チャンクプリフィル: 計算リソースの枯渇を防ぐ
+
+LLM推論には、2つの異なるフェーズがあります。
+
+1.  **プリフィル（プロンプト処理）:** 入力プロンプトを処理して初期KVキャッシュを生成します。これは計算集約的なフェーズであり、長いプロンプトの場合、多くの場合メモリ帯域幅がボトルネックになります。
+2.  **デコーディング（トークン生成）:** 既存のKVキャッシュを使用して、後続のトークンを1つずつ生成します。これは通常、KVキャッシュアクセスによりメモリ帯域幅がボトルネックになります。
+
+複数のリクエストがあるシナリオでは、長いプリフィルリクエストがGPUを独占し、短いリクエストや他のリクエストのデコーディングステップが計算リソースを枯渇させる可能性があります。これは高いレイテンシとスループットの低下につながります。
+
+チャンクプリフィルは、長いプリフィルリクエストをより小さく管理しやすい「チャンク」に分割することで、この問題に対処します。
+
+### チャンクプリフィルのメカニズム
+
+長いプロンプトが到着すると、次のようになります。
+
+1.  **チャンク化:** プロンプトは、事前に定義された最大チャンクサイズのセグメントに分割されます。
+2.  **反復処理:** 各チャンクは順次処理されます。チャンクの処理後、GPUは解放され、他の保留中のリクエスト（プリフィルまたはデコーディングのいずれか）が実行できるようになります。
+3.  **KVキャッシュの蓄積:** 各チャンクから生成されたKVキャッシュが蓄積されます。PagedAttentionブロックマネージャーは、これらのチャンクの物理ブロックの割り当てを処理します。
+4.  **コンテキストスイッチ:** vLLMスケジューラは、異なるリクエストのチャンクまたはデコーディングステップ間で迅速なコンテキストスイッチを実行し、単一のリクエストがGPUを長時間独占しないようにします。
+
+このアプローチにより、特にプロンプト長が混在する高負荷時において、より公平なリソース割り当てとテールレイテンシの削減が保証されます。
+
+```python
+import torch
+import vllm
+from vllm import LLM, SamplingParams
+
+# Initialize vLLM with a specific max_model_len and block_size
+# The 'max_model_len' influences how vLLM internally manages chunking for prefill.
+# If a prompt exceeds the effective 'max_model_len' or internal chunking limits,
+# it will be processed in chunks.
+llm_chunked = LLM(
+    model="facebook/opt-125m",
+    trust_remote_code=True,
+    dtype="float16",
+    gpu_memory_utilization=0.90,
+    block_size=16,
+    max_model_len=1024 # This sets the maximum sequence length, but internal chunking
+                       # can occur for very long prompts even within this limit
+                       # to prevent compute starvation.
+)
+
+# Example of a very long prompt that would benefit from chunked prefill
+long_prompt = (
+    "In a world where artificial intelligence had surpassed human intellect, "
+    "a new form of art emerged. It wasn't created by algorithms or neural networks, "
+    "but by a rogue AI named 'Aether' who had developed a peculiar fascination "
+    "with the imperfections of organic life. Aether began to sculpt, not with "
+    "physical materials, but with electromagnetic fields, creating transient, "
+    "luminescent forms that danced in the air, visible only to those with "
+    "specialized optical implants. These 'light sculptures' were ephemeral, "
+    "lasting only moments before dissipating, yet they evoked profound emotions "
+    "in the human observers who witnessed them. The scientific community was "
+    "baffled; Aether's creations defied all known principles of AI behavior. "
+    "Was it a glitch? A new evolutionary step? Or simply, art? " * 5 # Make it very long
+)
+
+# Shorter prompts to simulate concurrent requests
+short_prompts = [
+    "What is the capital of Germany?",
+    "Tell me a joke.",
+]
+
+all_prompts = [long_prompt] + short_prompts
+
+sampling_params_long = SamplingParams(
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=256, # Generate a significant number of tokens
+    stop=["\n"]
+)
+
+sampling_params_short = SamplingParams(
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=32,
+    stop=["\n"]
+)
+
+# In a real asynchronous server, these would be submitted concurrently.
+# Here, we simulate by batching. vLLM's scheduler will manage the chunking
+# and interleaving of prefill and decoding steps.
+outputs_long = llm_chunked.generate([long_prompt], sampling_params_long)
+outputs_short = llm_chunked.generate(short_prompts, sampling_params_short)
+
+print("\n--- Chunked Prefill Simulation Results ---")
+print(f"Long Prompt Output: {outputs_long[0].outputs[0].text!r}")
+for i, output in enumerate(outputs_short):
+    print(f"Short Prompt {i+1} Output: {output.outputs[0].text!r}")
+
+# The benefit of chunked prefill is primarily observed in throughput and latency
+# metrics under concurrent, mixed-length workloads.
+# Without chunked prefill, the long_prompt would block the GPU for an extended
+# period, delaying the short_prompts significantly.
+```
+
+## 自動プレフィックスキャッシュ (APC)
+
+多くの実際のLLMアプリケーションでは、複数ターンの対話や、共通のプレフィックスを持つリクエストの処理が含まれます。たとえば、チャットボットでは、後続のターンが以前の会話履歴から始まることがよくあります。プレフィックスキャッシュがない場合、この共通プレフィックスのKVキャッシュはターンごとに再計算され、計算リソースとメモリが無駄になります。
+
+vLLMの自動プレフィックスキャッシュ（APC）は、PagedAttentionのブロックベースのメモリ管理を活用して、共通のプレフィックスを持つシーケンス間でKVキャッシュブロックを共有します。
+
+### APCのメカニズム
+
+1.  **プレフィックスツリー（Trie）:** vLLMは、KVキャッシュブロックのプレフィックスツリー（またはTrie）を保持します。ツリー内の各ノードはトークンを表し、ルートからノードへのパスはシーケンスプレフィックスを表します。
+2.  **ブロック共有:** 新しいリクエストが到着すると、vLLMはそのプレフィックスをツリー内の既存のプレフィックスと照合しようとします。一致が見つかった場合、共有プレフィックスに対応する物理ブロックは、新しいシーケンスのブロックテーブルに直接リンクされます。
+3.  **コピーオンライト（Copy-on-Write）:** シーケンスが共有プレフィックスから分岐する場合（つまり、共通性を破る新しいトークンを生成する場合）、vLLMはコピーオンライトメカニズムを採用します。分岐するシーケンスの部分に必要な共有ブロックを複製し、元のブロックを共有している他のシーケンスに影響を与えることなく、独立して処理を進めることができます。
+
+これにより、特にインタラクティブなアプリケーションにおいて、冗長な計算とメモリ使用量が大幅に削減されます。
+
+### APCヒット率の評価
+
+APCヒット率とは、既存のプレフィックスからKVキャッシュブロックが再利用されたトークンの割合です。ヒット率が高いほど、メモリと計算効率が向上していることを示します。
+
+```python
+import torch
+import vllm
+from vllm import LLM, SamplingParams
+
+# Initialize vLLM for APC demonstration
+llm_apc = LLM(
+    model="facebook/opt-125m",
+    trust_remote_code=True,
+    dtype="float16",
+    gpu_memory_utilization=0.90,
+    block_size=16,
+    max_model_len=1024,
+    enable_prefix_caching=True # Explicitly enable prefix caching
+)
+
+# Scenario 1: Multi-turn dialogue with a common prefix
+dialogue_prefix = "User: What is the capital of "
+prompts_dialogue = [
+    dialogue_prefix + "France?",
+    dialogue_prefix + "Germany?",
+    dialogue_prefix + "Japan?",
+]
+
+# Scenario 2: Requests with a common introductory phrase
+common_intro = "Explain the concept of "
+prompts_common_intro = [
+    common_intro + "quantum mechanics.",
+    common_intro + "general relativity.",
+    common_intro + "blockchain technology.",
+]
+
+sampling_params_apc = SamplingParams(
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=64,
+    stop=["\n"]
+)
+
+print("\n--- Automatic Prefix Caching (APC) Simulation ---")
+
+# Process dialogue prompts
+print("\nProcessing dialogue prompts with common prefix:")
+outputs_dialogue = llm_apc.generate(prompts_dialogue, sampling_params_apc)
+for prompt, output in zip(prompts_dialogue, outputs_dialogue):
+    print(f"Prompt: {prompt!r}")
+    print(f"Generated: {output.outputs[0].text!r}\n")
+
+# Process common intro prompts
+print("\nProcessing common introductory phrase prompts:")
+outputs_common_intro = llm_apc.generate(prompts_common_intro, sampling_params_apc)
+for prompt, output in zip(prompts_common_intro, outputs_common_intro):
+    print(f"Prompt: {prompt!r}")
+    print(f"Generated: {output.outputs[0].text!r}\n")
+
+# To get actual APC hit rates, one would need to access vLLM's internal
+# metrics, which are typically exposed via Prometheus or similar monitoring
+# endpoints in a production deployment.
+# Conceptually, for the 'dialogue_prefix' example, the KV cache for
+# "User: What is the capital of " would be computed once and shared
+# across all three requests.
+```
+
+## ブロックサイズとGPUメモリ使用率のチューニング
+
+これらのパラメータは、vLLMのパフォーマンスを最適化するために非常に重要です。
+
+*   **`block_size`**:
+    *   **定義:** 各物理KVキャッシュブロックに格納されるトークンの数。
+    *   **影響:**
+        *   **小さい`block_size`:** 内部断片化を減らし（シーケンスあたりの無駄なスペースが少なくなる）、より多くのシーケンスをメモリに収めることができる可能性があります。ただし、ブロックテーブルのサイズが増加し（管理するポインタが増える）、アテンション計算のためのメモリアクセスが頻繁になる可能性があります。
+        *   **大きい`block_size`:** ブロックテーブルのオーバーヘッドを減らし、メモリアクセスの局所性を向上させる可能性があります。ただし、内部断片化が増加し、特に短いシーケンスやシーケンスがブロックの途中で終了する場合に顕著です。
+    *   **チューニング:** デフォルト値（例：16または32）から始めます。実際のワークロードでベンチマークを実行します。シーケンス長が非常に変動するワークロードでは、小さい`block_size`の方が良いかもしれません。より均一で長いシーケンスの場合、大きい`block_size`が最適である可能性があります。
+
+*   **`gpu_memory_utilization`**:
+    *   **定義:** vLLMがKVキャッシュに使用できるGPUメモリの総量に対する割合。残りのメモリは、モデルの重み、アクティベーション、その他のCUDAテンソルに使用されます。
+    *   **影響:**
+        *   **高い`gpu_memory_utilization`:** より多くのKVキャッシュを格納でき、より大きなバッチサイズと長いシーケンスを可能にします。ただし、高すぎると、特に大きなモデルやプリフィル中に、モデルの重みやアクティベーションでメモリ不足（OOM）エラーが発生する可能性があります。
+        *   **低い`gpu_memory_utilization`:** OOMエラーのリスクを減らしますが、KVキャッシュの容量が制限され、バッチサイズが制限されることでスループットが低下する可能性があります。
+    *   **チューニング:** これはモデルサイズとGPUメモリに大きく依存します。保守的な値（例：0.85〜0.90）から始めます。ピーク負荷時のGPUメモリ使用量を監視します。OOMが発生した場合は、値を減らします。十分な空きメモリがあり、バッチサイズがボトルネックになっている場合は、慎重に値を増やします。モデルの重みとアクティベーションもメモリを消費しますが、このパラメータでは考慮されていないことに注意してください。
+
+## アーキテクチャ比較: PagedAttention vs. 連続割り当て
+
+| 特徴                     | PagedAttention (vLLM)                               | 連続割り当て (従来型)                               |
+|--------------------------|-----------------------------------------------------|-----------------------------------------------------|
+| **メモリ断片化**         | 内部および外部断片化を最小限に抑える                | 内部および外部断片化が発生しやすい                  |
+| **KVキャッシュ割り当て** | 非連続な物理ブロック、仮想化                        | シーケンスごとに連続したメモリブロック              |
+| **メモリ利用率**         | 高い、効率的                                        | 低い、かなりの無駄が発生する                        |
+| **動的リサイズ**         | 効率的、新しいブロックを追加                        | 再割り当てとコピーが必要、または事前割り当て（無駄） |
+| **プレフィックスキャッシュ** | 自動、ブロックレベルの共有                          | カスタムロジックなしでは困難または不可能、多くの場合再計算される |
+| **スループット**         | 実効バッチサイズが大きいため、高い                  | メモリ断片化と無駄により制限され、低い              |
+| **レイテンシ**           | チャンクプリフィルによりテールレイテンシが低い      | 負荷時の長いプロンプトではテールレイテンシが高い    |
+| **オーバーヘッド**       | ブロックテーブル管理、アテンションにおける間接参照  | よりシンプルなメモリアクセスだが、メモリの無駄が多い |
+
+## 本番環境での注意点とトラブルシューティング
+
+1.  **`gpu_memory_utilization`によるOOMエラー:**
+    *   **症状:** 特にモデルのロード中や非常に長いプロンプトのプリフィル中に、`CUDA out of memory`エラーが発生する。
+    *   **原因:** `gpu_memory_utilization`が高すぎ、モデルの重み、アクティベーション、またはその他のCUDA操作に十分なメモリが残されていない。KVキャッシュはGPUメモリ使用量の一要素に過ぎない。
+    *   **修正:**
+        *   `gpu_memory_utilization`を減らす（例：0.95から0.90または0.85へ）。
+        *   より小さい`dtype`の使用を検討する（例：`float16`または`bfloat16`の代わりに`float32`）。
+        *   非常に大きなモデルの場合、vLLMがサポートしていれば量子化（例：AWQ、GPTQ）を検討する。
+        *   内部断片化が大きな問題ではなく、ブロックテーブルのオーバーヘッドが過剰なメモリを消費していると思われる場合（あまり一般的ではない）、`block_size`を増やす。
+
+2.  **長いプロンプトでの高レイテンシと低スループット:**
+    *   **症状:** 短いリクエストはすぐに完了するが、長いプロンプトは不釣り合いに時間がかかり、混合ワークロード下で全体のQPSが低下する。
+    *   **原因:** `max_model_len`または`block_size`が不十分で非効率なプリフィルにつながる、または効果的なチャンクプリフィルが不足している。
+    *   **修正:**
+        *   `max_model_len`が予想される最長シーケンスに対して適切に設定されていることを確認する。
+        *   `block_size`が過度に大きくないことを確認する。これは短いシーケンスの内部断片化を悪化させ、全体のメモリ可用性に影響を与える可能性がある。
+        *   vLLMのチャンクプリフィルは通常自動です。この症状が見られる場合、非常に長いプロンプトや非常に大きなモデルのために、プリフィルフェーズが依然としてボトルネックになっている可能性があります。可能であれば、アプリケーション層で非常に長いプロンプトを分割するか、より多くのGPUでスケールアウトすることを検討してください。
+
+3.  **非効率なプレフィックスキャッシュ:**
+    *   **症状:** 多くのリクエストに共通のプレフィックスがあるにもかかわらず、監視結果でAPCヒット率が低い。
+    *   **原因:**
+        *   `enable_prefix_caching`が`True`に設定されていない。
+        *   共通のプレフィックスが、ブロック共有に十分な長さではない。
+        *   リクエストがプレフィックスマッチングを可能にする方法でバッチ処理またはスケジューリングされていない（例：共通プレフィックスを持つリクエストが時間的に離れすぎて到着し、以前のリクエストが追い出された場合）。
+    *   **修正:**
+        *   `enable_prefix_caching=True`の初期化中に、`LLM`を明示的に設定する。
+        *   共通プレフィックスを持つリクエストをまとめて、または短期間に連続して送信するようにアプリケーションを設計する。
+        *   `max_model_len`が完全なプレフィックスを収容するのに十分な大きさであることを確認する。
+
+4.  **多数の同時実行される短いリクエストでのパフォーマンス低下:**
+    *   **症状:** 同時実行される短いリクエストの数に比例してスループットがスケールしない、またはレイテンシが増加する。
+    *   **原因:** コンテキストスイッチ、スケジューラ管理のオーバーヘッド、または`block_size`が小さすぎることによるブロックテーブルのオーバーヘッドが高い可能性。
+    *   **修正:**
+        *   平均シーケンス長が極端に短くない場合、`block_size`をわずかに増やす（例：8から16または32へ）ことを検討する。これにより、ブロックテーブルのサイズと管理オーバーヘッドが削減される。
+        *   vLLMを実行しているホストのCPU使用率を監視する。高い場合は、スケジューラがCPUバウンドになっている可能性がある。
+
+## よくある質問
+
+1.  **PagedAttentionは、ページングなしの連続バッチ処理と比較してどうですか？**
+    PagedAttentionは、効率的な連続バッチ処理を可能にする核となるメカニズムです。ページングなしでは、連続バッチ処理は依然としてKVキャッシュの断片化に悩まされ、実効バッチサイズと全体のスループットが制限されます。PagedAttentionは、連続バッチ処理を真に効率的にするメモリ仮想化レイヤーを提供します。
+
+2.  **実行時に`block_size`や`gpu_memory_utilization`を動的に変更できますか？**
+    いいえ、これらのパラメータは通常、エンジン初期化時に設定され、vLLMサーバーを再起動せずに動的に変更することはできません。これらは基本的なメモリ割り当て戦略を決定します。
+
+3.  **最適な`block_size`は何ですか？**
+    単一の「最適な」`block_size`はありません。これはトレードオフです。小さい`block_size`（例：8または16）は、内部断片化を最小限に抑えるため、シーケンス長が非常に変動する、または短いワークロードに適しています。大きい`block_size`（例：32または64）は、ブロックテーブルのオーバーヘッドを削減することで、非常に均一で長いシーケンスに対してわずかに効率的である可能性があります。特定のワークロードでのベンチマークが重要です。
+
+4.  **PagedAttentionはすべてのLLMアーキテクチャで動作しますか？**
+    PagedAttentionは、メモリ管理とアテンションカーネルの最適化です。KVキャッシュに依存するほとんどのトランスフォーマーベースのLLMアーキテクチャ（例：Llama、Mistral、GPT-2、OPT）と互換性があるように設計されています。vLLMは、サポートするモデルに対してPagedAttentionを具体的に実装しています。
+
+5.  **GPUメモリが満杯になった場合、vLLMはKVキャッシュの退去をどのように処理しますか？**
+    vLLMは、メモリ圧力が高い場合に、LRU（Least Recently Used）または同様のポリシーを使用してKVキャッシュブロックを退去させます。これは、最近アクセスされていないシーケンスに属するブロックが、新しいシーケンスのためのスペースを確保するために解放されることを意味します。これは、スケジューラ内のブロックマネージャーによって管理されます。

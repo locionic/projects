@@ -1,0 +1,322 @@
+---
+title: "Kiến trúc ScyllaDB & Seastar: Thực thi Thread-per-Core, C++ Shared-Nothing & Độ trễ P99"
+images: ['/static/images/scylladb-seastar-asynchronous-thread-per-core.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["database", "scylladb", "cassandra", "c++", "performance"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về kiến trúc ScyllaDB & Seastar: thực thi thread-per-core, C++ shared-nothing & độ trễ P99 với kiến trúc cấp độ sản xuất và các ví dụ mã."
+---
+
+ScyllaDB là một cơ sở dữ liệu phân tán NoSQL hiệu suất cao, tương thích với các API của Apache Cassandra và Amazon DynamoDB. Sự khác biệt về kiến trúc của nó bắt nguồn từ engine C++ bất đồng bộ bên dưới, Seastar. Tài liệu này phân tích các nguyên lý kiến trúc cốt lõi của ScyllaDB: thực thi thread-per-core, thiết kế shared-nothing, nhận biết NUMA và lập lịch I/O trong không gian người dùng, làm rõ cách các nguyên tắc này kết hợp lại để mang lại độ trễ P99 dưới mili giây có thể dự đoán được ngay cả dưới tải cực lớn.
+
+<AudioPlayer src="/static/audio/scylladb-seastar-asynchronous-thread-per-core-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Engine Seastar: Mô hình Shared-Nothing, Thread-per-Core
+
+Các hệ thống cơ sở dữ liệu truyền thống, bao gồm Apache Cassandra, thường dựa vào kiến trúc đa luồng, nơi một nhóm các luồng xử lý các yêu cầu. Các luồng này tranh giành các tài nguyên dùng chung (khóa, bộ đệm) và phải chịu sự can thiệp của bộ lập lịch hệ điều hành, dẫn đến chi phí chuyển đổi ngữ cảnh và các đỉnh độ trễ không thể đoán trước. Hơn nữa, các hệ thống dựa trên JVM như Cassandra còn gây ra các khoảng dừng thu gom rác (GC), có thể ảnh hưởng đáng kể đến độ trễ P99.
+
+Seastar, framework C++ bất đồng bộ cung cấp sức mạnh cho ScyllaDB, đã tái kiến trúc mô hình này một cách cơ bản. Nó áp dụng mô hình thực thi "shared-nothing, thread-per-core".
+
+### Thực thi Thread-per-Core
+
+Trong Seastar, mỗi lõi CPU được gán một luồng Seastar chuyên dụng (còn được gọi là "shard" hoặc "reactor"). Luồng này được ghim vào lõi của nó và chạy một vòng lặp sự kiện. Tất cả dữ liệu và logic được xử lý bởi lõi đó đều cục bộ với nó. Không có bộ nhớ dùng chung hoặc cấu trúc dữ liệu dùng chung giữa các lõi yêu cầu khóa hoặc các hoạt động nguyên tử để truy cập đồng thời.
+
+Thiết kế này loại bỏ:
+1.  **Chi phí chuyển đổi ngữ cảnh:** Bộ lập lịch OS phần lớn bị bỏ qua để lập lịch ở cấp ứng dụng. Luồng của mỗi lõi chạy liên tục, xử lý các sự kiện từ hàng đợi cục bộ của nó.
+2.  **Tranh chấp khóa:** Không có trạng thái có thể thay đổi dùng chung, mutex, semaphore và các nguyên thủy đồng bộ hóa khác phần lớn không cần thiết cho việc truy cập dữ liệu giữa các lõi, đơn giản hóa tính đồng thời và tăng thông lượng.
+3.  **Hủy bỏ bộ đệm:** Tính cục bộ của dữ liệu được tối đa hóa. Một lõi chủ yếu hoạt động trên dữ liệu nằm trong bộ đệm L1/L2/L3 của chính nó, giảm thiểu lỗi bộ đệm và lưu lượng truy cập nhất quán bộ đệm giữa các lõi.
+
+### Kiến trúc Shared-Nothing
+
+Nguyên tắc "shared-nothing" mở rộng ra ngoài các lõi CPU đến các tài nguyên khác. Mỗi luồng Seastar quản lý riêng của nó:
+*   **Vùng bộ nhớ:** Phân bổ bộ nhớ nhận biết NUMA đảm bảo rằng bộ nhớ được truy cập bởi một lõi được phân bổ từ nút NUMA cục bộ với lõi đó.
+*   **Ngăn xếp mạng:** Seastar có thể bỏ qua ngăn xếp mạng của kernel bằng cách sử dụng các công nghệ như DPDK (Data Plane Development Kit) hoặc XDP (eXpress Data Path) để truy cập trực tiếp vào các card giao diện mạng (NIC). Điều này cho phép mỗi lõi xử lý I/O mạng của riêng nó, giảm chi phí kernel và cải thiện tốc độ xử lý gói.
+*   **Hàng đợi I/O đĩa:** Mỗi lõi quản lý hàng đợi các yêu cầu I/O đĩa của riêng nó, tận dụng các cơ chế I/O bất đồng bộ như Linux AIO hoặc `io_uring`.
+
+Khi một yêu cầu đến, nó thường được băm đến một lõi cụ thể dựa trên khóa phân vùng. Lõi đó sau đó xử lý yêu cầu từ đầu đến cuối, từ đầu vào mạng đến I/O đĩa và ngược lại, mà không liên quan đến các lõi khác trừ khi dữ liệu cần được chuyển rõ ràng (ví dụ: đối với các truy vấn liên shard, được xử lý thông qua truyền thông điệp).
+
+### Mô hình lập trình bất đồng bộ
+
+Seastar sử dụng mô hình lập trình bất đồng bộ dựa trên future. Các hoạt động mà theo truyền thống sẽ chặn (ví dụ: I/O đĩa, I/O mạng) trả về một đối tượng `future<T>` ngay lập tức. Vòng lặp sự kiện Seastar sau đó lập lịch các tác vụ sẵn sàng khác trong khi hoạt động I/O hoàn tất. Khi I/O hoàn tất, future tương ứng được "hoàn thành" và phần tiếp theo của nó (một callback hoặc hoạt động được xâu chuỗi) được lập lịch để thực thi trên cùng một lõi.
+
+Việc đa nhiệm hợp tác này trong một luồng duy nhất trên mỗi lõi tránh được chi phí chuyển đổi ngữ cảnh của OS trong khi vẫn cho phép tính đồng thời cao.
+
+```cpp
+// Example: Seastar asynchronous I/O
+#include <seastar/core/app-template.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/file.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/thread.hh> // For seastar::thread
+
+// Function to write data asynchronously to a file
+seastar::future<> write_to_file(const seastar::sstring& filename, const seastar::sstring& data) {
+    // Open the file asynchronously. O_CREAT | O_TRUNC | O_WRONLY are standard flags.
+    // 0644 is file permissions.
+    return seastar::open_file_dma(filename, seastar::open_flags::rw_create | seastar::open_flags::truncate).then([data](seastar::file f) {
+        // Allocate a DMA-aligned buffer for efficient I/O
+        auto buffer = seastar::temporary_buffer<char>::aligned(4096, data.size());
+        std::copy(data.begin(), data.end(), buffer.begin());
+
+        // Write the buffer to the file asynchronously
+        return f.dma_write(buffer.get(), 0, buffer.size()).then([f = std::move(f), buffer = std::move(buffer)] (size_t bytes_written) {
+            std::cout << "Wrote " << bytes_written << " bytes to " << f.get_path() << std::endl;
+            // Close the file asynchronously
+            return f.close();
+        });
+    }).handle_exception([](std::exception_ptr ep) {
+        // Handle any exceptions during file operations
+        std::cerr << "Error writing to file: " << seastar::current_exception_better_what(ep) << std::endl;
+        return seastar::make_exception_future<>(ep);
+    });
+}
+
+// Function to read data asynchronously from a file
+seastar::future<seastar::sstring> read_from_file(const seastar::sstring& filename) {
+    return seastar::open_file_dma(filename, seastar::open_flags::ro).then([filename](seastar::file f) {
+        // Get file size to allocate buffer
+        return f.size().then([f = std::move(f), filename](uint64_t size) mutable {
+            auto buffer = seastar::temporary_buffer<char>::aligned(4096, size);
+            // Read into the buffer asynchronously
+            return f.dma_read(buffer.get(), 0, size).then([f = std::move(f), buffer = std::move(buffer)](size_t bytes_read) mutable {
+                std::cout << "Read " << bytes_read << " bytes from " << f.get_path() << std::endl;
+                // Close the file asynchronously
+                return f.close().then([buffer = std::move(buffer)]() mutable {
+                    return seastar::sstring(buffer.begin(), buffer.size());
+                });
+            });
+        });
+    }).handle_exception([](std::exception_ptr ep) {
+        std::cerr << "Error reading from file: " << seastar::current_exception_better_what(ep) << std::endl;
+        return seastar::make_exception_future<seastar::sstring>(ep);
+    });
+}
+
+int main(int argc, char** argv) {
+    seastar::app_template app;
+
+    // Define the application's main function
+    app.run(argc, argv, [] {
+        return seastar::make_ready_future().then([] {
+            seastar::sstring test_data = "Hello, Seastar asynchronous I/O!";
+            seastar::sstring filename = "test_async_io.txt";
+
+            // Chain asynchronous operations: write, then read, then print
+            return write_to_file(filename, test_data).then([filename] {
+                return read_from_file(filename);
+            }).then([](seastar::sstring content) {
+                std::cout << "File content: " << content << std::endl;
+            }).handle_exception([](std::exception_ptr ep) {
+                std::cerr << "Application failed: " << seastar::current_exception_better_what(ep) << std::endl;
+                return seastar::make_exception_future<>(ep);
+            });
+        });
+    });
+    return 0;
+}
+```
+Để biên dịch và chạy ví dụ Seastar này:
+```bash
+# Assuming Seastar is installed and SEASTAR_HOME is set
+g++ -std=c++17 -Wall -Werror -O2 -I${SEASTAR_HOME}/include -L${SEASTAR_HOME}/build/lib -Wl,-rpath=${SEASTAR_HOME}/build/lib -o async_io async_io.cpp -lseastar -lfmt -lstdc++fs -lboost_program_options -lboost_thread -lboost_system -lboost_filesystem -lboost_chrono -lboost_context -lboost_atomic -lhwloc -latomic -lrt -lm -ldl -lucontext -lnuma -lz -lcryptopp -lgnutls -lprotobuf -ljsoncpp -lcap -luring
+./async_io --smp 1 # Run with 1 core
+```
+
+### Nhận biết NUMA
+
+Các máy chủ đa socket hiện đại sử dụng kiến trúc Non-Uniform Memory Access (NUMA). Thời gian truy cập bộ nhớ thay đổi tùy thuộc vào việc bộ nhớ đó cục bộ với CPU đang truy cập nó hay nằm trên một nút NUMA khác. ScyllaDB rõ ràng nhận biết NUMA. Nó phân vùng các vùng bộ nhớ của mình sao cho mỗi luồng Seastar phân bổ bộ nhớ từ nút NUMA mà nó cư trú. Điều này làm giảm đáng kể việc truy cập bộ nhớ giữa các nút NUMA, vốn chậm hơn và tiêu tốn băng thông giữa các socket.
+
+### Lập lịch I/O trong không gian người dùng (Linux AIO / `io_uring`)
+
+ScyllaDB bỏ qua lớp khối của kernel cho I/O đĩa bất cứ khi nào có thể. Nó sử dụng các giao diện I/O bất đồng bộ như Linux AIO (Asynchronous I/O) hoặc, gần đây hơn và được ưu tiên hơn, `io_uring`. `io_uring` là một giao diện kernel Linux hiện đại cung cấp cơ chế I/O bất đồng bộ hiệu quả cao, không sao chép.
+
+Mỗi lõi Seastar duy trì hàng đợi gửi và hoàn thành `io_uring` của riêng nó. Điều này cho phép gửi trực tiếp các yêu cầu I/O từ không gian người dùng đến kernel và truy xuất trực tiếp các sự kiện hoàn thành, giảm thiểu chuyển đổi ngữ cảnh và chi phí gọi hệ thống. ScyllaDB cũng triển khai bộ lập lịch I/O của riêng mình trong không gian người dùng, cho phép kiểm soát chi tiết việc ưu tiên và công bằng I/O, điều này rất quan trọng để duy trì độ trễ thấp dưới các khối lượng công việc hỗn hợp.
+
+```cpp
+// Conceptual illustration of io_uring usage within Seastar (simplified)
+// In reality, Seastar abstracts this heavily.
+
+#include <liburing.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <iostream>
+#include <vector>
+#include <string>
+
+// This is a simplified, standalone example to demonstrate io_uring concepts.
+// Seastar integrates io_uring much more deeply into its reactor model.
+
+const int QUEUE_DEPTH = 64;
+const int BLOCK_SIZE = 4096;
+
+int main() {
+    struct io_uring ring;
+    int ret = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
+    if (ret < 0) {
+        std::cerr << "io_uring_queue_init: " << strerror(-ret) << std::endl;
+        return 1;
+    }
+
+    int fd = open("test_io_uring.txt", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        std::cerr << "open: " << strerror(errno) << std::endl;
+        io_uring_queue_exit(&ring);
+        return 1;
+    }
+
+    std::string write_data = "Hello from io_uring!";
+    std::vector<char> write_buffer(BLOCK_SIZE);
+    std::copy(write_data.begin(), write_data.end(), write_buffer.begin());
+
+    // Prepare a write request
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        std::cerr << "io_uring_get_sqe failed" << std::endl;
+        close(fd);
+        io_uring_queue_exit(&ring);
+        return 1;
+    }
+    io_uring_prep_write(sqe, fd, write_buffer.data(), write_buffer.size(), 0);
+    sqe->user_data = 1; // Unique identifier for this request
+
+    // Submit the request
+    io_uring_submit(&ring);
+
+    // Wait for completion
+    struct io_uring_cqe *cqe;
+    ret = io_uring_wait_cqe(&ring, &cqe);
+    if (ret < 0) {
+        std::cerr << "io_uring_wait_cqe: " << strerror(-ret) << std::endl;
+        close(fd);
+        io_uring_queue_exit(&ring);
+        return 1;
+    }
+
+    if (cqe->res < 0) {
+        std::cerr << "Write failed: " << strerror(-cqe->res) << std::endl;
+    } else {
+        std::cout << "Write completed: " << cqe->res << " bytes" << std::endl;
+    }
+
+    io_uring_cqe_seen(&ring, cqe); // Mark completion as seen
+
+    // Prepare a read request
+    std::vector<char> read_buffer(BLOCK_SIZE);
+    sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        std::cerr << "io_uring_get_sqe failed for read" << std::endl;
+        close(fd);
+        io_uring_queue_exit(&ring);
+        return 1;
+    }
+    io_uring_prep_read(sqe, fd, read_buffer.data(), read_buffer.size(), 0);
+    sqe->user_data = 2; // Unique identifier for this request
+
+    // Submit the request
+    io_uring_submit(&ring);
+
+    // Wait for completion
+    ret = io_uring_wait_cqe(&ring, &cqe);
+    if (ret < 0) {
+        std::cerr << "io_uring_wait_cqe for read: " << strerror(-ret) << std::endl;
+        close(fd);
+        io_uring_queue_exit(&ring);
+        return 1;
+    }
+
+    if (cqe->res < 0) {
+        std::cerr << "Read failed: " << strerror(-cqe->res) << std::endl;
+    } else {
+        std::cout << "Read completed: " << cqe->res << " bytes. Content: " << std::string(read_buffer.data(), cqe->res) << std::endl;
+    }
+
+    io_uring_cqe_seen(&ring, cqe);
+
+    close(fd);
+    io_uring_queue_exit(&ring);
+    return 0;
+}
+```
+Để biên dịch và chạy ví dụ `io_uring` này:
+```bash
+g++ -std=c++17 -Wall -Werror -O2 -o io_uring_example io_uring_example.cpp -luring
+./io_uring_example
+```
+Lưu ý: `io_uring` yêu cầu kernel Linux gần đây (5.1 trở lên cho chức năng cơ bản, 5.8+ cho các tính năng nâng cao).
+
+## ScyllaDB so với Apache Cassandra: So sánh kiến trúc
+
+| Tính năng | ScyllaDB (Seastar) | Apache Cassandra (JVM) |
+|---|---|---|
+| **Mô hình thực thi** | Thread-per-core, shared-nothing | Đa luồng, shared-memory |
+| **Đồng thời** | Đa nhiệm hợp tác (futures) | Đa nhiệm ưu tiên (luồng OS) |
+| **Ngôn ngữ** | C++ | Java |
+| **Quản lý bộ nhớ** | Thủ công (bộ cấp phát nhận biết NUMA) | JVM GC (Stop-the-world/concurrent) |
+| **Mô hình I/O** | User-space AIO/io_uring, trực tiếp | Kernel-buffered AIO/NIO, bộ lập lịch OS |
+| **Ngăn xếp mạng** | Tùy chọn bỏ qua kernel (DPDK/XDP) | Ngăn xếp TCP/IP kernel tiêu chuẩn |
+| **Khả năng dự đoán độ trễ** | Cao (P99 dưới mili giây) | Thấp hơn (khoảng dừng GC, chuyển đổi ngữ cảnh) |
+| **Sử dụng tài nguyên** | Gần 100% CPU, hiệu quả I/O cao | Biến đổi, chi phí GC, chuyển đổi ngữ cảnh |
+| **Thời gian khởi động** | Nhanh | Chậm hơn (JVM JIT, tải lớp) |
+| **Dung lượng** | Nhỏ hơn | Lớn hơn (runtime JVM) |
+
+## Đạt được độ trễ P99 có thể dự đoán được
+
+Các lựa chọn kiến trúc của ScyllaDB trực tiếp góp phần vào khả năng duy trì độ trễ P99 dưới mili giây có thể dự đoán được dưới thông lượng cao (ví dụ: 500.000 ghi/giây).
+
+*   **Loại bỏ các khoảng dừng GC:** Được viết bằng C++, ScyllaDB tránh được các khoảng dừng "stop-the-world" không thể đoán trước vốn có trong việc thu gom rác của JVM. Quản lý bộ nhớ là xác định và được kiểm soát.
+*   **Giảm chuyển đổi ngữ cảnh:** Việc ghim thread-per-core và mô hình đa nhiệm hợp tác làm giảm đáng kể các chuyển đổi ngữ cảnh cấp OS, vốn là một nguồn chính gây ra độ trễ không ổn định.
+*   **Tính cục bộ của dữ liệu và hiệu quả bộ đệm:** Thiết kế shared-nothing đảm bảo dữ liệu và mã cục bộ với lõi xử lý, tối đa hóa tỷ lệ truy cập bộ đệm CPU và giảm thiểu các truy cập bộ nhớ tốn kém.
+*   **I/O hiệu quả:** Lập lịch I/O trong không gian người dùng với `io_uring` cung cấp quyền truy cập trực tiếp, độ trễ thấp vào các thiết bị lưu trữ, bỏ qua chi phí kernel và cho phép ScyllaDB ưu tiên các hoạt động I/O quan trọng.
+*   **Tối ưu hóa NUMA:** Giảm thiểu lưu lượng truy cập giữa các NUMA đảm bảo thời gian truy cập bộ nhớ nhất quán, ngăn chặn các đỉnh độ trễ từ việc tìm nạp bộ nhớ từ xa.
+*   **Áp lực ngược và cân bằng tải:** ScyllaDB tích hợp các cơ chế nội bộ tinh vi để áp lực ngược và cân bằng tải trên các lõi và nút, ngăn chặn bất kỳ thành phần nào trở thành nút thắt cổ chai và đảm bảo suy giảm hiệu suất một cách duyên dáng khi quá tải.
+
+## Những vấn đề và cách khắc phục trong sản xuất
+
+1.  **Ghim/Cách ly CPU bị cấu hình sai:**
+    *   **Triệu chứng:** Độ trễ không thể đoán trước, thông lượng thấp hơn mong đợi, thời gian CPU bị chiếm dụng cao, hoặc `top` cho thấy các tiến trình ScyllaDB nhảy giữa các lõi.
+    *   **Nguyên nhân:** ScyllaDB dựa vào các lõi CPU chuyên dụng. Nếu bộ lập lịch OS được phép di chuyển các luồng ScyllaDB hoặc nếu các tiến trình khác tranh giành cùng các lõi, hiệu suất sẽ giảm sút.
+    *   **Khắc phục:** Đảm bảo các tham số kernel `isolcpus` hoặc `cpuset` được cấu hình đúng trong `/etc/default/grub` (hoặc tương đương) để cách ly các lõi cho ScyllaDB. Sử dụng `tuned-adm profile scylla` trên RHEL/CentOS hoặc cấu hình thủ công `irqbalance` để tránh định tuyến các ngắt đến các lõi ScyllaDB. Xác minh bằng `lscpu -e` và `taskset -cp <pid>`.
+
+2.  **Lệch NUMA:**
+    *   **Triệu chứng:** Các chỉ số `numa_hit` và `numa_miss` cao trong `numastat -m`, hoặc `perf` cho thấy các truy cập bộ nhớ từ xa đáng kể.
+    *   **Nguyên nhân:** Các tiến trình ScyllaDB không được liên kết đúng với các nút NUMA tương ứng của chúng, hoặc bộ nhớ đang được phân bổ từ một nút từ xa.
+    *   **Khắc phục:** ScyllaDB thường xử lý việc liên kết NUMA tự động. Đảm bảo `numactl` được cài đặt. Kiểm tra nhật ký ScyllaDB để tìm các cảnh báo liên quan đến NUMA. Xác minh các cài đặt `scylla.yaml` `smp` và `memory` phù hợp với phần cứng của bạn. Ví dụ, nếu bạn có hai nút NUMA, `smp` phải bằng một nửa tổng số lõi của bạn và bộ nhớ phải bằng một nửa tổng RAM của bạn.
+
+3.  **Không đủ tài nguyên `io_uring` / AIO:**
+    *   **Triệu chứng:** Cảnh báo độ sâu hàng đợi I/O trong nhật ký, độ trễ I/O đĩa cao mặc dù lưu trữ nhanh, `iostat` cho thấy thời gian `await` cao.
+    *   **Nguyên nhân:** Giới hạn `io_uring` hoặc AIO của kernel quá thấp, hoặc bộ nhớ lưu trữ bên dưới bị bão hòa.
+    *   **Khắc phục:** Đối với `io_uring`, đảm bảo kernel đủ mới. Đối với AIO cũ hơn, tăng `fs.aio-max-nr` trong `/etc/sysctl.conf` (ví dụ: `fs.aio-max-nr = 1048576`). Theo dõi chặt chẽ các chỉ số I/O đĩa. Cân nhắc lưu trữ nhanh hơn (NVMe) hoặc nhiều đường dẫn I/O hơn.
+
+4.  **Tranh chấp ngăn xếp mạng (không có DPDK/XDP):**
+    *   **Triệu chứng:** Độ trễ mạng cao, mất gói, `netstat -s` hiển thị lỗi, đặc biệt trên các nút thông lượng cao.
+    *   **Nguyên nhân:** Ngăn xếp mạng mặc định của kernel có thể trở thành nút thắt cổ chai dưới tốc độ gói cực cao, dẫn đến chuyển đổi ngữ cảnh và tràn bộ đệm.
+    *   **Khắc phục:** Đối với các triển khai quan trọng, hiệu suất cao, hãy cân nhắc bật DPDK hoặc XDP cho ScyllaDB. Điều này yêu cầu các NIC và mô-đun kernel cụ thể. Nếu không, hãy đảm bảo kích thước bộ đệm mạng được điều chỉnh (`net.core.rmem_max`, `net.core.wmem_max`, `net.ipv4.tcp_rmem`, `net.ipv4.tcp_wmem`).
+
+5.  **Cung cấp quá mức/thiếu lõi:**
+    *   **Triệu chứng:** Sử dụng CPU thấp trên một số lõi, tải cao trên các lõi khác, hoặc hiệu suất tổng thể kém.
+    *   **Nguyên nhân:** Cài đặt `scylla.yaml` `smp` không khớp với các lõi bị cách ly có sẵn, hoặc khối lượng công việc được phân phối không đều.
+    *   **Khắc phục:** Đặt `smp` thành số lõi bị cách ly dành riêng cho ScyllaDB. Để lại ít nhất một lõi cho OS và các tác vụ nền. Đảm bảo mô hình dữ liệu và khóa phân vùng của bạn dẫn đến phân phối dữ liệu và yêu cầu đều trên các nút và lõi.
+
+## Các câu hỏi thường gặp
+
+1.  **Tại sao ScyllaDB sử dụng C++ thay vì một ngôn ngữ có thu gom rác như Java hoặc Go?**
+    ScyllaDB sử dụng C++ để đạt được hiệu suất xác định và kiểm soát chi tiết các tài nguyên hệ thống. Điều này tránh được các đỉnh độ trễ không thể đoán trước do các khoảng dừng thu gom rác (phổ biến trong Java/Go) và cho phép quản lý bộ nhớ trực tiếp, nhận biết NUMA và I/O trong không gian người dùng, những yếu tố quan trọng để đạt được độ trễ P99 dưới mili giây ở quy mô lớn.
+
+2.  **ScyllaDB xử lý tính đồng thời như thế nào mà không cần khóa truyền thống hoặc luồng OS?**
+    ScyllaDB sử dụng mô hình "shared-nothing, thread-per-core". Mỗi lõi CPU chạy một luồng Seastar chuyên dụng với bộ nhớ, mạng và hàng đợi I/O cục bộ riêng. Tính đồng thời trong một lõi được quản lý thông qua đa nhiệm hợp tác bằng cách sử dụng futures và continuations. Giao tiếp giữa các lõi xảy ra thông qua truyền thông điệp rõ ràng, tránh tranh chấp bộ nhớ dùng chung và khóa.
+
+3.  **`io_uring` là gì và tại sao nó quan trọng đối với hiệu suất của ScyllaDB?**
+    `io_uring` là một giao diện kernel Linux hiện đại cho I/O bất đồng bộ. Nó cho phép ScyllaDB gửi và hoàn thành các yêu cầu I/O trực tiếp từ không gian người dùng mà không cần gọi hệ thống hoặc chuyển đổi ngữ cảnh cho mỗi hoạt động. Điều này làm giảm đáng kể chi phí I/O, cải thiện thông lượng và giảm độ trễ so với I/O được đệm bởi kernel truyền thống hoặc các giao diện AIO cũ hơn.
+
+4.  **ScyllaDB đảm bảo tính cục bộ của dữ liệu và nhận biết NUMA như thế nào?**
+    Engine Seastar của ScyllaDB được thiết kế để nhận biết NUMA. Nó phân vùng các vùng bộ nhớ và hàng đợi I/O sao cho mỗi luồng Seastar (được ghim vào một lõi CPU) phân bổ và truy cập bộ nhớ chủ yếu từ nút NUMA cục bộ của nó. Điều này giảm thiểu việc truy cập bộ nhớ giữa các nút NUMA chậm hơn, điều này rất quan trọng để có hiệu suất cao nhất quán trên các máy chủ đa socket.
+
+5.  **Tôi có thể chạy các ứng dụng khác trên cùng máy chủ với ScyllaDB không?**
+    Mặc dù về mặt kỹ thuật là có thể, nhưng điều này không được khuyến khích mạnh mẽ đối với các triển khai ScyllaDB trong sản xuất. ScyllaDB được thiết kế để tiêu thụ gần như tất cả các tài nguyên CPU, bộ nhớ và I/O có sẵn trên các lõi chuyên dụng của nó để đạt hiệu suất tối ưu. Chạy các ứng dụng khác trên cùng máy chủ, đặc biệt là trên cùng các lõi bị cách ly, sẽ dẫn đến tranh chấp tài nguyên, độ trễ không thể đoán trước và hiệu suất ScyllaDB bị suy giảm. Nên sử dụng phần cứng chuyên dụng hoặc máy ảo bị cách ly với việc ghim CPU.

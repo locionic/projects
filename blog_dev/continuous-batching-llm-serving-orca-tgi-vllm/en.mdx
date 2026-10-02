@@ -1,0 +1,445 @@
+---
+title: 'Continuous Dynamic Batching in LLM Inference: Orca, vLLM & TGI Latency Benchmarks'
+images: ['/static/images/continuous-batching-llm-serving-orca-tgi-vllm.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["ai", "llm", "performance", "systems", "python"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: 'Comprehensive guide covering continuous dynamic batching in llm inference: orca, vllm & tgi latency benchmarks with production-grade architecture and code examples.'
+---
+
+Large Language Model (LLM) inference serving demands high throughput and low latency. Traditional static batching, where requests are grouped and processed together, exhibits significant inefficiencies. Short requests often wait for the longest request in the batch to complete, leading to wasted GPU cycles and increased Time to First Token (TTFT) and Inter-Token Latency (ITL). Continuous dynamic batching addresses this by processing tokens iteratively, allowing the scheduler to dynamically add new requests or preempt existing ones at each decoding step. This document details the principles, implementation strategies, and performance characteristics of continuous batching, benchmarking vLLM and HuggingFace TGI.
+
+<AudioPlayer src="/static/audio/continuous-batching-llm-serving-orca-tgi-vllm.mp3" title="Executive Audio Briefing" voice="Google Cloud en-US-Neural2-F" />
+
+
+## The Inefficiency of Static Batching
+
+In static batching, a fixed number of requests are grouped. Once a batch is formed, all requests within it are processed until the longest sequence completes. This creates a "head-of-line blocking" problem. Consider a batch of 8 requests, where 7 requests require 20 tokens and 1 request requires 500 tokens. The 7 short requests will be held in GPU memory, consuming resources, until the 500-token request finishes. This is particularly detrimental for interactive applications where TTFT is critical.
+
+The core issue is that GPU utilization drops significantly during the decoding phase for shorter sequences while waiting for longer ones. The KV cache for completed sequences remains allocated, but unused.
+
+## Continuous Dynamic Batching: Iteration-Level Scheduling
+
+Continuous dynamic batching, pioneered by systems like Orca, vLLM, and TGI, fundamentally changes how requests are processed. Instead of batching entire sequences, it batches *tokens* at each decoding iteration. This allows for:
+
+1.  **Dynamic Batch Size:** The batch size can fluctuate at each step, maximizing GPU utilization by filling available capacity with new requests.
+2.  **Preemption and Scheduling:** When new requests arrive, or existing requests complete, the scheduler can re-evaluate the batch. If GPU memory is constrained, it can preempt (evict) lower-priority or longer-running requests to make room for new, higher-priority ones.
+3.  **Reduced Latency:** Short requests can complete quickly without waiting for long requests, significantly improving TTFT.
+
+### Orca's Iteration-Level Scheduling
+
+Orca introduced the concept of iteration-level scheduling. At each decoding step, the scheduler decides which requests to include in the current batch. This decision is based on factors like remaining sequence length, priority, and available GPU memory. The key insight is that LLM inference is an iterative process, generating one token at a time. By making scheduling decisions at this granularity, resources can be managed much more efficiently.
+
+### KV Cache Management and Preemption
+
+A critical component of continuous batching is efficient Key-Value (KV) cache management. The KV cache stores the attention keys and values for each token generated, growing with sequence length. When GPU memory is exhausted, preemption strategies are employed:
+
+1.  **Recompute:** The KV cache for a preempted request is discarded. When the request is rescheduled, its KV cache must be recomputed from scratch up to the last generated token. This is computationally expensive but simpler to implement.
+2.  **Swap:** The KV cache for a preempted request is swapped from GPU memory to CPU memory (or even disk). When the request is rescheduled, its KV cache is swapped back to GPU memory. This is faster than recomputation but requires careful memory management and can introduce latency if CPU-GPU transfer is slow.
+
+Modern systems like vLLM utilize PagedAttention, which manages KV cache memory in fixed-size blocks, similar to virtual memory paging in operating systems. This allows for non-contiguous allocation and efficient sharing of KV cache blocks, further reducing memory fragmentation and improving utilization.
+
+## Benchmarking Setup
+
+We will benchmark vLLM and HuggingFace TGI using a common LLM, Llama-2-7b-chat-hf, on an NVIDIA A100 80GB GPU. Our focus will be on TTFT and ITL under varying concurrency levels.
+
+### Metrics
+
+*   **Time to First Token (TTFT):** The time elapsed from when the request is received by the server until the first output token is generated. Critical for perceived responsiveness.
+*   **Inter-Token Latency (ITL):** The average time between subsequent token generations. Reflects the steady-state throughput of the system.
+
+### Environment
+
+*   **GPU:** NVIDIA A100 80GB
+*   **Model:** `meta-llama/Llama-2-7b-chat-hf`
+*   **Load Generator:** Python script using `asyncio` and `httpx`
+*   **Concurrency:** 1, 4, 8, 16, 32 concurrent requests
+*   **Prompt Length:** Randomly sampled between 50 and 200 tokens
+*   **Max New Tokens:** Randomly sampled between 100 and 500 tokens
+
+### Code: vLLM Server
+
+First, set up the vLLM server. Ensure you have vLLM installed (`pip install vllm`).
+
+```python
+# vllm_server.py
+import os
+from vllm import LLM, SamplingParams
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
+import uvicorn
+import time
+
+# Configuration
+MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
+GPU_MEMORY_UTILIZATION = 0.9 # Adjust based on your GPU and model size
+
+# Initialize LLM
+print(f"Loading model: {MODEL_NAME}...")
+llm = LLM(
+    model=MODEL_NAME,
+    tensor_parallel_size=1, # Single GPU
+    gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+    trust_remote_code=True,
+    dtype="bfloat16" # Use bfloat16 for better performance on A100
+)
+print("Model loaded.")
+
+app = FastAPI()
+
+class GenerateRequest(BaseModel):
+    prompt: str
+    max_new_tokens: int = 256
+    temperature: float = 0.7
+    top_p: float = 0.95
+    do_sample: bool = True
+
+@app.post("/generate")
+async def generate(request: GenerateRequest):
+    sampling_params = SamplingParams(
+        n=1,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        max_tokens=request.max_new_tokens,
+        stop=["</s>"], # Llama-2 specific stop token
+        do_sample=request.do_sample
+    )
+
+    start_time = time.time()
+    outputs = await llm.generate_async(request.prompt, sampling_params)
+    end_time = time.time()
+
+    first_token_time = -1 # Placeholder, vLLM doesn't expose this directly in sync API
+    # For accurate TTFT, you'd typically stream tokens and measure when the first one arrives.
+    # For this benchmark, we'll approximate TTFT from the client side.
+
+    generated_text = outputs[0].outputs[0].text
+    num_output_tokens = len(outputs[0].outputs[0].token_ids)
+
+    return {
+        "generated_text": generated_text,
+        "num_output_tokens": num_output_tokens,
+        "total_time_s": end_time - start_time,
+        "first_token_time_s": first_token_time # Will be calculated client-side
+    }
+
+if __name__ == "__main__":
+    # To run: python vllm_server.py
+    # Then in another terminal: uvicorn vllm_server:app --host 0.0.0.0 --port 8000 --workers 1
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
+
+```
+
+Run the vLLM server:
+```bash
+python vllm_server.py
+# In a separate terminal:
+uvicorn vllm_server:app --host 0.0.0.0 --port 8000 --workers 1
+```
+
+### Code: TGI Server
+
+Install TGI (`pip install text-generation-inference`).
+Then, run the TGI Docker container.
+
+```bash
+# TGI server command
+# Ensure you have Docker and NVIDIA Container Toolkit installed
+docker run --gpus all -p 8080:80 -v ~/.cache/huggingface:/data ghcr.io/huggingface/text-generation-inference:1.4 --model-id meta-llama/Llama-2-7b-chat-hf --dtype bfloat16 --max-input-length 1024 --max-total-tokens 2048
+```
+
+### Code: Benchmarking Client
+
+This client will send requests concurrently and measure TTFT and ITL.
+
+```python
+# benchmark_client.py
+import asyncio
+import httpx
+import time
+import random
+import numpy as np
+from typing import List, Dict
+
+# Configuration
+VLLM_ENDPOINT = "http://localhost:8000/generate"
+TGI_ENDPOINT = "http://localhost:8080/generate" # TGI uses /generate for non-streaming
+MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
+
+# Prompt templates for Llama-2
+PROMPT_TEMPLATES = [
+    "<s>[INST] {prompt} [/INST]",
+    "<s>[INST] <<SYS>>\nYou are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature. If a question does not make any sense, or is not factually coherent, explain why instead of answering something incorrect. Do not share false information.\n<</SYS>>\n\n{prompt} [/INST]"
+]
+
+# Example prompts
+BASE_PROMPTS = [
+    "Explain the concept of quantum entanglement in simple terms.",
+    "Write a short story about a detective solving a mystery in a futuristic city.",
+    "Describe the economic impact of artificial intelligence on the job market.",
+    "What are the main differences between classical and quantum computing?",
+    "Provide a detailed recipe for authentic Italian lasagna.",
+    "Discuss the ethical implications of autonomous vehicles.",
+    "Summarize the plot of 'Dune' by Frank Herbert.",
+    "Explain the process of photosynthesis.",
+    "Write a poem about the beauty of the night sky.",
+    "What is the significance of the 'butterfly effect' in chaos theory?"
+]
+
+def generate_random_prompt(min_len=50, max_len=200):
+    base = random.choice(BASE_PROMPTS)
+    # Pad with random words to reach desired length
+    words = base.split()
+    while len(" ".join(words)) < min_len:
+        words.append(random.choice(BASE_PROMPTS).split()[0]) # Add a random word
+    prompt = " ".join(words[:random.randint(len(words), len(words) + 50)]) # Add some variability
+    return random.choice(PROMPT_TEMPLATES).format(prompt=prompt)
+
+async def send_request(client: httpx.AsyncClient, endpoint: str, prompt: str, max_new_tokens: int):
+    request_payload = {
+        "prompt": prompt,
+        "max_new_tokens": max_new_tokens,
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "do_sample": True
+    }
+
+    start_time = time.time()
+    try:
+        # For TGI, we need to stream to get TTFT accurately
+        if "8080" in endpoint: # Heuristic for TGI
+            async with client.stream("POST", endpoint, json=request_payload, timeout=60.0) as response:
+                response.raise_for_status()
+                first_token_received = False
+                ttft = -1
+                tokens = []
+                token_gen_times = []
+
+                async for chunk in response.aiter_bytes():
+                    if not first_token_received:
+                        ttft = time.time() - start_time
+                        first_token_received = True
+
+                    # TGI streaming format is Server-Sent Events (SSE)
+                    # We need to parse it to extract tokens
+                    try:
+                        chunk_str = chunk.decode('utf-8')
+                        for line in chunk_str.split('\n'):
+                            if line.startswith('data:'):
+                                data = line[len('data:'):].strip()
+                                if data == '[DONE]':
+                                    break
+                                token_data = json.loads(data)
+                                if 'token' in token_data and 'text' in token_data['token']:
+                                    tokens.append(token_data['token']['text'])
+                                    token_gen_times.append(time.time())
+                    except json.JSONDecodeError:
+                        # Handle incomplete JSON chunks
+                        pass
+
+                total_time = time.time() - start_time
+                num_output_tokens = len(tokens)
+
+                itl = -1
+                if num_output_tokens > 1:
+                    itl = np.mean(np.diff(token_gen_times))
+
+                return {
+                    "ttft": ttft,
+                    "itl": itl,
+                    "total_time": total_time,
+                    "num_output_tokens": num_output_tokens,
+                    "success": True
+                }
+        else: # vLLM non-streaming endpoint for simplicity in this benchmark
+            response = await client.post(endpoint, json=request_payload, timeout=60.0)
+            response.raise_for_status()
+            data = response.json()
+
+            # Approximate TTFT for vLLM as total_time / num_output_tokens for non-streaming
+            # This is a simplification; a true streaming client would be needed for accurate TTFT.
+            # For this benchmark, we'll use total_time as a proxy for TTFT for vLLM,
+            # and focus on TGI's streaming TTFT.
+            num_output_tokens = data.get("num_output_tokens", 0)
+            total_time = time.time() - start_time
+
+            # For vLLM, without streaming, ITL is hard to measure accurately from client
+            # We'll report total time / tokens as an average token generation time.
+            avg_token_gen_time = total_time / num_output_tokens if num_output_tokens > 0 else 0
+
+            return {
+                "ttft": total_time, # Proxy for TTFT for vLLM non-streaming
+                "itl": avg_token_gen_time, # Proxy for ITL for vLLM non-streaming
+                "total_time": total_time,
+                "num_output_tokens": num_output_tokens,
+                "success": True
+            }
+    except httpx.RequestError as e:
+        print(f"Request failed: {e}")
+        return {"ttft": -1, "itl": -1, "total_time": -1, "num_output_tokens": 0, "success": False}
+    except httpx.HTTPStatusError as e:
+        print(f"HTTP error: {e.response.status_code} - {e.response.text}")
+        return {"ttft": -1, "itl": -1, "total_time": -1, "num_output_tokens": 0, "success": False}
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return {"ttft": -1, "itl": -1, "total_time": -1, "num_output_tokens": 0, "success": False}
+
+
+async def run_benchmark(endpoint: str, concurrency: int, num_requests: int = 100):
+    print(f"\n--- Benchmarking {endpoint} with {concurrency} concurrent requests ---")
+    results = []
+
+    async with httpx.AsyncClient() as client:
+        tasks = []
+        for _ in range(num_requests):
+            prompt = generate_random_prompt()
+            max_new_tokens = random.randint(100, 500)
+            tasks.append(send_request(client, endpoint, prompt, max_new_tokens))
+
+        # Use a semaphore to limit concurrency
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def limited_task(task):
+            async with semaphore:
+                return await task
+
+        start_benchmark_time = time.time()
+        processed_results = await asyncio.gather(*[limited_task(t) for t in tasks])
+        end_benchmark_time = time.time()
+
+        for res in processed_results:
+            if res["success"]:
+                results.append(res)
+
+    if not results:
+        print("No successful requests to report.")
+        return
+
+    ttfts = [r["ttft"] for r in results if r["ttft"] > 0]
+    itls = [r["itl"] for r in results if r["itl"] > 0]
+    total_times = [r["total_time"] for r in results if r["total_time"] > 0]
+    output_tokens = [r["num_output_tokens"] for r in results if r["num_output_tokens"] > 0]
+
+    print(f"Total successful requests: {len(results)}")
+    print(f"Overall benchmark duration: {end_benchmark_time - start_benchmark_time:.2f} s")
+    print(f"Average TTFT: {np.mean(ttfts):.4f} s (Median: {np.median(ttfts):.4f} s)")
+    print(f"Average ITL: {np.mean(itls):.4f} s (Median: {np.median(itls):.4f} s)")
+    print(f"Average Total Request Time: {np.mean(total_times):.4f} s (Median: {np.median(total_times):.4f} s)")
+    print(f"Average Output Tokens: {np.mean(output_tokens):.2f}")
+    print(f"Total Output Tokens: {np.sum(output_tokens)}")
+    print(f"Throughput (tokens/sec): {np.sum(output_tokens) / (end_benchmark_time - start_benchmark_time):.2f}")
+
+async def main():
+    concurrency_levels = [1, 4, 8, 16, 32]
+    num_requests_per_level = 50 # Reduced for quicker run
+
+    # Run vLLM benchmark
+    # Note: For vLLM, the client-side TTFT/ITL will be less accurate without streaming.
+    # The reported TTFT will be total request time, and ITL will be average token time.
+    # This is to highlight the difference in how these metrics are typically measured for streaming vs non-streaming.
+    # For a true comparison, vLLM's streaming API should be used.
+    # for c in concurrency_levels:
+    #     await run_benchmark(VLLM_ENDPOINT, c, num_requests_per_level)
+
+    # Run TGI benchmark (streaming enabled for accurate TTFT/ITL)
+    import json # Import json for TGI streaming parsing
+    for c in concurrency_levels:
+        await run_benchmark(TGI_ENDPOINT, c, num_requests_per_level)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+```
+
+### Benchmark Results (Illustrative)
+
+| Concurrency | TTFT (s) Avg (TGI) | ITL (s) Avg (TGI) | Throughput (tokens/s) (TGI) | TTFT (s) Avg (vLLM) | ITL (s) Avg (vLLM) | Throughput (tokens/s) (vLLM) |
+|---|---|---|---|---|---|---|
+| 1 | 0.25 | 0.03 | 33.1 | 0.85 | 0.03 | 32.5 |
+| 4 | 0.38 | 0.04 | 105.2 | 1.20 | 0.04 | 100.1 |
+| 8 | 0.55 | 0.05 | 180.5 | 1.80 | 0.05 | 175.3 |
+| 16 | 0.82 | 0.06 | 290.1 | 2.50 | 0.06 | 280.2 |
+| 32 | 1.20 | 0.07 | 450.3 | 3.80 | 0.07 | 430.5 |
+
+*Note: The vLLM TTFT/ITL values in this table are illustrative and based on the simplified client-side calculation for its non-streaming API. A proper streaming client for vLLM would yield more comparable TTFT/ITL metrics.*
+
+### Analysis of Results
+
+*   **TTFT:** As concurrency increases, TTFT generally rises for both systems. This is expected as more requests contend for GPU resources. TGI, with its explicit streaming and optimized first-token generation, often shows slightly better TTFT under load.
+*   **ITL:** ITL remains relatively stable or increases slightly with concurrency. This indicates that the systems are efficiently batching tokens and maintaining a consistent token generation rate per request, even as the overall throughput increases.
+*   **Throughput:** Throughput (tokens/second) scales well with concurrency, demonstrating the effectiveness of continuous batching. The GPU is kept busy by dynamically filling the batch with tokens from active requests.
+*   **vLLM vs. TGI:** Both vLLM and TGI exhibit strong performance characteristics due to their continuous batching implementations. Differences often come down to specific optimizations, KV cache management, and overheads. TGI's streaming API is more mature for client-side TTFT measurement.
+
+## Production Gotchas & Troubleshooting
+
+1.  **OOM Errors (Out of Memory):**
+    *   **Failure Mode:** Server crashes with `CUDA out of memory` errors, especially during traffic spikes or with very long sequences.
+    *   **Root Cause:** The combined KV cache size of all active requests exceeds available GPU memory.
+    *   **Fixes:**
+        *   **Reduce `gpu_memory_utilization`:** For vLLM, lower this parameter (e.g., from 0.9 to 0.8). This reserves more memory for the model weights and other CUDA operations, reducing the chance of OOM from KV cache.
+        *   **Increase `max_model_len` (or `max_total_tokens` for TGI):** Counter-intuitively, sometimes increasing the maximum sequence length can help. If `max_model_len` is too small, requests might be rejected prematurely, leading to retries and thrashing. Ensure it's large enough to accommodate typical request patterns.
+        *   **Implement Preemption:** Ensure your serving system (vLLM, TGI) is configured to use preemption (swapping to CPU) when GPU memory is tight. This is usually enabled by default but verify.
+        *   **Batch Size Tuning:** While continuous batching is dynamic, there are still internal limits. Monitor GPU memory usage and adjust `max_batch_size` if exposed, or scale out to more GPUs/instances.
+        *   **Model Quantization:** Use 8-bit or 4-bit quantization to reduce model weight memory footprint, freeing up space for KV cache.
+
+2.  **High TTFT under Load:**
+    *   **Failure Mode:** First token takes a long time to appear, even if subsequent tokens are fast.
+    *   **Root Cause:**
+        *   **Queueing Delay:** Requests are waiting in a queue before being processed by the scheduler.
+        *   **Context Encoding Bottleneck:** Initial prompt processing (encoding) is a sequential operation and can be a bottleneck if prompts are very long or many requests arrive simultaneously.
+    *   **Fixes:**
+        *   **Increase Concurrency/Workers:** If the server is CPU-bound on the scheduler or I/O, adding more workers (if supported by the framework) or instances can help.
+        *   **Optimize Prompt Encoding:** Ensure the tokenizer is efficient. For very long prompts, consider prompt compression techniques.
+        *   **Prioritization:** Implement request prioritization. Short, interactive requests should get higher priority for TTFT-sensitive applications.
+        *   **Scale Out:** Add more GPU instances to distribute the load.
+
+3.  **Inconsistent ITL / Jitter:**
+    *   **Failure Mode:** Token generation times are erratic, with occasional spikes.
+    *   **Root Cause:**
+        *   **GPU Context Switching:** Other processes on the GPU (e.g., monitoring agents, other ML tasks) are contending for resources.
+        *   **CPU-GPU Swapping:** If preemption involves swapping KV cache to CPU, the swap-in/swap-out latency can cause jitter.
+        *   **Garbage Collection/Python GIL:** Less common for core inference, but Python overheads can sometimes contribute.
+    *   **Fixes:**
+        *   **Dedicated GPU:** Ensure the LLM serving process has exclusive access to the GPU.
+        *   **Monitor System Resources:** Check CPU, memory, and disk I/O to identify other bottlenecks.
+        *   **Tune Swapping Parameters:** If possible, adjust parameters related to KV cache swapping to balance memory pressure and latency.
+        *   **Profile:** Use NVIDIA Nsight Systems or similar tools to profile GPU activity and identify specific bottlenecks.
+
+4.  **Model Loading Failures:**
+    *   **Failure Mode:** Server fails to start, reporting issues with model weights or tokenizer.
+    *   **Root Cause:**
+        *   **Incorrect Model Path/ID:** Model not found in HuggingFace cache or specified path.
+        *   **Insufficient CPU RAM:** Model weights are loaded into CPU RAM first before being transferred to GPU. Large models require substantial CPU memory.
+        *   **Dependency Issues:** Missing `transformers`, `torch`, `vllm`, `text-generation-inference` versions.
+    *   **Fixes:**
+        *   **Verify Model ID:** Double-check the `model-id` or path.
+        *   **Increase CPU RAM:** Provision instances with sufficient CPU memory (e.g., 2x-4x model size for 7B models).
+        *   **Check Dependencies:** Ensure all required libraries are installed and compatible. Use `pip freeze` to inspect.
+
+## Frequently Asked Questions
+
+1.  **What is the primary advantage of continuous batching over static batching?**
+    The primary advantage is significantly improved GPU utilization and reduced latency, especially Time to First Token (TTFT). Continuous batching processes tokens iteratively, allowing the scheduler to dynamically add new requests or preempt existing ones at each decoding step. This avoids the "head-of-line blocking" issue where short requests wait for long ones in a static batch, leading to wasted GPU cycles.
+
+2.  **How do vLLM's PagedAttention and TGI's block-based KV cache management contribute to efficiency?**
+    Both PagedAttention (vLLM) and TGI's block-based KV cache management optimize GPU memory usage by allocating KV cache in fixed-size blocks, similar to virtual memory paging. This allows for non-contiguous memory allocation, reduces fragmentation, and enables efficient sharing of KV cache blocks across requests. It also facilitates preemption by allowing individual blocks to be swapped to CPU memory without affecting other requests, leading to higher throughput and better memory utilization.
+
+3.  **When should I use recompute preemption versus swap preemption for KV cache?**
+    **Recompute preemption** is simpler to implement but computationally expensive. It's suitable when GPU memory pressure is infrequent, and the cost of recomputing a small portion of the KV cache is less than the overhead of swapping. **Swap preemption** (swapping KV cache to CPU memory) is generally preferred for high-throughput scenarios and when GPU memory is frequently constrained. It's faster than recomputation but requires careful memory management and can introduce latency if CPU-GPU transfer is slow. Modern systems like vLLM and TGI primarily use swap preemption.
+
+4.  **What are the key factors to consider when choosing between vLLM and HuggingFace TGI for production?**
+    Both are excellent choices. Key factors include:
+    *   **Ecosystem Integration:** TGI integrates tightly with the HuggingFace ecosystem (Hub, `transformers` library), which can be beneficial if your existing pipeline is heavily HuggingFace-centric. vLLM is more standalone but widely adopted.
+    *   **Streaming API:** TGI has a robust and well-documented streaming API, which is crucial for interactive applications requiring low TTFT. vLLM also offers streaming, but TGI's might be more mature for certain use cases.
+    *   **Customization & Extensibility:** vLLM is often praised for its clean architecture and extensibility, making it easier to integrate custom scheduling logic or new attention mechanisms.
+    *   **Deployment:** TGI provides a convenient Docker image for easy deployment. vLLM also supports Docker and can be deployed via various orchestration tools.
+    *   **Performance:** Both offer state-of-the-art performance. Benchmarking with your specific models and traffic patterns is essential to determine the best fit.
+
+5.  **How does prompt length and generation length impact continuous batching performance?**
+    *   **Prompt Length:** Longer prompts consume more KV cache memory during the initial encoding phase and take longer to process sequentially. While continuous batching helps by allowing other requests to proceed during this encoding, a high volume of long prompts can still increase TTFT due to initial processing overhead and KV cache pressure.
+    *   **Generation Length:** Longer generations mean a request occupies GPU resources for more decoding steps. This increases the likelihood of KV cache preemption for other requests and can contribute to higher overall latency for the system if not managed efficiently. Continuous batching mitigates this by allowing the scheduler to interleave tokens from multiple long generations, maintaining high GPU utilization.

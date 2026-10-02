@@ -1,0 +1,333 @@
+---
+title: "Kiến trúc & Tinh chỉnh PgBouncer: Transaction Pooling, Prepared Statements & Session Overhead"
+images: ['/static/images/pgbouncer-connection-pooling-tuning-architecture.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["postgresql", "database", "performance", "backend", "devops"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về kiến trúc & tinh chỉnh pgbouncer: transaction pooling, prepared statements & session overhead với kiến trúc cấp độ sản xuất và ví dụ mã."
+---
+
+Mặc dù mô hình mỗi-tiến-trình-cho-mỗi-kết-nối của PostgreSQL rất mạnh mẽ, nhưng nó lại gây ra chi phí đáng kể khi mở rộng quy mô. Mỗi kết nối client sẽ tạo ra một tiến trình backend riêng, tiêu tốn bộ nhớ (thường là hơn 10MB cho mỗi backend, thay đổi tùy theo khối lượng công việc và cấu hình) và chu kỳ CPU. Đối với các ứng dụng có nhiều kết nối ngắn hạn hoặc độ đồng thời cao, chi phí này nhanh chóng trở thành nút thắt cổ chai, dẫn đến tăng độ trễ, cạn kiệt tài nguyên và cuối cùng là suy giảm dịch vụ. PgBouncer giải quyết vấn đề này bằng cách hoạt động như một proxy nhẹ, ghép nối các kết nối client vào một nhóm kết nối server nhỏ hơn, cố định.
+
+<AudioPlayer src="/static/audio/pgbouncer-connection-pooling-tuning-architecture-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Các Chế Độ Pooling của PgBouncer
+
+PgBouncer cung cấp ba chế độ pooling chính, mỗi chế độ có những ảnh hưởng riêng biệt đến hành vi ứng dụng và việc sử dụng tài nguyên. Việc hiểu rõ các chế độ này là rất quan trọng để triển khai đúng cách.
+
+### 1. Session Pooling (`pool_mode = session`)
+
+Trong session pooling, một kết nối server được gán cho một client trong toàn bộ thời gian client đó kết nối với PgBouncer. Khi client ngắt kết nối, kết nối server sẽ được trả về pool. Chế độ này minh bạch nhất đối với ứng dụng, vì nó hoạt động gần như giống hệt với kết nối PostgreSQL trực tiếp.
+
+**Ưu điểm:**
+*   Tương thích hoàn toàn với tất cả các tính năng của PostgreSQL, bao gồm prepared statements, advisory locks và temporary tables.
+*   Thông thường không yêu cầu thay đổi mã ứng dụng.
+
+**Nhược điểm:**
+*   Chế độ pooling kém hiệu quả nhất. Nếu một client giữ kết nối ở trạng thái rảnh, kết nối server đó vẫn không khả dụng cho các client khác.
+*   Mang lại lợi ích tối thiểu so với kết nối trực tiếp nếu các mẫu kết nối client là dài hạn và rảnh rỗi.
+
+### 2. Transaction Pooling (`pool_mode = transaction`)
+
+Transaction pooling là chế độ được khuyến nghị phổ biến nhất cho các ứng dụng web và microservices. Một kết nối server chỉ được gán cho một client trong suốt thời gian diễn ra một giao dịch. Khi giao dịch commit hoặc rollback, kết nối server sẽ được trả về pool ngay lập tức, ngay cả khi client vẫn kết nối với PgBouncer.
+
+**Ưu điểm:**
+*   Cải thiện đáng kể việc sử dụng kết nối, đặc biệt đối với các ứng dụng có nhiều giao dịch ngắn.
+*   Giảm số lượng kết nối server đang hoạt động cần thiết.
+
+**Nhược điểm:**
+*   Làm hỏng các prepared statements, advisory locks và temporary tables phía server tồn tại ngoài một giao dịch duy nhất.
+*   Yêu cầu thiết kế ứng dụng cẩn thận để đảm bảo tất cả các hoạt động được đóng gói trong các giao dịch rõ ràng.
+
+### 3. Statement Pooling (`pool_mode = statement`)
+
+Trong statement pooling, một kết nối server được gán cho một client trong suốt thời gian diễn ra một câu lệnh duy nhất. Sau khi câu lệnh thực thi, kết nối server sẽ được trả về pool ngay lập tức. Đây là chế độ pooling mạnh mẽ nhất.
+
+**Ưu điểm:**
+*   Tối đa hóa việc sử dụng kết nối.
+*   Có thể xử lý số lượng kết nối client cực cao với lượng kết nối server tối thiểu.
+
+**Nhược điểm:**
+*   Làm hỏng gần như tất cả các tính năng PostgreSQL có trạng thái, bao gồm các giao dịch (trừ khi mỗi câu lệnh là một giao dịch autocommit), prepared statements, advisory locks và temporary tables.
+*   Hiếm khi phù hợp cho các ứng dụng đa năng do những hạn chế nghiêm ngặt của nó.
+
+## Prepared Statements & Transaction Pooling
+
+Thách thức chính với transaction pooling là sự không tương thích của nó với các prepared statements phía server. Khi một client thực thi `PREPARE` hoặc sử dụng một thư viện client ngầm định chuẩn bị các câu lệnh (ví dụ: `Npgsql`'s `NpgsqlCommand.Prepare()`, `psycopg2`'s `cursor.execute()` với `prepare=True`), prepared statement đó được liên kết với kết nối server cụ thể. Trong transaction pooling, kết nối server này được trả về pool sau giao dịch, và một giao dịch tiếp theo từ cùng một client có thể nhận được một kết nối server khác, không có prepared statement đó. Điều này dẫn đến các lỗi như `ERROR: prepared statement "..." does not exist`.
+
+### Giải pháp 1: `DISCARD ALL`
+
+PgBouncer có thể được cấu hình để tự động thực thi `DISCARD ALL` vào cuối mỗi giao dịch khi một kết nối server được trả về pool. `DISCARD ALL` dọn dẹp tất cả trạng thái cục bộ của phiên, bao gồm prepared statements, advisory locks và temporary tables. Điều này đảm bảo một trạng thái sạch sẽ cho client tiếp theo sử dụng kết nối server đó.
+
+**Cấu hình (`pgbouncer.ini`):**
+
+```ini
+[databases]
+mydb = host=127.0.0.1 port=5432 dbname=mydb pool_mode=transaction
+
+[pgbouncer]
+server_reset_query = DISCARD ALL
+```
+
+**Tác động:**
+*   **Ưu điểm:** Dễ cấu hình, không cần thay đổi mã ứng dụng.
+*   **Nhược điểm:** Nếu ứng dụng *dựa vào* các prepared statements phía server để đạt hiệu suất (ví dụ: các truy vấn phức tạp được chuẩn bị một lần và thực thi nhiều lần), `DISCARD ALL` sẽ làm mất đi lợi ích đó, vì các câu lệnh sẽ được chuẩn bị lại cho mỗi giao dịch. Đối với hầu hết các ứng dụng web, chi phí chuẩn bị lại các câu lệnh đơn giản là không đáng kể so với lợi ích của transaction pooling.
+
+### Giải pháp 2: Prepared Statements phía Client
+
+Nhiều trình điều khiển cơ sở dữ liệu hiện đại triển khai việc lưu trữ và chuẩn bị câu lệnh phía client. Trình điều khiển phân tích cú pháp truy vấn, thay thế các tham số và gửi chuỗi truy vấn hoàn chỉnh đến server. Điều này tránh các vấn đề về trạng thái phía server với PgBouncer.
+
+**Ví dụ (thư viện Node.js `pg`):**
+
+```typescript
+import { Pool } from 'pg';
+
+const pool = new Pool({
+  user: 'app_user',
+  host: 'pgbouncer_host',
+  database: 'mydb',
+  password: 'password',
+  port: 6432, // PgBouncer default port
+});
+
+async function getUser(userId: number) {
+  const client = await pool.connect();
+  try {
+    // This is a client-side prepared statement (parameterized query)
+    // The driver sends 'SELECT * FROM users WHERE id = $1' and [userId]
+    // PgBouncer handles this fine in transaction mode.
+    const res = await client.query('SELECT * FROM users WHERE id = $1', [userId]);
+    return res.rows[0];
+  } finally {
+    client.release();
+  }
+}
+
+// Example of a server-side prepared statement that would break in transaction mode
+// unless DISCARD ALL is used or the application explicitly manages it.
+async function createAndExecuteServerSidePreparedStatement() {
+  const client = await pool.connect();
+  try {
+    // This explicitly uses a server-side prepared statement named 'my_stmt'
+    // This will break in transaction pooling without DISCARD ALL or similar cleanup.
+    await client.query('PREPARE my_stmt (int) AS SELECT * FROM users WHERE id = $1');
+    const res = await client.query('EXECUTE my_stmt(1)');
+    console.log(res.rows);
+    // Must explicitly deallocate or rely on DISCARD ALL
+    await client.query('DEALLOCATE my_stmt');
+  } finally {
+    client.release();
+  }
+}
+```
+
+**Tác động:**
+*   **Ưu điểm:** Tương thích hoàn toàn với transaction pooling, thường là hành vi mặc định cho các truy vấn có tham số trong các trình điều khiển hiện đại.
+*   **Nhược điểm:** Yêu cầu hỗ trợ từ trình điều khiển; các câu lệnh `PREPARE` phía server rõ ràng vẫn sẽ bị lỗi.
+
+### Giải pháp 3: Named Server-Side Statements với `DEALLOCATE`
+
+Nếu các prepared statements phía server là hoàn toàn cần thiết cho hiệu suất và `DISCARD ALL` không mong muốn (ví dụ: do chi phí chuẩn bị lại cho các truy vấn rất phức tạp), ứng dụng phải quản lý rõ ràng vòng đời của các prepared statements được đặt tên. Điều này có nghĩa là phải phát hành `DEALLOCATE <statement_name>` trước khi giao dịch commit hoặc kết nối được trả về pool. Điều này phức tạp và dễ gây lỗi.
+
+```typescript
+// This is a conceptual example, actual implementation depends heavily on the ORM/driver.
+async function executeComplexQueryWithManagedPreparedStatement(client: any, param: any) {
+  const statementName = `my_complex_query_${Date.now()}`; // Unique name per execution
+  try {
+    await client.query(`PREPARE ${statementName} (int) AS SELECT complex_func($1) FROM large_table WHERE condition = $1`);
+    const res = await client.query(`EXECUTE ${statementName}(${param})`);
+    return res.rows;
+  } finally {
+    // Crucial: Deallocate the prepared statement before the transaction ends
+    // or the connection is returned to the pool.
+    await client.query(`DEALLOCATE ${statementName}`);
+  }
+}
+```
+
+**Tác động:**
+*   **Ưu điểm:** Giữ lại lợi ích của việc chuẩn bị phía server.
+*   **Nhược điểm:** Độ phức tạp của ứng dụng cao, dễ gây lỗi, nói chung không được khuyến nghị trừ khi việc phân tích hiệu suất chứng minh được lợi ích đáng kể.
+
+## Cấu hình & Tinh chỉnh PgBouncer
+
+### `pgbouncer.ini` Thiết yếu
+
+```ini
+[databases]
+# Define your databases. 'mydb' is the alias clients connect to.
+# 'host', 'port', 'dbname' are for the actual PostgreSQL server.
+# 'pool_mode' is critical. 'transaction' is generally recommended.
+# 'pool_size' is the number of server connections PgBouncer will maintain for this database.
+mydb = host=127.0.0.1 port=5432 dbname=mydb pool_mode=transaction pool_size=20
+
+[pgbouncer]
+listen_addr = 0.0.0.0      ; Address PgBouncer listens on
+listen_port = 6432         ; Port PgBouncer listens on
+auth_type = md5            ; Authentication method (md5, plain, trust, hba, cert)
+auth_file = /etc/pgbouncer/userlist.txt ; Userlist for authentication
+
+; Max client connections PgBouncer will accept. This is the total across all databases.
+max_client_conn = 1000
+
+; Default pool size for databases not explicitly configured.
+; This is the number of server connections per database.
+default_pool_size = 10
+
+; Max server connections PgBouncer will open to a single PostgreSQL server.
+; This limits the total load on the backend.
+max_db_connections = 50
+
+; Max server connections PgBouncer will open to a single database.
+; This is per database, overriding default_pool_size if specified.
+max_user_connections = 50
+
+; How long a server connection can be idle before being closed.
+server_idle_timeout = 600
+
+; How long a client connection can be idle before being closed.
+client_idle_timeout = 300
+
+; Query to run when a server connection is returned to the pool.
+; Essential for transaction pooling to clean up state.
+server_reset_query = DISCARD ALL
+
+; Log level (DEBUG, INFO, WARNING, ERROR)
+logfile = /var/log/pgbouncer/pgbouncer.log
+log_connections = 1
+log_disconnections = 1
+log_pooler_errors = 1
+```
+
+### Các Tham số Chính & Lý do
+
+*   **`pool_mode`**: Như đã thảo luận, `transaction` là khuyến nghị mặc định.
+*   **`pool_size`**: Đây là số lượng kết nối mà PgBouncer duy trì đến *server PostgreSQL* cho một cơ sở dữ liệu nhất định. Tham số này nên được tinh chỉnh dựa trên `max_connections` của server PostgreSQL và khối lượng công việc của bạn. Một điểm khởi đầu phổ biến là `(CPU_cores * 2) + 1` cho server PostgreSQL, sau đó phân phối số này cho các pool PgBouncer của bạn. Ví dụ, nếu PostgreSQL của bạn có 16 lõi và `max_connections = 200`, bạn có thể đặt `pool_size = 32` cho cơ sở dữ liệu ứng dụng chính của mình.
+*   **`max_client_conn`**: Số lượng kết nối client tối đa mà PgBouncer sẽ chấp nhận. Giá trị này nên cao hơn đáng kể so với `pool_size` để hấp thụ các đợt tăng đột biến kết nối. Đặt giá trị này bằng với giá trị mà ứng dụng của bạn dự kiến đạt được trong thời gian tải cao điểm, cộng thêm một vùng đệm.
+*   **`default_pool_size`**: Áp dụng cho các cơ sở dữ liệu không được liệt kê rõ ràng trong phần `[databases]`.
+*   **`server_reset_query = DISCARD ALL`**: Rất quan trọng đối với `transaction` pooling để ngăn chặn lỗi prepared statement và các rò rỉ trạng thái phiên khác.
+*   **`server_idle_timeout`**: Ngăn PgBouncer giữ các kết nối rảnh đến PostgreSQL vô thời hạn.
+*   **`client_idle_timeout`**: Ngăn các kết nối client rảnh tiêu tốn tài nguyên của PgBouncer.
+
+## Chuyển đổi dự phòng kết nối có tính sẵn sàng cao
+
+Bản thân PgBouncer có thể là một điểm lỗi duy nhất. Để có tính sẵn sàng cao, nhiều phiên bản PgBouncer thường được triển khai, thường đi kèm với một giải pháp sẵn sàng cao của PostgreSQL (ví dụ: Patroni, repmgr).
+
+### Chuyển đổi dự phòng phía Client
+
+Cách tiếp cận phổ biến nhất là cấu hình chuỗi kết nối cơ sở dữ liệu của ứng dụng với nhiều điểm cuối PgBouncer. Trình điều khiển client (ví dụ: các trình điều khiển dựa trên `libpq`) sẽ cố gắng kết nối với máy chủ đầu tiên, và nếu thất bại, sẽ thử máy chủ tiếp theo.
+
+**Ví dụ (chuỗi kết nối Node.js `pg`):**
+
+```typescript
+const pool = new Pool({
+  connectionString: 'postgresql://app_user:password@pgbouncer_host1:6432,pgbouncer_host2:6432/mydb',
+});
+```
+
+Ở đây, `pgbouncer_host1` và `pgbouncer_host2` sẽ là các phiên bản PgBouncer riêng biệt, mỗi phiên bản được cấu hình để kết nối với cùng một PostgreSQL primary. Nếu primary bị lỗi và một replica được thăng cấp, các phiên bản PgBouncer phải được cấu hình lại hoặc khởi động lại để trỏ đến primary mới.
+
+### Chuyển đổi dự phòng dựa trên DNS
+
+Sử dụng một bản ghi DNS phân giải thành nhiều IP của PgBouncer (DNS luân phiên) hoặc một bộ cân bằng tải (ví dụ: HAProxy, AWS NLB) phía trước các phiên bản PgBouncer cung cấp một lớp trừu tượng khác. Bản ghi DNS hoặc bộ cân bằng tải có thể được cập nhật để loại bỏ các phiên bản PgBouncer không hoạt động hoặc chuyển hướng lưu lượng truy cập đến một tập hợp các phiên bản mới.
+
+### PgBouncer với HAProxy
+
+HAProxy có thể cung cấp kiểm tra sức khỏe và cân bằng tải cho nhiều phiên bản PgBouncer.
+
+```ini
+# HAProxy configuration snippet
+listen pgbouncer_cluster
+    bind *:6432
+    mode tcp
+    balance roundrobin
+    option tcp-check
+    server pgbouncer1 192.168.1.10:6432 check port 6432
+    server pgbouncer2 192.168.1.11:6432 check port 6432
+```
+
+Thiết lập này cho phép các client kết nối đến một điểm cuối HAProxy duy nhất, sau đó phân phối các kết nối đến các phiên bản PgBouncer khỏe mạnh.
+
+## Những vấn đề thường gặp & Khắc phục sự cố trong môi trường sản xuất
+
+1.  **"Prepared statement '...' does not exist"**:
+    *   **Nguyên nhân**: Vấn đề phổ biến nhất với `pool_mode=transaction`. Một ứng dụng đang sử dụng các prepared statements phía server, nhưng kết nối server được trả về pool và được sử dụng lại bởi một client khác (hoặc cùng một client nhận được một kết nối khác) trước khi prepared statement được giải phóng.
+    *   **Khắc phục**:
+        *   Đảm bảo `server_reset_query = DISCARD ALL` được đặt trong `pgbouncer.ini`. Đây là cách khắc phục đơn giản và phổ biến nhất.
+        *   Nếu `DISCARD ALL` không phải là một lựa chọn (ví dụ: các prepared statements quan trọng về hiệu suất), hãy tái cấu trúc ứng dụng để sử dụng các prepared statements phía client hoặc rõ ràng `DEALLOCATE` các câu lệnh phía server.
+
+2.  **"Too many connections" (từ PgBouncer)**:
+    *   **Nguyên nhân**: Đã đạt đến giới hạn `max_client_conn`. Quá nhiều phiên bản ứng dụng hoặc client đang cố gắng kết nối với PgBouncer cùng lúc.
+    *   **Khắc phục**: Tăng `max_client_conn` trong `pgbouncer.ini`. Đảm bảo máy chủ PgBouncer của bạn có đủ tài nguyên (bộ nhớ, bộ mô tả tệp) để xử lý số lượng kết nối client tăng lên.
+
+3.  **"Too many connections" (từ PostgreSQL)**:
+    *   **Nguyên nhân**: `pool_size` (hoặc `default_pool_size`) quá cao, hoặc `max_db_connections` quá cao, khiến PgBouncer mở quá nhiều kết nối đến server PostgreSQL backend, vượt quá giới hạn `max_connections` của nó.
+    *   **Khắc phục**: Giảm `pool_size` và `max_db_connections` trong `pgbouncer.ini`. Tinh chỉnh các giá trị này dựa trên dung lượng và khối lượng công việc của server PostgreSQL của bạn. Giám sát các kết nối đang hoạt động của PostgreSQL.
+
+4.  **Ứng dụng bị treo hoặc kết nối chậm**:
+    *   **Nguyên nhân**: `pool_size` quá thấp so với độ đồng thời của ứng dụng. Các client đang chờ một kết nối server khả dụng trong pool của PgBouncer.
+    *   **Khắc phục**: Tăng `pool_size` cho cơ sở dữ liệu bị ảnh hưởng trong `pgbouncer.ini`. Giám sát đầu ra `SHOW STATS` của PgBouncer để tìm `total_wait_time` và `avg_wait_time`. Các giá trị cao cho thấy tình trạng thiếu kết nối.
+
+5.  **Lỗi xác thực**:
+    *   **Nguyên nhân**: `auth_type` không khớp, đường dẫn `auth_file` không chính xác hoặc thông tin đăng nhập không chính xác trong `userlist.txt`.
+    *   **Khắc phục**: Xác minh `auth_type` trong `pgbouncer.ini` khớp với thiết lập của bạn (ví dụ: `md5` cho xác thực dựa trên mật khẩu). Đảm bảo `auth_file` trỏ đến `userlist.txt` chính xác và các mục người dùng được định dạng đúng: `"username" "password_hash"`. Đối với `md5`, băm mật khẩu là `md5(password + username)`.
+
+6.  **PgBouncer không khởi động**:
+    *   **Nguyên nhân**: Lỗi cấu hình, xung đột cổng hoặc thiếu các phụ thuộc.
+    *   **Khắc phục**: Kiểm tra `pgbouncer.log` để tìm lỗi khởi động. Đảm bảo `listen_port` không được sử dụng bởi một tiến trình khác. Xác thực cú pháp `pgbouncer.ini`.
+
+## Các câu hỏi thường gặp
+
+### 1. Khi nào tôi nên sử dụng PgBouncer thay vì pool kết nối tích hợp của ứng dụng?
+
+Sử dụng PgBouncer khi:
+*   Bạn có nhiều phiên bản ứng dụng hoặc microservices kết nối đến cùng một cơ sở dữ liệu PostgreSQL.
+*   Pool kết nối của ứng dụng của bạn không hiệu quả hoặc được cấu hình kém.
+*   Bạn cần tập trung quản lý kết nối và thực thi giới hạn kết nối trên nhiều ứng dụng.
+*   Bạn muốn giảm lượng bộ nhớ tiêu thụ trên server PostgreSQL bằng cách giới hạn số lượng tiến trình backend đang hoạt động.
+*   Bạn cần một proxy nhẹ để chuyển đổi dự phòng kết nối hoặc cân bằng tải.
+
+Các pool cấp ứng dụng vẫn hữu ích để quản lý các kết nối *từ một phiên bản ứng dụng duy nhất* đến PgBouncer. PgBouncer sau đó sẽ gộp các kết nối này đến server PostgreSQL.
+
+### 2. Làm cách nào để giám sát PgBouncer?
+
+Kết nối đến bảng điều khiển quản trị của PgBouncer (thường là cổng 6432, với cơ sở dữ liệu `pgbouncer` đặc biệt) và sử dụng các lệnh `SHOW`:
+*   `SHOW STATS`: Cung cấp số liệu thống kê về kết nối, giao dịch và byte.
+*   `SHOW POOLS`: Hiển thị trạng thái pool hiện tại, các client đang hoạt động/chờ và các kết nối server.
+*   `SHOW CLIENTS`: Liệt kê tất cả các client đã kết nối.
+*   `SHOW SERVERS`: Liệt kê tất cả các kết nối đến các server PostgreSQL backend.
+
+Các số liệu này nên được tích hợp vào hệ thống giám sát của bạn (ví dụ: Prometheus, Datadog).
+
+### 3. PgBouncer có thể xử lý các kết nối SSL/TLS không?
+
+Có. PgBouncer hỗ trợ SSL/TLS cho cả kết nối client-to-PgBouncer và PgBouncer-to-server. Bạn cấu hình điều này trong `pgbouncer.ini` bằng cách sử dụng các tham số như `client_tls_mode`, `server_tls_mode`, `client_tls_key_file`, `client_tls_cert_file`, v.v. Đảm bảo chứng chỉ và khóa của bạn được cấu hình đúng cách và có thể truy cập được.
+
+### 4. Lượng bộ nhớ tiêu thụ của PgBouncer là bao nhiêu?
+
+PgBouncer được thiết kế để rất nhẹ. Lượng bộ nhớ tiêu thụ của nó chủ yếu được điều khiển bởi số lượng kết nối client và server đang hoạt động mà nó quản lý. Mỗi kết nối tiêu thụ một lượng nhỏ bộ nhớ cho bộ đệm và trạng thái. Đối với hàng nghìn kết nối, PgBouncer thường tiêu thụ hàng chục đến hàng trăm MB, ít hơn đáng kể so với số lượng tiến trình backend PostgreSQL tương đương.
+
+### 5. PgBouncer xử lý các lệnh `SET` như thế nào?
+
+Trong `session` pooling, các lệnh `SET` hoạt động như mong đợi, vì kết nối server được dành riêng cho client.
+Trong `transaction` pooling, các lệnh `SET` (ví dụ: `SET search_path`, `SET timezone`) thường được đặt lại bởi `server_reset_query = DISCARD ALL` vào cuối giao dịch. Nếu bạn cần các lệnh `SET` dành riêng cho phiên để tồn tại qua các giao dịch, `transaction` pooling không phù hợp, hoặc bạn phải phát hành lại lệnh `SET` vào đầu mỗi giao dịch. Đối với hầu hết các ứng dụng, `DISCARD ALL` là hành vi mong muốn để ngăn chặn rò rỉ trạng thái.
+
+## So sánh Kiến trúc & Đánh đổi
+
+| Tính năng/Chế độ          | Session Pooling                               | Transaction Pooling                                   | Statement Pooling                                     |
+| :-------------------- | :-------------------------------------------- | :---------------------------------------------------- | :---------------------------------------------------- |
+| **Tái sử dụng kết nối Server**| Khi client ngắt kết nối                          | Khi giao dịch commit/rollback                        | Khi câu lệnh hoàn thành                               |
+| **Prepared Statements**| Tương thích hoàn toàn                              | Bị lỗi (cần `DISCARD ALL` hoặc chuẩn bị phía client)      | Bị lỗi (cần `DISCARD ALL` hoặc chuẩn bị phía client)      |
+| **Advisory Locks**    | Tương thích hoàn toàn                              | Bị lỗi                                                | Bị lỗi                                                |
+| **Temp Tables**       | Tương thích hoàn toàn                              | Bị lỗi                                                | Bị lỗi                                                |
+| **Lệnh `SET`**    | Duy trì cho phiên client                    | Đặt lại bởi `DISCARD ALL` (mặc định)                      | Đặt lại bởi `DISCARD ALL` (mặc định)                      |
+| **Sử dụng kết nối**  | Thấp (kết nối rảnh giữ tài nguyên server)  | Cao (kết nối server nhanh chóng được trả về pool)    | Rất cao (kết nối server được trả về sau mỗi câu lệnh)|
+| **Tác động đến ứng dụng**| Tối thiểu                                       | Yêu cầu xử lý cẩn thận các tính năng có trạng thái        | Yêu cầu tái cấu trúc ứng dụng đáng kể          |
+| **Trường hợp sử dụng điển hình**  | Ứng dụng cũ, phiên tương tác dài hạn  | Ứng dụng web, microservices, giao dịch ngắn     | Chuyên biệt, khối lượng công việc rất đặc thù                   |
+| **Chi phí**          | Thấp (bản thân PgBouncer)                        | Thấp (bản thân PgBouncer)                                | Thấp (bản thân PgBouncer)                                |

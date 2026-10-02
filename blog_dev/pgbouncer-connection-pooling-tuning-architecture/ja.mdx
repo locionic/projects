@@ -1,0 +1,333 @@
+---
+title: "PgBouncerのアーキテクチャとチューニング: トランザクションプーリング、プリペアドステートメント、セッションオーバーヘッド"
+images: ['/static/images/pgbouncer-connection-pooling-tuning-architecture.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["postgresql", "database", "performance", "backend", "devops"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "PgBouncerのアーキテクチャとチューニングについて、トランザクションプーリング、プリペアドステートメント、セッションオーバーヘッドを網羅し、本番環境レベルのアーキテクチャとコード例を交えて解説する包括的なガイドです。"
+---
+
+PostgreSQLのプロセス・パー・コネクション（process-per-connection）モデルは堅牢である一方で、大規模な運用においてはかなりのオーバーヘッドを発生させます。クライアント接続ごとに専用のバックエンドプロセスが生成され、メモリ（ワークロードや設定によって異なりますが、通常バックエンドあたり10MB以上）とCPUサイクルを消費します。短命な接続が多いアプリケーションや高並行性のアプリケーションでは、このオーバーヘッドがすぐにボトルネックとなり、レイテンシーの増加、リソースの枯渇、最終的にはサービス品質の低下につながります。PgBouncerは、軽量なプロキシとして機能し、クライアント接続をより少ない固定数のサーバー接続プールに多重化することで、この問題に対処します。
+
+<AudioPlayer src="/static/audio/pgbouncer-connection-pooling-tuning-architecture-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+## PgBouncerのプーリングモード
+
+PgBouncerは、主に3つのプーリングモードを提供しており、それぞれアプリケーションの動作とリソース利用に異なる影響を与えます。これらのモードを理解することは、正しくデプロイするために不可欠です。
+
+### 1. セッションプーリング（`pool_mode = session`）
+
+セッションプーリングでは、クライアントがPgBouncerに接続している間、サーバー接続がそのクライアントに割り当てられます。クライアントが切断すると、サーバー接続はプールに戻されます。このモードは、直接PostgreSQLに接続するのとほぼ同じように動作するため、アプリケーションにとって最も透過的です。
+
+**長所:**
+*   プリペアドステートメント、アドバイザリーロック、一時テーブルなど、すべてのPostgreSQL機能と完全に互換性があります。
+*   通常、アプリケーションコードの変更は不要です。
+
+**短所:**
+*   最も効率の悪いプーリングモードです。クライアントが接続をアイドル状態に保持している場合、そのサーバー接続は他のクライアントには利用できません。
+*   クライアントの接続パターンが長期間にわたってアイドル状態である場合、直接接続と比較してメリットは最小限です。
+
+### 2. トランザクションプーリング（`pool_mode = transaction`）
+
+トランザクションプーリングは、Webアプリケーションやマイクロサービスで最も一般的に推奨されるモードです。サーバー接続は、トランザクションの期間中のみクライアントに割り当てられます。トランザクションがコミットまたはロールバックされると、クライアントがPgBouncerに接続したままであっても、サーバー接続はすぐにプールに戻されます。
+
+**長所:**
+*   特に短時間のトランザクションが多いアプリケーションの場合、接続利用率が大幅に向上します。
+*   必要なアクティブなサーバー接続数を削減します。
+
+**短所:**
+*   単一のトランザクションを超えて永続するサーバーサイドのプリペアドステートメント、アドバイザリーロック、一時テーブルを壊します。
+*   すべての操作が明示的なトランザクション内にカプセル化されるように、慎重なアプリケーション設計が必要です。
+
+### 3. ステートメントプーリング（`pool_mode = statement`）
+
+ステートメントプーリングでは、単一のステートメントの期間中のみ、サーバー接続がクライアントに割り当てられます。ステートメントの実行後、サーバー接続はすぐにプールに戻されます。これは最も積極的なプーリングモードです。
+
+**長所:**
+*   最大の接続利用率。
+*   最小限のサーバー接続フットプリントで、非常に多数のクライアント接続を処理できます。
+
+**短所:**
+*   トランザクション（各ステートメントがオートコミットトランザクションでない限り）、プリペアドステートメント、アドバイザリーロック、一時テーブルなど、ほとんどすべてのステートフルなPostgreSQL機能を壊します。
+*   その厳格な制限のため、一般的なアプリケーションにはほとんど適していません。
+
+## プリペアドステートメントとトランザクションプーリング
+
+トランザクションプーリングの主な課題は、サーバーサイドのプリペアドステートメントとの非互換性です。クライアントが`PREPARE`を実行したり、暗黙的にステートメントを準備するクライアントライブラリ（例：`Npgsql`の`NpgsqlCommand.Prepare()`、`psycopg2`の`cursor.execute()`と`prepare=True`）を使用したりすると、プリペアドステートメントは特定のサーバー接続に関連付けられます。トランザクションプーリングでは、このサーバー接続はトランザクション後にプールに戻され、同じクライアントからの後続のトランザクションでは、プリペアドステートメントを持たない別のサーバー接続を受け取る可能性があります。これにより、`ERROR: prepared statement "..." does not exist`のようなエラーが発生します。
+
+### 解決策1: `DISCARD ALL`
+
+PgBouncerは、サーバー接続がプールに戻される際に、各トランザクションの最後に自動的に`DISCARD ALL`を実行するように設定できます。`DISCARD ALL`は、プリペアドステートメント、アドバイザリーロック、一時テーブルを含むすべてのセッションローカルな状態をクリーンアップします。これにより、そのサーバー接続を使用する次のクライアントのためにクリーンな状態が保証されます。
+
+**設定（`pgbouncer.ini`）:**
+
+```ini
+[databases]
+mydb = host=127.0.0.1 port=5432 dbname=mydb pool_mode=transaction
+
+[pgbouncer]
+server_reset_query = DISCARD ALL
+```
+
+**影響:**
+*   **長所:** 設定が簡単で、アプリケーションコードの変更は不要です。
+*   **短所:** アプリケーションがパフォーマンスのためにサーバーサイドのプリペアドステートメントに依存している場合（例：複雑なクエリを一度準備して何度も実行する場合）、`DISCARD ALL`はそのメリットを打ち消し、各トランザクションでステートメントが再準備されます。ほとんどのWebアプリケーションでは、単純なステートメントの再準備のオーバーヘッドは、トランザクションプーリングのメリットと比較して無視できる程度です。
+
+### 解決策2: クライアントサイドのプリペアドステートメント
+
+多くの最新のデータベースドライバーは、クライアントサイドのステートメントキャッシュと準備を実装しています。ドライバーはクエリを解析し、パラメーターを置換して、完全なクエリ文字列をサーバーに送信します。これにより、PgBouncerでのサーバーサイドの状態の問題が回避されます。
+
+**例（Node.js `pg`ライブラリ）:**
+
+```typescript
+import { Pool } from 'pg';
+
+const pool = new Pool({
+  user: 'app_user',
+  host: 'pgbouncer_host',
+  database: 'mydb',
+  password: 'password',
+  port: 6432, // PgBouncer default port
+});
+
+async function getUser(userId: number) {
+  const client = await pool.connect();
+  try {
+    // This is a client-side prepared statement (parameterized query)
+    // The driver sends 'SELECT * FROM users WHERE id = $1' and [userId]
+    // PgBouncer handles this fine in transaction mode.
+    const res = await client.query('SELECT * FROM users WHERE id = $1', [userId]);
+    return res.rows[0];
+  } finally {
+    client.release();
+  }
+}
+
+// Example of a server-side prepared statement that would break in transaction mode
+// unless DISCARD ALL is used or the application explicitly manages it.
+async function createAndExecuteServerSidePreparedStatement() {
+  const client = await pool.connect();
+  try {
+    // This explicitly uses a server-side prepared statement named 'my_stmt'
+    // This will break in transaction pooling without DISCARD ALL or similar cleanup.
+    await client.query('PREPARE my_stmt (int) AS SELECT * FROM users WHERE id = $1');
+    const res = await client.query('EXECUTE my_stmt(1)');
+    console.log(res.rows);
+    // Must explicitly deallocate or rely on DISCARD ALL
+    await client.query('DEALLOCATE my_stmt');
+  } finally {
+    client.release();
+  }
+}
+```
+
+**影響:**
+*   **長所:** トランザクションプーリングと完全に互換性があり、最新のドライバーではパラメーター化されたクエリのデフォルトの動作であることが多いです。
+*   **短所:** ドライバーのサポートが必要です。明示的なサーバーサイドの`PREPARE`ステートメントは引き続き壊れます。
+
+### 解決策3: `DEALLOCATE`を使用した名前付きサーバーサイドステートメント
+
+パフォーマンスのためにサーバーサイドのプリペアドステートメントが絶対に必要で、`DISCARD ALL`が望ましくない場合（例：非常に複雑なクエリの再準備のオーバーヘッドのため）、アプリケーションは名前付きプリペアドステートメントのライフサイクルを明示的に管理する必要があります。これは、トランザクションがコミットされる前、または接続がプールに戻される前に`DEALLOCATE <statement_name>`を発行することを意味します。これは複雑でエラーが発生しやすいです。
+
+```typescript
+// This is a conceptual example, actual implementation depends heavily on the ORM/driver.
+async function executeComplexQueryWithManagedPreparedStatement(client: any, param: any) {
+  const statementName = `my_complex_query_${Date.now()}`; // Unique name per execution
+  try {
+    await client.query(`PREPARE ${statementName} (int) AS SELECT complex_func($1) FROM large_table WHERE condition = $1`);
+    const res = await client.query(`EXECUTE ${statementName}(${param})`);
+    return res.rows;
+  } finally {
+    // Crucial: Deallocate the prepared statement before the transaction ends
+    // or the connection is returned to the pool.
+    await client.query(`DEALLOCATE ${statementName}`);
+  }
+}
+```
+
+**影響:**
+*   **長所:** サーバーサイドの準備のメリットを維持します。
+*   **短所:** アプリケーションの複雑性が高く、エラーが発生しやすく、プロファイリングで大幅なパフォーマンス向上が証明されない限り、一般的には推奨されません。
+
+## PgBouncerの設定とチューニング
+
+### `pgbouncer.ini`の基本
+
+```ini
+[databases]
+# Define your databases. 'mydb' is the alias clients connect to.
+# 'host', 'port', 'dbname' are for the actual PostgreSQL server.
+# 'pool_mode' is critical. 'transaction' is generally recommended.
+# 'pool_size' is the number of server connections PgBouncer will maintain for this database.
+mydb = host=127.0.0.1 port=5432 dbname=mydb pool_mode=transaction pool_size=20
+
+[pgbouncer]
+listen_addr = 0.0.0.0      ; Address PgBouncer listens on
+listen_port = 6432         ; Port PgBouncer listens on
+auth_type = md5            ; Authentication method (md5, plain, trust, hba, cert)
+auth_file = /etc/pgbouncer/userlist.txt ; Userlist for authentication
+
+; Max client connections PgBouncer will accept. This is the total across all databases.
+max_client_conn = 1000
+
+; Default pool size for databases not explicitly configured.
+; This is the number of server connections per database.
+default_pool_size = 10
+
+; Max server connections PgBouncer will open to a single PostgreSQL server.
+; This limits the total load on the backend.
+max_db_connections = 50
+
+; Max server connections PgBouncer will open to a single database.
+; This is per database, overriding default_pool_size if specified.
+max_user_connections = 50
+
+; How long a server connection can be idle before being closed.
+server_idle_timeout = 600
+
+; How long a client connection can be idle before being closed.
+client_idle_timeout = 300
+
+; Query to run when a server connection is returned to the pool.
+; Essential for transaction pooling to clean up state.
+server_reset_query = DISCARD ALL
+
+; Log level (DEBUG, INFO, WARNING, ERROR)
+logfile = /var/log/pgbouncer/pgbouncer.log
+log_connections = 1
+log_disconnections = 1
+log_pooler_errors = 1
+```
+
+### 主要なパラメーターと根拠
+
+*   **`pool_mode`**: 議論したように、`transaction`がデフォルトの推奨事項です。
+*   **`pool_size`**: これは、PgBouncerが特定のデータベースに対して*PostgreSQLサーバー*との間に維持する接続の数です。これは、PostgreSQLサーバーの`max_connections`とワークロードに基づいて調整する必要があります。一般的な出発点として、PostgreSQLサーバーに`(CPU_cores * 2) + 1`を設定し、これをPgBouncerプール全体に分散させます。たとえば、PostgreSQLに16コアがあり、`max_connections = 200`の場合、プライマリアプリケーションデータベースに`pool_size = 32`を設定するかもしれません。
+*   **`max_client_conn`**: PgBouncerが受け入れるクライアント接続の最大数です。接続の急増を吸収するために、`pool_size`よりも大幅に高く設定する必要があります。ピーク負荷時にアプリケーションが到達すると予想される値に、バッファを追加して設定します。
+*   **`default_pool_size`**: `[databases]`セクションに明示的にリストされていないデータベースに適用されます。
+*   **`server_reset_query = DISCARD ALL`**: プリペアドステートメントのエラーやその他のセッション状態の漏洩を防ぐために、`transaction`プーリングにとって非常に重要です。
+*   **`server_idle_timeout`**: PgBouncerがPostgreSQLへのアイドル接続を無期限に保持するのを防ぎます。
+*   **`client_idle_timeout`**: アイドル状態のクライアント接続がPgBouncerリソースを消費するのを防ぎます。
+
+## 高可用性接続フェイルオーバー
+
+PgBouncer自体が単一障害点になる可能性があります。高可用性のためには、通常、複数のPgBouncerインスタンスがデプロイされ、PostgreSQLの高可用性ソリューション（例：Patroni、repmgr）と連携して使用されます。
+
+### クライアントサイドのフェイルオーバー
+
+最も一般的なアプローチは、アプリケーションのデータベース接続文字列に複数のPgBouncerエンドポイントを設定することです。クライアントドライバー（例：`libpq`ベースのドライバー）は、最初のホストへの接続を試み、失敗した場合は次のホストを試します。
+
+**例（Node.js `pg`接続文字列）:**
+
+```typescript
+const pool = new Pool({
+  connectionString: 'postgresql://app_user:password@pgbouncer_host1:6432,pgbouncer_host2:6432/mydb',
+});
+```
+
+ここで、`pgbouncer_host1`と`pgbouncer_host2`は別々のPgBouncerインスタンスであり、それぞれ同じPostgreSQLプライマリに接続するように設定されています。プライマリが失敗してレプリカが昇格した場合、PgBouncerインスタンスは新しいプライマリを指すように再設定または再起動する必要があります。
+
+### DNSベースのフェイルオーバー
+
+複数のPgBouncer IP（ラウンドロビンDNS）またはロードバランサー（例：HAProxy、AWS NLB）に解決されるDNSエントリをPgBouncerインスタンスの前に配置することで、もう1つの抽象化レイヤーを提供できます。DNSエントリまたはロードバランサーは、異常なPgBouncerインスタンスを削除したり、新しいインスタンスセットにトラフィックを誘導したりするように更新できます。
+
+### HAProxyとPgBouncer
+
+HAProxyは、複数のPgBouncerインスタンスのヘルスチェックとロードバランシングを提供できます。
+
+```ini
+# HAProxy configuration snippet
+listen pgbouncer_cluster
+    bind *:6432
+    mode tcp
+    balance roundrobin
+    option tcp-check
+    server pgbouncer1 192.168.1.10:6432 check port 6432
+    server pgbouncer2 192.168.1.11:6432 check port 6432
+```
+
+この設定により、クライアントは単一のHAProxyエンドポイントに接続し、HAProxyが健全なPgBouncerインスタンスに接続を分散します。
+
+## 本番環境での落とし穴とトラブルシューティング
+
+1.  **"Prepared statement '...' does not exist"**:
+    *   **原因**: `pool_mode=transaction`で最もよくある問題です。アプリケーションがサーバーサイドのプリペアドステートメントを使用していますが、サーバー接続がプールに戻され、プリペアドステートメントが解放される前に別のクライアント（または同じクライアントが別の接続を取得する）によって再利用されています。
+    *   **修正**:
+        *   `server_reset_query = DISCARD ALL`が`pgbouncer.ini`で設定されていることを確認します。これが最も単純で一般的な修正です。
+        *   `DISCARD ALL`が選択肢にない場合（例：パフォーマンスが重要なプリペアドステートメント）、アプリケーションをリファクタリングしてクライアントサイドのプリペアドステートメントを使用するか、サーバーサイドのステートメントを明示的に`DEALLOCATE`します。
+
+2.  **"Too many connections" (PgBouncerから)**:
+    *   **原因**: `max_client_conn`の制限に達しました。あまりにも多くのアプリケーションインスタンスまたはクライアントが同時にPgBouncerに接続しようとしています。
+    *   **修正**: `max_client_conn`を`pgbouncer.ini`で増やします。PgBouncerホストに、増加したクライアント接続を処理するための十分なリソース（メモリ、ファイルディスクリプタ）があることを確認します。
+
+3.  **"Too many connections" (PostgreSQLから)**:
+    *   **原因**: `pool_size`（または`default_pool_size`）が高すぎるか、`max_db_connections`が高すぎるため、PgBouncerがバックエンドのPostgreSQLサーバーに開く接続が多すぎ、その`max_connections`の制限を超えています。
+    *   **修正**: `pool_size`と`max_db_connections`を`pgbouncer.ini`で減らします。これらの値は、PostgreSQLサーバーの容量とワークロードに基づいて調整します。PostgreSQLのアクティブな接続を監視します。
+
+4.  **アプリケーションのハングまたは接続の遅延**:
+    *   **原因**: アプリケーションの並行性に対して`pool_size`が低すぎます。クライアントは、PgBouncerプールでサーバー接続が利用可能になるのを待っています。
+    *   **修正**: 影響を受けるデータベースの`pool_size`を`pgbouncer.ini`で増やします。PgBouncerの`SHOW STATS`出力で`total_wait_time`と`avg_wait_time`を監視します。高い値は接続の枯渇を示します。
+
+5.  **認証失敗**:
+    *   **原因**: `auth_type`の不一致、`auth_file`パスの誤り、または`userlist.txt`の資格情報の誤り。
+    *   **修正**: `auth_type`が設定（例：パスワードベースの認証の場合は`md5`）と一致していることを`pgbouncer.ini`で確認します。`auth_file`が正しい`userlist.txt`を指しており、ユーザーエントリが正しくフォーマットされていることを確認します: `"username" "password_hash"`。`md5`の場合、パスワードハッシュは`md5(password + username)`です。
+
+6.  **PgBouncerが起動しない**:
+    *   **原因**: 設定エラー、ポートの競合、または依存関係の不足。
+    *   **修正**: 起動エラーについては`pgbouncer.log`を確認します。`listen_port`が他のプロセスで使用されていないことを確認します。`pgbouncer.ini`の構文を検証します。
+
+## よくある質問
+
+### 1. アプリケーションの組み込み接続プールではなく、PgBouncerを使用すべきなのはどのような場合ですか？
+
+PgBouncerは次のような場合に使用します。
+*   同じPostgreSQLデータベースに接続する多数のアプリケーションインスタンスまたはマイクロサービスがある場合。
+*   アプリケーションの接続プールが非効率的であるか、適切に設定されていない場合。
+*   接続管理を一元化し、複数のアプリケーション間で接続制限を適用する必要がある場合。
+*   アクティブなバックエンドプロセスの数を制限することで、PostgreSQLサーバーのメモリフットプリントを削減したい場合。
+*   接続フェイルオーバーまたはロードバランシングのための軽量なプロキシが必要な場合。
+
+アプリケーションレベルのプールは、*単一のアプリケーションインスタンスから* PgBouncerへの接続を管理するのに依然として役立ちます。その後、PgBouncerはこれらの接続をPostgreSQLサーバーにプールします。
+
+### 2. PgBouncerを監視するにはどうすればよいですか？
+
+PgBouncerの管理コンソール（通常はポート6432、特別な`pgbouncer`データベースを使用）に接続し、`SHOW`コマンドを使用します。
+*   `SHOW STATS`: 接続、トランザクション、バイトの統計情報を提供します。
+*   `SHOW POOLS`: 現在のプールステータス、アクティブ/待機中のクライアント、サーバー接続を表示します。
+*   `SHOW CLIENTS`: 接続されているすべてのクライアントをリストします。
+*   `SHOW SERVERS`: バックエンドのPostgreSQLサーバーへのすべての接続をリストします。
+
+これらのメトリクスは、監視システム（例：Prometheus、Datadog）に統合する必要があります。
+
+### 3. PgBouncerはSSL/TLS接続を処理できますか？
+
+はい。PgBouncerは、クライアントからPgBouncerへ、およびPgBouncerからサーバーへの両方の接続でSSL/TLSをサポートしています。これは、`pgbouncer.ini`で`client_tls_mode`、`server_tls_mode`、`client_tls_key_file`、`client_tls_cert_file`などのパラメーターを使用して設定します。証明書とキーが正しく設定され、アクセス可能であることを確認してください。
+
+### 4. PgBouncerのメモリフットプリントはどのくらいですか？
+
+PgBouncerは非常に軽量に設計されています。そのメモリ消費は、主に管理するアクティブなクライアント接続とサーバー接続の数によって決まります。各接続は、バッファと状態のために少量のメモリを消費します。数千の接続の場合、PgBouncerは通常、数十から数百MBを消費し、同数のPostgreSQLバックエンドプロセスよりも大幅に少なくなります。
+
+### 5. PgBouncerは`SET`コマンドをどのように処理しますか？
+
+`session`プーリングでは、サーバー接続がクライアント専用であるため、`SET`コマンドは期待どおりに動作します。
+`transaction`プーリングでは、`SET`コマンド（例：`SET search_path`、`SET timezone`）は通常、トランザクションの最後に`server_reset_query = DISCARD ALL`によってリセットされます。セッション固有の`SET`コマンドがトランザクション間で永続する必要がある場合、`transaction`プーリングは適していません。または、各トランザクションの開始時に`SET`コマンドを再発行する必要があります。ほとんどのアプリケーションでは、状態の漏洩を防ぐために`DISCARD ALL`が望ましい動作です。
+
+## アーキテクチャとトレードオフの比較
+
+| 機能/モード             | セッションプーリング                                | トランザクションプーリング                                | ステートメントプーリング                                  |
+| :-------------------- | :-------------------------------------------- | :---------------------------------------------------- | :---------------------------------------------------- |
+| **サーバー接続の再利用**| クライアント切断時                            | トランザクションコミット/ロールバック時                   | ステートメント完了時                                    |
+| **プリペアドステートメント**| 完全に互換性あり                              | 壊れる（`DISCARD ALL`またはクライアントサイドの準備が必要）      | 壊れる（`DISCARD ALL`またはクライアントサイドの準備が必要）      |
+| **アドバイザリーロック**    | 完全に互換性あり                              | 壊れる                                                | 壊れる                                                |
+| **一時テーブル**       | 完全に互換性あり                              | 壊れる                                                | 壊れる                                                |
+| **`SET`コマンド**    | クライアントセッションで永続                    | `DISCARD ALL`によってリセットされる（デフォルト）              | `DISCARD ALL`によってリセットされる（デフォルト）              |
+| **接続利用率**        | 低い（アイドル接続がサーバーリソースを保持）      | 高い（サーバー接続はすぐにプールに戻される）              | 非常に高い（各ステートメントの後にサーバー接続が戻される）|
+| **アプリケーションへの影響**| 最小限                                        | ステートフルな機能の慎重な処理が必要                      | 大幅なアプリケーションのリファクタリングが必要            |
+| **典型的なユースケース**  | レガシーアプリ、長時間の対話型セッション          | Webアプリ、マイクロサービス、短時間のトランザクション     | ニッチな、高度に専門化されたワークロード                  |
+| **オーバーヘッド**          | 低い（PgBouncer自体）                        | 低い（PgBouncer自体）                                | 低い（PgBouncer自体）                                |

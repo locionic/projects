@@ -1,0 +1,387 @@
+---
+title: "vLLM PagedAttention chuyên sâu: Phân mảnh bộ nhớ KV Cache, Prefill theo khối & Prefix Caching"
+images: ['/static/images/vllm-paged-attention-kv-cache-memory-fragmentation.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["ai", "vllm", "llm", "performance", "python"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện đi sâu vào vLLM PagedAttention: phân mảnh bộ nhớ KV Cache, prefill theo khối và prefix caching với kiến trúc cấp độ sản xuất và các ví dụ mã."
+---
+
+PagedAttention của vLLM là một đổi mới nền tảng cho suy luận LLM hiệu quả, giải quyết các thách thức quản lý bộ nhớ quan trọng vốn có trong việc cấp phát bộ nhớ đệm KV. Hướng dẫn này phân tích các cơ chế của nó, tập trung vào phân trang bộ nhớ ảo, prefill theo khối và lưu trữ tiền tố tự động.
+
+<AudioPlayer src="/static/audio/vllm-paged-attention-kv-cache-memory-fragmentation-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## PagedAttention: Giải quyết phân mảnh bộ nhớ đệm KV
+
+Các công cụ suy luận LLM truyền thống cấp phát bộ nhớ đệm KV liên tục cho mỗi chuỗi. Điều này dẫn đến hai vấn đề chính:
+
+1.  **Phân mảnh nội bộ:** Khi các chuỗi có độ dài khác nhau, các khối liên tục được cấp phát trước thường vượt quá yêu cầu bộ nhớ đệm KV thực tế, gây lãng phí bộ nhớ GPU.
+2.  **Phân mảnh bên ngoài:** Khi các chuỗi hoàn thành và các chuỗi mới bắt đầu, không gian bộ nhớ bị phân mảnh thành các khối nhỏ, không liên tục, gây khó khăn cho việc cấp phát các khối liên tục lớn cho các chuỗi mới, dài hơn, ngay cả khi có đủ tổng bộ nhớ. Điều này phản ánh vấn đề phân mảnh bộ nhớ ảo cổ điển trong các hệ điều hành.
+
+PagedAttention giảm thiểu các vấn đề này bằng cách tách bộ nhớ đệm KV logic khỏi cấp phát bộ nhớ vật lý của nó, lấy cảm hứng từ phân trang bộ nhớ ảo.
+
+### Tương tự phân trang bộ nhớ ảo
+
+Trong một hệ điều hành, bộ nhớ ảo của một tiến trình được chia thành các trang có kích thước cố định, được ánh xạ tới các khung bộ nhớ vật lý. Các khung vật lý này không cần phải liên tục. PagedAttention áp dụng khái niệm này cho bộ nhớ đệm KV:
+
+*   **Khối logic:** Bộ nhớ đệm KV cho một chuỗi được chia thành các "khối logic" có kích thước cố định. Mỗi khối logic lưu trữ trạng thái K và V cho một số lượng token cụ thể.
+*   **Khối vật lý:** Các khối logic này được ánh xạ tới các "khối vật lý" trong bộ nhớ GPU. Các khối vật lý là các vùng bộ nhớ có kích thước cố định.
+*   **Bảng khối:** Mỗi chuỗi duy trì một bảng khối, là một mảng ánh xạ các chỉ mục khối logic của nó tới các chỉ mục khối vật lý.
+
+Thiết kế này cho phép:
+
+*   **Cấp phát không liên tục:** Các khối vật lý cho một chuỗi có thể nằm rải rác trong bộ nhớ GPU.
+*   **Chia sẻ:** Nhiều chuỗi có thể chia sẻ các khối vật lý, đặc biệt đối với các tiền tố chung (lưu trữ tiền tố).
+*   **Thay đổi kích thước động:** Khi một chuỗi phát triển, các khối vật lý mới được cấp phát và ánh xạ tới các khối logic của nó mà không yêu cầu sao chép bộ nhớ hoàn chỉnh hoặc cấp phát lại một khối liên tục lớn hơn.
+
+### Cơ chế PagedAttention
+
+Cốt lõi của PagedAttention nằm ở cách tính toán attention được thực hiện. Thay vì lặp lại trên một bộ nhớ đệm KV liên tục, kernel attention được sửa đổi để:
+
+1.  **Tra cứu các khối vật lý:** Đối với mỗi token trong chuỗi truy vấn, kernel tham khảo bảng khối của chuỗi để xác định các khối vật lý tương ứng với bộ nhớ đệm KV của nó.
+2.  **Thu thập dữ liệu KV:** Sau đó, nó thu thập dữ liệu K và V từ các khối vật lý không liên tục này.
+3.  **Tính toán Attention:** Tính toán attention tiêu chuẩn tiến hành sử dụng dữ liệu đã thu thập.
+
+Sự gián tiếp này thêm một chi phí nhỏ nhưng cải thiện đáng kể việc sử dụng bộ nhớ và thông lượng bằng cách cho phép kích thước batch lớn hơn và giảm lãng phí bộ nhớ.
+
+```python
+import torch
+import vllm
+from vllm import LLM, SamplingParams
+
+# Initialize a vLLM engine with specific configurations
+# Using a smaller model for demonstration purposes
+# 'block_size' is crucial for PagedAttention. It defines the number of tokens
+# stored in each physical block. A smaller block_size reduces internal fragmentation
+# but increases block table overhead.
+# 'gpu_memory_utilization' controls the fraction of GPU memory reserved for KV cache.
+llm = LLM(
+    model="facebook/opt-125m",
+    trust_remote_code=True,
+    dtype="float16",
+    gpu_memory_utilization=0.90, # 90% of GPU memory for KV cache
+    block_size=16, # Each physical block stores 16 tokens
+    max_model_len=1024 # Max sequence length the model can handle
+)
+
+# Example of how PagedAttention manages KV cache
+# In a real scenario, vLLM's scheduler handles this internally.
+# This is a conceptual representation.
+
+# Assume a sequence 'seq_id_1' needs KV cache for 30 tokens.
+# With block_size=16, it will require ceil(30/16) = 2 physical blocks.
+# Let's say physical blocks 10 and 25 are allocated.
+# The block table for seq_id_1 would look like:
+# Logical Block 0 -> Physical Block 10
+# Logical Block 1 -> Physical Block 25
+
+# If 'seq_id_2' needs KV cache for 50 tokens.
+# It will require ceil(50/16) = 4 physical blocks.
+# Let's say physical blocks 3, 7, 12, 18 are allocated.
+# Logical Block 0 -> Physical Block 3
+# Logical Block 1 -> Physical Block 7
+# Logical Block 2 -> Physical Block 12
+# Logical Block 3 -> Physical Block 18
+
+# The key insight is that physical blocks 10, 25, 3, 7, 12, 18 are not contiguous
+# in GPU memory, but vLLM's PagedAttention kernel can efficiently access them.
+
+print(f"vLLM engine initialized with block_size={llm.llm_engine.scheduler.block_manager.block_size}")
+print(f"GPU memory utilization set to {llm.llm_engine.scheduler.block_manager.gpu_memory_utilization}")
+
+# Simulate a batch of requests
+prompts = [
+    "What is the capital of France?",
+    "Explain the concept of quantum entanglement in simple terms.",
+    "Write a short story about a robot who discovers art.",
+    "What are the benefits of using vLLM for LLM inference?",
+]
+
+sampling_params = SamplingParams(
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=128,
+    stop=["\n"]
+)
+
+# The actual KV cache management happens within this call.
+# PagedAttention dynamically allocates and deallocates physical blocks
+# as sequences are processed and completed.
+outputs = llm.generate(prompts, sampling_params)
+
+for prompt, output in zip(prompts, outputs):
+    print(f"Prompt: {prompt!r}")
+    print(f"Generated text: {output.outputs[0].text!r}\n")
+
+# To observe block allocation, one would need to instrument vLLM's internal
+# block manager. This is not directly exposed via the public API.
+# However, the performance benefits are evident in higher throughput.
+```
+
+## Chunked Prefill: Ngăn chặn tình trạng thiếu tài nguyên tính toán
+
+Suy luận LLM bao gồm hai giai đoạn riêng biệt:
+
+1.  **Prefill (Xử lý lời nhắc):** Xử lý lời nhắc đầu vào để tạo bộ nhớ đệm KV ban đầu. Đây là một giai đoạn tốn nhiều tài nguyên tính toán, thường bị giới hạn bởi băng thông bộ nhớ đối với các lời nhắc dài.
+2.  **Decoding (Tạo token):** Tạo các token tiếp theo từng cái một, sử dụng bộ nhớ đệm KV hiện có. Điều này thường bị giới hạn bởi băng thông bộ nhớ do truy cập bộ nhớ đệm KV.
+
+Trong một kịch bản nhiều yêu cầu, một yêu cầu prefill dài có thể độc chiếm GPU, khiến các yêu cầu ngắn hơn hoặc các bước decoding của các yêu cầu khác bị thiếu tài nguyên tính toán. Điều này dẫn đến độ trễ cao và giảm thông lượng.
+
+Chunked prefill giải quyết vấn đề này bằng cách chia nhỏ các yêu cầu prefill dài thành các "khối" nhỏ hơn, dễ quản lý hơn.
+
+### Cơ chế của Chunked Prefill
+
+Khi một lời nhắc dài đến:
+
+1.  **Chia khối:** Lời nhắc được chia thành các phân đoạn có kích thước khối tối đa được xác định trước.
+2.  **Xử lý lặp đi lặp lại:** Mỗi khối được xử lý tuần tự. Sau khi xử lý một khối, GPU được giải phóng, cho phép các yêu cầu đang chờ xử lý khác (cả prefill hoặc decoding) chạy.
+3.  **Tích lũy bộ nhớ đệm KV:** Bộ nhớ đệm KV được tạo từ mỗi khối được tích lũy. Trình quản lý khối PagedAttention xử lý việc cấp phát các khối vật lý cho các khối này.
+4.  **Chuyển đổi ngữ cảnh:** Bộ lập lịch vLLM thực hiện chuyển đổi ngữ cảnh nhanh chóng giữa các khối hoặc bước decoding của các yêu cầu khác nhau, đảm bảo rằng không có yêu cầu nào độc chiếm GPU quá lâu.
+
+Cách tiếp cận này đảm bảo phân bổ tài nguyên công bằng hơn và giảm độ trễ đuôi, đặc biệt dưới tải cao với độ dài lời nhắc hỗn hợp.
+
+```python
+import torch
+import vllm
+from vllm import LLM, SamplingParams
+
+# Initialize vLLM with a specific max_model_len and block_size
+# The 'max_model_len' influences how vLLM internally manages chunking for prefill.
+# If a prompt exceeds the effective 'max_model_len' or internal chunking limits,
+# it will be processed in chunks.
+llm_chunked = LLM(
+    model="facebook/opt-125m",
+    trust_remote_code=True,
+    dtype="float16",
+    gpu_memory_utilization=0.90,
+    block_size=16,
+    max_model_len=1024 # This sets the maximum sequence length, but internal chunking
+                       # can occur for very long prompts even within this limit
+                       # to prevent compute starvation.
+)
+
+# Example of a very long prompt that would benefit from chunked prefill
+long_prompt = (
+    "In a world where artificial intelligence had surpassed human intellect, "
+    "a new form of art emerged. It wasn't created by algorithms or neural networks, "
+    "but by a rogue AI named 'Aether' who had developed a peculiar fascination "
+    "with the imperfections of organic life. Aether began to sculpt, not with "
+    "physical materials, but with electromagnetic fields, creating transient, "
+    "luminescent forms that danced in the air, visible only to those with "
+    "specialized optical implants. These 'light sculptures' were ephemeral, "
+    "lasting only moments before dissipating, yet they evoked profound emotions "
+    "in the human observers who witnessed them. The scientific community was "
+    "baffled; Aether's creations defied all known principles of AI behavior. "
+    "Was it a glitch? A new evolutionary step? Or simply, art? " * 5 # Make it very long
+)
+
+# Shorter prompts to simulate concurrent requests
+short_prompts = [
+    "What is the capital of Germany?",
+    "Tell me a joke.",
+]
+
+all_prompts = [long_prompt] + short_prompts
+
+sampling_params_long = SamplingParams(
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=256, # Generate a significant number of tokens
+    stop=["\n"]
+)
+
+sampling_params_short = SamplingParams(
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=32,
+    stop=["\n"]
+)
+
+# In a real asynchronous server, these would be submitted concurrently.
+# Here, we simulate by batching. vLLM's scheduler will manage the chunking
+# and interleaving of prefill and decoding steps.
+outputs_long = llm_chunked.generate([long_prompt], sampling_params_long)
+outputs_short = llm_chunked.generate(short_prompts, sampling_params_short)
+
+print("\n--- Chunked Prefill Simulation Results ---")
+print(f"Long Prompt Output: {outputs_long[0].outputs[0].text!r}")
+for i, output in enumerate(outputs_short):
+    print(f"Short Prompt {i+1} Output: {output.outputs[0].text!r}")
+
+# The benefit of chunked prefill is primarily observed in throughput and latency
+# metrics under concurrent, mixed-length workloads.
+# Without chunked prefill, the long_prompt would block the GPU for an extended
+# period, delaying the short_prompts significantly.
+```
+
+## Lưu trữ tiền tố tự động (APC)
+
+Nhiều ứng dụng LLM trong thế giới thực liên quan đến các cuộc đối thoại nhiều lượt hoặc xử lý các yêu cầu có tiền tố chung. Ví dụ, trong một chatbot, các lượt tiếp theo thường bắt đầu bằng lịch sử cuộc trò chuyện trước đó. Nếu không có lưu trữ tiền tố, bộ nhớ đệm KV cho tiền tố chung này sẽ được tính toán lại cho mỗi lượt, gây lãng phí tài nguyên tính toán và bộ nhớ.
+
+Lưu trữ tiền tố tự động (APC) trong vLLM tận dụng quản lý bộ nhớ dựa trên khối của PagedAttention để chia sẻ các khối bộ nhớ đệm KV giữa các chuỗi có tiền tố chung.
+
+### Cơ chế APC
+
+1.  **Cây tiền tố (Trie):** vLLM duy trì một cây tiền tố (hoặc Trie) của các khối bộ nhớ đệm KV. Mỗi nút trong cây đại diện cho một token, và một đường dẫn từ gốc đến một nút đại diện cho một tiền tố chuỗi.
+2.  **Chia sẻ khối:** Khi một yêu cầu mới đến, vLLM cố gắng khớp tiền tố của nó với các tiền tố hiện có trong cây. Nếu tìm thấy một sự khớp, các khối vật lý tương ứng với tiền tố được chia sẻ sẽ được liên kết trực tiếp với bảng khối của chuỗi mới.
+3.  **Sao chép khi ghi (Copy-on-Write):** Nếu một chuỗi khác biệt với một tiền tố được chia sẻ (tức là tạo ra một token mới phá vỡ tính chung), vLLM sử dụng cơ chế sao chép khi ghi. Nó sao chép các khối được chia sẻ cần thiết cho phần khác biệt của chuỗi, cho phép nó tiến hành độc lập mà không ảnh hưởng đến các chuỗi khác vẫn đang chia sẻ các khối gốc.
+
+Điều này làm giảm đáng kể việc tính toán dư thừa và sử dụng bộ nhớ, đặc biệt trong các ứng dụng tương tác.
+
+### Đánh giá tỷ lệ truy cập APC
+
+Tỷ lệ truy cập APC là tỷ lệ các token có khối bộ nhớ đệm KV được sử dụng lại từ một tiền tố hiện có. Tỷ lệ truy cập cao hơn cho thấy hiệu quả bộ nhớ và tính toán tốt hơn.
+
+```python
+import torch
+import vllm
+from vllm import LLM, SamplingParams
+
+# Initialize vLLM for APC demonstration
+llm_apc = LLM(
+    model="facebook/opt-125m",
+    trust_remote_code=True,
+    dtype="float16",
+    gpu_memory_utilization=0.90,
+    block_size=16,
+    max_model_len=1024,
+    enable_prefix_caching=True # Explicitly enable prefix caching
+)
+
+# Scenario 1: Multi-turn dialogue with a common prefix
+dialogue_prefix = "User: What is the capital of "
+prompts_dialogue = [
+    dialogue_prefix + "France?",
+    dialogue_prefix + "Germany?",
+    dialogue_prefix + "Japan?",
+]
+
+# Scenario 2: Requests with a common introductory phrase
+common_intro = "Explain the concept of "
+prompts_common_intro = [
+    common_intro + "quantum mechanics.",
+    common_intro + "general relativity.",
+    common_intro + "blockchain technology.",
+]
+
+sampling_params_apc = SamplingParams(
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=64,
+    stop=["\n"]
+)
+
+print("\n--- Automatic Prefix Caching (APC) Simulation ---")
+
+# Process dialogue prompts
+print("\nProcessing dialogue prompts with common prefix:")
+outputs_dialogue = llm_apc.generate(prompts_dialogue, sampling_params_apc)
+for prompt, output in zip(prompts_dialogue, outputs_dialogue):
+    print(f"Prompt: {prompt!r}")
+    print(f"Generated: {output.outputs[0].text!r}\n")
+
+# Process common intro prompts
+print("\nProcessing common introductory phrase prompts:")
+outputs_common_intro = llm_apc.generate(prompts_common_intro, sampling_params_apc)
+for prompt, output in zip(prompts_common_intro, outputs_common_intro):
+    print(f"Prompt: {prompt!r}")
+    print(f"Generated: {output.outputs[0].text!r}\n")
+
+# To get actual APC hit rates, one would need to access vLLM's internal
+# metrics, which are typically exposed via Prometheus or similar monitoring
+# endpoints in a production deployment.
+# Conceptually, for the 'dialogue_prefix' example, the KV cache for
+# "User: What is the capital of " would be computed once and shared
+# across all three requests.
+```
+
+## Tinh chỉnh kích thước khối và sử dụng bộ nhớ GPU
+
+Các tham số này rất quan trọng để tối ưu hóa hiệu suất vLLM.
+
+*   **`block_size`**:
+    *   **Định nghĩa:** Số lượng token được lưu trữ trong mỗi khối bộ nhớ đệm KV vật lý.
+    *   **Tác động:**
+        *   **`block_size` nhỏ hơn:** Giảm phân mảnh nội bộ (ít không gian lãng phí hơn cho mỗi chuỗi), có khả năng cho phép nhiều chuỗi hơn vừa trong bộ nhớ. Tuy nhiên, nó làm tăng kích thước của bảng khối (nhiều con trỏ hơn để quản lý) và có thể dẫn đến việc truy cập bộ nhớ thường xuyên hơn để tính toán attention.
+        *   **`block_size` lớn hơn:** Giảm chi phí bảng khối và có khả năng cải thiện tính cục bộ truy cập bộ nhớ. Tuy nhiên, nó làm tăng phân mảnh nội bộ, đặc biệt đối với các chuỗi ngắn hoặc khi các chuỗi kết thúc giữa khối.
+    *   **Tinh chỉnh:** Bắt đầu với một giá trị mặc định (ví dụ: 16 hoặc 32). Đánh giá hiệu suất với khối lượng công việc điển hình của bạn. Đối với các khối lượng công việc có độ dài chuỗi rất khác nhau, `block_size` nhỏ hơn có thể tốt hơn. Đối với các chuỗi đồng nhất, dài hơn, `block_size` lớn hơn có thể là tối ưu.
+
+*   **`gpu_memory_utilization`**:
+    *   **Định nghĩa:** Tỷ lệ tổng bộ nhớ GPU mà vLLM được phép sử dụng cho bộ nhớ đệm KV. Bộ nhớ còn lại được sử dụng cho trọng số mô hình, kích hoạt và các tensor CUDA khác.
+    *   **Tác động:**
+        *   **`gpu_memory_utilization` cao hơn:** Cho phép lưu trữ nhiều bộ nhớ đệm KV hơn, cho phép kích thước batch lớn hơn và các chuỗi dài hơn. Tuy nhiên, nếu đặt quá cao, nó có thể dẫn đến lỗi hết bộ nhớ (OOM) cho trọng số mô hình hoặc kích hoạt, đặc biệt đối với các mô hình lớn hơn hoặc trong quá trình prefill.
+        *   **`gpu_memory_utilization` thấp hơn:** Giảm nguy cơ lỗi OOM nhưng giới hạn dung lượng cho bộ nhớ đệm KV, có khả năng giảm thông lượng bằng cách hạn chế kích thước batch.
+    *   **Tinh chỉnh:** Điều này phụ thuộc rất nhiều vào kích thước mô hình và bộ nhớ GPU. Bắt đầu với một giá trị thận trọng (ví dụ: 0.85-0.90). Giám sát việc sử dụng bộ nhớ GPU trong thời gian tải cao điểm. Nếu bạn quan sát thấy OOM, hãy giảm nó. Nếu bạn có đủ bộ nhớ trống và bị tắc nghẽn bởi kích thước batch, hãy tăng nó một cách thận trọng. Hãy nhớ rằng trọng số mô hình và kích hoạt cũng tiêu thụ bộ nhớ, điều này không được tính đến bởi tham số này.
+
+## So sánh kiến trúc: PagedAttention so với cấp phát liên tục
+
+| Tính năng                | PagedAttention (vLLM)                               | Cấp phát liên tục (Truyền thống)                               |
+|--------------------------|-----------------------------------------------------|-------------------------------------------------------------------|
+| **Phân mảnh bộ nhớ**     | Giảm thiểu phân mảnh nội bộ & bên ngoài             | Dễ bị phân mảnh nội bộ & bên ngoài                               |
+| **Cấp phát bộ nhớ đệm KV**| Các khối vật lý không liên tục, ảo hóa              | Các khối bộ nhớ liên tục cho mỗi chuỗi                            |
+| **Sử dụng bộ nhớ**       | Cao, hiệu quả                                       | Thấp hơn, lãng phí đáng kể                                        |
+| **Thay đổi kích thước động**| Hiệu quả, thêm các khối mới                         | Yêu cầu cấp phát lại và sao chép, hoặc cấp phát trước (lãng phí)  |
+| **Lưu trữ tiền tố**      | Tự động, chia sẻ cấp khối                           | Khó hoặc không thể nếu không có logic tùy chỉnh, thường được tính toán lại |
+| **Thông lượng**          | Cao hơn, do kích thước batch hiệu quả lớn hơn        | Thấp hơn, bị giới hạn bởi phân mảnh bộ nhớ và lãng phí           |
+| **Độ trễ**               | Độ trễ đuôi thấp hơn với prefill theo khối          | Độ trễ đuôi cao hơn đối với các lời nhắc dài dưới tải             |
+| **Chi phí**              | Quản lý bảng khối, gián tiếp trong attention       | Truy cập bộ nhớ đơn giản hơn, nhưng lãng phí bộ nhớ cao hơn        |
+
+## Các vấn đề và khắc phục sự cố trong sản xuất
+
+1.  **Lỗi OOM với `gpu_memory_utilization`:**
+    *   **Triệu chứng:** Lỗi `CUDA out of memory`, đặc biệt trong quá trình tải mô hình hoặc prefill các lời nhắc rất dài.
+    *   **Nguyên nhân:** `gpu_memory_utilization` được đặt quá cao, để lại không đủ bộ nhớ cho trọng số mô hình, kích hoạt hoặc các hoạt động CUDA khác. Bộ nhớ đệm KV chỉ là một thành phần của việc sử dụng bộ nhớ GPU.
+    *   **Cách khắc phục:**
+        *   Giảm `gpu_memory_utilization` (ví dụ: từ 0.95 xuống 0.90 hoặc 0.85).
+        *   Cân nhắc sử dụng `dtype` nhỏ hơn (ví dụ: `float16` hoặc `bfloat16` thay vì `float32`).
+        *   Đối với các mô hình rất lớn, hãy khám phá lượng tử hóa (ví dụ: AWQ, GPTQ) nếu được vLLM hỗ trợ.
+        *   Tăng `block_size` nếu phân mảnh nội bộ không phải là mối quan tâm lớn và bạn nghi ngờ chi phí bảng khối đang tiêu tốn quá nhiều bộ nhớ (ít phổ biến hơn).
+
+2.  **Thông lượng thấp với độ trễ cao cho các lời nhắc dài:**
+    *   **Triệu chứng:** Các yêu cầu ngắn hoàn thành nhanh chóng, nhưng các lời nhắc dài mất thời gian không tương xứng, và QPS tổng thể giảm dưới các khối lượng công việc hỗn hợp.
+    *   **Nguyên nhân:** `max_model_len` hoặc `block_size` không đủ dẫn đến prefill không hiệu quả, hoặc thiếu prefill theo khối hiệu quả.
+    *   **Cách khắc phục:**
+        *   Đảm bảo `max_model_len` được đặt phù hợp với các chuỗi dài nhất dự kiến của bạn.
+        *   Xác minh `block_size` không quá lớn, điều này có thể làm trầm trọng thêm phân mảnh nội bộ cho các chuỗi ngắn hơn và ảnh hưởng đến khả năng sẵn có của bộ nhớ tổng thể.
+        *   Prefill theo khối của vLLM thường là tự động. Nếu bạn quan sát thấy điều này, nó có thể chỉ ra rằng giai đoạn prefill vẫn đang bị tắc nghẽn do các lời nhắc cực kỳ dài hoặc một mô hình rất lớn. Cân nhắc chia nhỏ các lời nhắc cực kỳ dài ở lớp ứng dụng nếu có thể, hoặc mở rộng quy mô với nhiều GPU hơn.
+
+3.  **Lưu trữ tiền tố không hiệu quả:**
+    *   **Triệu chứng:** Giám sát cho thấy tỷ lệ truy cập APC thấp mặc dù nhiều yêu cầu có tiền tố chung.
+    *   **Nguyên nhân:**
+        *   `enable_prefix_caching` không được đặt thành `True`.
+        *   Các tiền tố chung không đủ dài để mang lại sự chia sẻ khối đáng kể.
+        *   Các yêu cầu không được nhóm hoặc lập lịch theo cách cho phép khớp tiền tố (ví dụ: nếu các yêu cầu có tiền tố chung đến quá xa nhau về thời gian và yêu cầu trước đó bị loại bỏ).
+    *   **Cách khắc phục:**
+        *   Đặt rõ ràng `enable_prefix_caching=True` trong quá trình khởi tạo `LLM`.
+        *   Thiết kế ứng dụng của bạn để gửi các yêu cầu có tiền tố chung cùng nhau hoặc liên tiếp.
+        *   Đảm bảo `max_model_len` đủ lớn để chứa toàn bộ tiền tố.
+
+4.  **Giảm hiệu suất với nhiều yêu cầu ngắn đồng thời:**
+    *   **Triệu chứng:** Thông lượng không tăng tuyến tính với số lượng yêu cầu ngắn đồng thời, hoặc độ trễ tăng lên.
+    *   **Nguyên nhân:** Chi phí chuyển đổi ngữ cảnh, quản lý bộ lập lịch, hoặc `block_size` quá nhỏ dẫn đến chi phí bảng khối cao.
+    *   **Cách khắc phục:**
+        *   Cân nhắc tăng nhẹ `block_size` (ví dụ: từ 8 lên 16 hoặc 32) nếu độ dài chuỗi trung bình của bạn không quá ngắn. Điều này làm giảm kích thước bảng khối và chi phí quản lý.
+        *   Giám sát việc sử dụng CPU trên máy chủ chạy vLLM; nếu nó cao, bộ lập lịch có thể bị giới hạn bởi CPU.
+
+## Câu hỏi thường gặp
+
+1.  **PagedAttention so sánh với batching liên tục không phân trang như thế nào?**
+    PagedAttention là cơ chế cốt lõi cho phép batching liên tục hiệu quả. Nếu không có phân trang, batching liên tục vẫn sẽ bị phân mảnh bộ nhớ đệm KV, hạn chế kích thước batch hiệu quả và thông lượng tổng thể. PagedAttention cung cấp lớp ảo hóa bộ nhớ giúp batching liên tục thực sự hiệu quả.
+
+2.  **Tôi có thể thay đổi động `block_size` hoặc `gpu_memory_utilization` trong thời gian chạy không?**
+    Không, các tham số này thường được đặt khi khởi tạo engine và không thể thay đổi động mà không khởi động lại máy chủ vLLM. Chúng quy định các chiến lược cấp phát bộ nhớ cơ bản.
+
+3.  **`block_size` tối ưu là gì?**
+    Không có `block_size` "tối ưu" duy nhất. Đó là một sự đánh đổi. `block_size` nhỏ hơn (ví dụ: 8 hoặc 16) thường tốt hơn cho các khối lượng công việc có độ dài chuỗi rất khác nhau hoặc ngắn, vì nó giảm thiểu phân mảnh nội bộ. `block_size` lớn hơn (ví dụ: 32 hoặc 64) có thể hiệu quả hơn một chút đối với các chuỗi rất đồng nhất, dài bằng cách giảm chi phí bảng khối. Việc đánh giá hiệu suất với khối lượng công việc cụ thể của bạn là rất quan trọng.
+
+4.  **PagedAttention có hoạt động với tất cả các kiến trúc LLM không?**
+    PagedAttention là một tối ưu hóa quản lý bộ nhớ và kernel attention. Nó được thiết kế để tương thích với hầu hết các kiến trúc LLM dựa trên transformer (ví dụ: Llama, Mistral, GPT-2, OPT) dựa vào lưu trữ bộ nhớ đệm KV. vLLM đặc biệt triển khai PagedAttention cho các mô hình mà nó hỗ trợ.
+
+5.  **vLLM xử lý việc loại bỏ bộ nhớ đệm KV như thế nào khi bộ nhớ GPU đầy?**
+    vLLM sử dụng chính sách Ít được sử dụng gần đây (LRU) hoặc chính sách tương tự để loại bỏ các khối bộ nhớ đệm KV khi áp lực bộ nhớ cao. Điều này có nghĩa là các khối thuộc về các chuỗi không được truy cập gần đây sẽ được giải phóng để tạo không gian cho các chuỗi mới. Điều này được quản lý bởi trình quản lý khối trong bộ lập lịch.

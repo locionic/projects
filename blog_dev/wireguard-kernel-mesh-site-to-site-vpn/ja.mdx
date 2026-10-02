@@ -1,0 +1,312 @@
+---
+title: "WireGuardサイト間カーネルメッシュ:高スループット暗号ルーティングとMTU最適化"
+images: ['/static/images/wireguard-kernel-mesh-site-to-site-vpn.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["networking", "linux", "security", "devops", "cloud"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "WireGuardサイト間カーネルメッシュにおける高スループット暗号ルーティングとMTU最適化を、本番環境レベルのアーキテクチャとコード例で解説する包括的なガイド。"
+---
+
+WireGuardのインカーネル実装は、サイト間VPN向けに高性能でセキュア、かつ合理化されたソリューションを提供し、多くの場合、従来のIPsecデプロイメントを大幅に上回る性能を発揮します。このガイドでは、クリプトキー・ルーティング、NATトラバーサル、MTU最適化、および`iproute2`とBGPによる高度なルーティングに焦点を当て、高スループットなWireGuardカーネルメッシュの構築について詳しく説明します。
+
+<AudioPlayer src="/static/audio/wireguard-kernel-mesh-site-to-site-vpn-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+## WireGuardの基本：クリプトキー・ルーティング
+
+WireGuardはクリプトキー・ルーティングの原則に基づいて動作します。ピアの識別とポリシー適用にIPアドレスを多用するIPsecとは異なり、WireGuardは公開鍵を使用します。各ピアは公開鍵によって識別され、トラフィックの暗号化/復号化はこの鍵と本質的に結びついています。これにより、IDがネットワークアドレスベースではなく暗号ベースになるため、設定が簡素化され、セキュリティが強化されます。
+
+通常`wg0`などと名付けられるWireGuardインターフェースは、仮想ネットワークインターフェースとして機能します。パケットがピアの`AllowedIPs`範囲内で設定されたIPアドレス宛ての場合、WireGuardは自動的にそのピアの公開鍵を使用して暗号化し、ピアのエンドポイントに送信します。逆に、受信した暗号化パケットは復号化され、その送信元IPが送信ピアの`AllowedIPs`範囲と一致する場合、受け入れられます。
+
+### ピア設定例
+
+`SiteA`と`SiteB`の2つのサイトを考えます。それぞれにWireGuardゲートウェイがあります。
+
+**SiteAゲートウェイ (wg0)**
+*   公開IP: `203.0.113.10`
+*   内部ネットワーク: `10.0.1.0/24`
+*   WireGuard IP: `10.255.255.1/32`
+*   公開鍵: `SITEA_PUBLIC_KEY`
+
+**SiteBゲートウェイ (wg0)**
+*   公開IP: `198.51.100.20`
+*   内部ネットワーク: `10.0.2.0/24`
+*   WireGuard IP: `10.255.255.2/32`
+*   公開鍵: `SITEB_PUBLIC_KEY`
+
+`SiteA`のゲートウェイ上のWireGuard設定には、`SiteB`のピアエントリが含まれます。
+
+```ini
+# /etc/wireguard/wg0.conf on SiteA Gateway
+[Interface]
+PrivateKey = SITEA_PRIVATE_KEY
+Address = 10.255.255.1/32
+ListenPort = 51820 # Standard WireGuard port
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+[Peer]
+# SiteB Gateway
+PublicKey = SITEB_PUBLIC_KEY
+Endpoint = 198.51.100.20:51820
+AllowedIPs = 10.255.255.2/32, 10.0.2.0/24 # WireGuard IP of SiteB, and SiteB's internal network
+PersistentKeepalive = 25 # Important for NAT traversal
+```
+
+そして、`SiteB`のゲートウェイ上には、`SiteA`のピアエントリが含まれます。
+
+```ini
+# /etc/wireguard/wg0.conf on SiteB Gateway
+[Interface]
+PrivateKey = SITEB_PRIVATE_KEY
+Address = 10.255.255.2/32
+ListenPort = 51820
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+[Peer]
+# SiteA Gateway
+PublicKey = SITEA_PUBLIC_KEY
+Endpoint = 203.0.113.10:51820
+AllowedIPs = 10.255.255.1/32, 10.0.1.0/24 # WireGuard IP of SiteA, and SiteA's internal network
+PersistentKeepalive = 25
+```
+
+`PostUp`/`PostDown`ルールは、WireGuardインターフェースのIPフォワーディングとNATを有効にし、内部ネットワークがトンネルを介して通信できるようにします。`eth0`は実際の公開インターフェース名に置き換える必要があることに注意してください。
+
+## Persistent KeepaliveによるNATトラバーサル
+
+WireGuardピアがNATデバイス（例：ホームルーターやクラウドNATゲートウェイ）の背後にある場合、長期間トラフィックが流れないとNATマッピングが期限切れになることがあります。これにより、NAT側のトラフィックが開始されるまで接続が切断されます。`PersistentKeepalive`は、`N`秒ごとに小さな暗号化されたキープアライブパケットをピアに送信することで、この問題に対処します。これによりNATマッピングが維持され、双方向の接続が保証されます。ほとんどのNATデバイスでは、`25`秒の値で十分です。
+
+## MTU最適化とMSSクランピング
+
+WireGuardはIPパケットをカプセル化し、独自のヘッダー（IPv4で通常20バイト、IPv6で40バイト）に加えてUDPヘッダー（8バイト）と外側のIPヘッダー（IPv4で20バイト、IPv6で40バイト）を追加します。このオーバーヘッドにより、カプセル化されたトラフィックで利用可能な実効最大転送単位（MTU）が減少します。
+
+標準のイーサネットMTUは1500バイトです。
+*   外側のIPヘッダー: 20バイト
+*   UDPヘッダー: 8バイト
+*   WireGuardヘッダー: 20バイト（約）
+*   合計オーバーヘッド: 約48バイト
+
+したがって、内部パケットの実効MTUは`1500 - 48 = 1452`バイトになります。WireGuardインターフェースのMTUを`1452`（または安全のために、あるいはIPv6が関与する場合は`1420`など、わずかに低く）に設定することで、*外側の* WireGuardパケットのフラグメンテーションを防ぎます。
+
+```ini
+# /etc/wireguard/wg0.conf (excerpt)
+[Interface]
+# ...
+MTU = 1420 # Or 1452 if only IPv4 and no other overheads
+# ...
+```
+
+しかし、WireGuardインターフェースのMTUを設定するだけでは十分ではありません。内部ネットワーク上のアプリケーションは、基盤となるネットワークがフラグメンテーションを処理することを期待して、`1420`バイトよりも大きなパケットを送信する可能性があります。ICMP Fragmentation Neededメッセージがブロックされると、「Path MTU Discovery (PMTUD) ブラックホール」が発生します。
+
+これを軽減するために、**MSSクランピング**を使用します。最大セグメントサイズ（MSS）は、コンピュータまたは通信デバイスが単一のTCPセグメントで受信できるデータの最大量（バイト単位）です。MSSクランピングは、TCP SYNパケットを変更して、WireGuardトンネルの実効MTUからTCP/IPヘッダーサイズを引いた値以下のMSS値をアドバタイズします。
+
+MTUが`1420`の場合：
+*   IPヘッダー: 20バイト
+*   TCPヘッダー: 20バイト
+*   実効MSS: `1420 - 20 - 20 = 1380`バイト
+
+これにより、トンネルを介して開始されるTCPセッションは、トンネル内でのフラグメンテーションを防ぐMSSをネゴシエートするようになります。
+
+```bash
+# Add to PostUp section of wg0.conf on both gateways
+# For IPv4
+iptables -A FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380
+# For IPv6 (if applicable)
+ip6tables -A FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380
+```
+
+`wg0.conf`の完全な`PostUp`/`PostDown`は次のようになります。
+
+```ini
+# /etc/wireguard/wg0.conf (excerpt)
+[Interface]
+# ...
+PostUp = \
+  iptables -A FORWARD -i %i -j ACCEPT; \
+  iptables -A FORWARD -o %i -j ACCEPT; \
+  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; \
+  iptables -A FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380; \
+  ip6tables -A FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380
+PostDown = \
+  iptables -D FORWARD -i %i -j ACCEPT; \
+  iptables -D FORWARD -o %i -j ACCEPT; \
+  iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE; \
+  iptables -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380; \
+  ip6tables -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380
+# ...
+```
+
+`eth0`を実際の公開インターフェースに置き換えてください。
+
+## 高度なルーティング：`iproute2`とFRRoutingによるBGP
+
+単純なサイト間設定では、`AllowedIPs`で定義された静的ルートで十分です。しかし、複数のサイトと動的なネットワークトポロジーを持つメッシュネットワークや、既存のルーティングインフラストラクチャとの統合では、BGPのような動的ルーティングプロトコルが不可欠です。
+
+### 静的ルートのための`iproute2`
+
+BGPが過剰なシナリオでは、`iproute2`を使用してルートを管理できます。WireGuardの`AllowedIPs`は、指定されたサブネットのルートをWireGuardインターフェース経由で自動的に作成します。ただし、WireGuardインターフェース*から*ゲートウェイに直接接続されていない特定の内部サブネット*へ*トラフィックをルーティングする必要がある場合は、`ip route`を使用します。
+
+例：`SiteA`ゲートウェイが内部ルーター`10.0.1.254`経由で`10.0.3.0/24`に到達する必要がある場合。
+
+```bash
+# On SiteA Gateway
+ip route add 10.0.3.0/24 via 10.0.1.254 dev eth1 # Assuming eth1 is internal interface
+```
+
+これはWireGuardの設定自体とは異なりますが、エンドツーエンドの接続には不可欠です。
+
+### BGPとFRRoutingによる動的ルーティング
+
+FRRouting (FRR) は、BGP、OSPF、RIP、IS-IS、PIMを含むLinuxおよびUnixプラットフォーム向けのIPルーティングプロトコルスイートです。WireGuardゲートウェイ間でルートを動的に交換するためにBGPを使用します。
+
+**アーキテクチャ:**
+1.  各WireGuardゲートウェイはFRRを実行します。
+2.  BGPセッションはWireGuardトンネルIP（例：`10.255.255.1`と`10.255.255.2`）を介して確立されます。
+3.  各ゲートウェイは、ローカルの内部ネットワークをBGPにアドバタイズします。
+
+**インストール (Debian/Ubuntu):**
+
+```bash
+sudo apt update
+sudo apt install frr frr-pythontools
+```
+
+**FRR設定 (`/etc/frr/frr.conf`):**
+
+**SiteAゲートウェイ (`10.255.255.1`):**
+
+```
+!
+hostname SiteA-WG-Gateway
+password zebra
+enable password zebra
+!
+router bgp 64512 # SiteA's ASN
+  bgp router-id 10.255.255.1
+  neighbor 10.255.255.2 remote-as 64513 # SiteB's ASN
+  neighbor 10.255.255.2 update-source wg0 # Use WireGuard interface for BGP session
+  !
+  address-family ipv4 unicast
+    network 10.0.1.0/24 # Advertise SiteA's internal network
+    neighbor 10.255.255.2 activate
+  exit-address-family
+!
+```
+
+**SiteBゲートウェイ (`10.255.255.2`):**
+
+```
+!
+hostname SiteB-WG-Gateway
+password zebra
+enable password zebra
+!
+router bgp 64513 # SiteB's ASN
+  bgp router-id 10.255.255.2
+  neighbor 10.255.255.1 remote-as 64512 # SiteA's ASN
+  neighbor 10.255.255.1 update-source wg0 # Use WireGuard interface for BGP session
+  !
+  address-family ipv4 unicast
+    network 10.0.2.0/24 # Advertise SiteB's internal network
+    neighbor 10.255.255.1 activate
+  exit-address-family
+!
+```
+
+FRRを設定したら、サービスを再起動します: `sudo systemctl restart frr`。
+`vtysh`を使用してBGPステータスを確認します。
+
+```bash
+sudo vtysh
+show ip bgp summary
+show ip route
+```
+
+WireGuardの`AllowedIPs`は、BGPセッションのトラフィック（つまり、WireGuardトンネルIP自体）とBGPによってアドバタイズされるネットワークを許可するように設定する必要があります。`AllowedIPs`にトンネルIPのみが含まれている場合、BGPは確立されますが、内部ネットワークのルートはWireGuardによってインストールされません。
+
+WireGuard over BGPの一般的なパターンは、`AllowedIPs`をピアのWireGuard IP（例：`10.255.255.2/32`）のみに設定することです。これにより、BGPトラフィック（およびその他の制御プレーンのトラフィック）のみが最初にWireGuardトンネルを使用するようになります。その後、BGPは実際の内部ネットワーク（例：`10.0.2.0/24`）をアドバタイズします。FRRがこれらのルートを受信すると、それらをカーネルのルーティングテーブルにインストールし、WireGuardインターフェースを指すようにします。
+
+**`AllowedIPs`とBGPに関する重要な注意点:**
+BGPを使用する場合、通常、`AllowedIPs`は最小限に抑え、通常はピアのWireGuardトンネルIPのみにします。これによりBGPが確立されます。その後、BGPは実際の内部ネットワークをアドバタイズします。WireGuardの`AllowedIPs`はルーティングポリシーとして機能します。WireGuardがトラフィックを*復号化*し、*送信*するIP範囲を決定します。`AllowedIPs`に`10.0.2.0/24`が含まれている場合、WireGuardは自動的にそのルートを作成します。BGPも`wg0`経由で`10.0.2.0/24`のルートをインストールしようとすると、競合したり冗長になったりする可能性があります。
+
+WireGuard over BGPのベストプラクティスは次のとおりです。
+1.  `AllowedIPs`をピアのWireGuard IP（例：`10.255.255.2/32`）のみに設定します。
+2.  `net.ipv4.ip_forward=1`が有効になっていることを確認します。
+3.  内部ネットワークのルートのアドバタイズとインストールはBGPに任せます。WireGuardは、これらのネットワークが`AllowedIPs`に明示的に含まれていなくても、`wg0`インターフェース経由でルーティングされるため、これらのネットワークのトラフィックを復号化します。
+
+この設定により、WireGuardを再設定することなく動的なルート更新が可能になります。
+
+## ベンチマーク：WireGuard vs. IPsec
+
+WireGuardの設計、特にカーネル空間実装とよりシンプルな暗号ハンドシェイクは、IPsecと比較して大幅に高いスループットと低いレイテンシをもたらすことがよくあります。
+
+| 機能 | WireGuard (カーネル) | IPsec (StrongSwan/Libreswan) |
+|---|---|---|
+| **パフォーマンス** | 非常に優れている（ほぼネイティブな回線速度） | 良い（CPU負荷が高い、コンテキストスイッチ） |
+| **複雑さ** | 低い（最小限の設定、シンプルなプロトコル） | 高い（IKEv1/v2、ESP/AH、複雑な設定） |
+| **セキュリティ** | 最新の暗号（ChaCha20、Poly1305） | 幅広い範囲（AES、3DES、SHA、MD5） |
+| **NATトラバーサル** | 組み込みの`PersistentKeepalive` | NAT-Tが必要、問題が発生する可能性あり |
+| **コードベースのサイズ** | 約4,000行 | 約400,000行 |
+| **MTU処理** | 手動の`MTU`と`MSS`クランピング | PMTUDに依存することが多いが、失敗する可能性あり |
+| **ルーティング** | `AllowedIPs`（静的）、トンネル経由のBGP | ポリシーベース（SPD/SAD）、トンネル経由のBGP |
+| **カーネル統合** | ネイティブカーネルモジュール | ユーザー空間デーモン + カーネルモジュール |
+
+**スループット比較 (概念的な10Gbpsリンク):**
+
+最新のCPUを搭載した10Gbpsリンクでは、WireGuardは暗号化されたスループットで8〜9Gbpsを達成できることがよくあります。IPsecは、暗号スイートとCPUによっては、特殊なハードウェアアクセラレーションなしでは3〜5Gbpsを超えるのに苦労する可能性があります。WireGuardのカーネル空間実装は、ユーザー空間VPNソリューションの主要なパフォーマンスボトルネックであるコンテキストスイッチングのオーバーヘッドを最小限に抑えます。
+
+## 本番環境での落とし穴とトラブルシューティング
+
+1.  **`AllowedIPs`の設定ミス:**
+    *   **症状:** BGPセッションが確立されない、または内部ネットワークに到達できない。
+    *   **問題:** ピアの`AllowedIPs`には、BGPセッションを確立するためにピアのWireGuard IPを含める必要があります。内部ネットワークにBGPを使用している場合、ピアの`AllowedIPs`にはそれらの内部ネットワークを含めるべきではなく、トンネルIPのみを含めるべきです。そうしないと、WireGuardがBGP学習ルートと競合したり、BGPが独自のルートをインストールするのを妨げたりする静的ルートをインストールしてしまいます。
+    *   **修正:** BGPの場合、`AllowedIPs = <PEER_WG_IP>/32`を設定します。`net.ipv4.ip_forward=1`が有効になっていることを確認します。
+    *   **確認:** `wg show wg0 dump`で現在のピア設定を確認し、`ip route show table main`でルーティングテーブルのエントリを確認します。
+
+2.  **MTU/MSSクランピングの問題 (PMTUDブラックホール):**
+    *   **症状:** 大容量ファイルの転送が停止する、認証後にSSH接続がハングする、特定のウェブサイトが読み込まれない。`ping -M do -s 1472 <remote_host>`が失敗する。
+    *   **問題:** パケットがフラグメント化されており、ICMP Fragmentation Neededメッセージがブロックされているか、MSSが大きすぎる。
+    *   **修正:** WireGuardインターフェースで`MTU`が正しく設定されていることを確認します（例：`1420`）。IPv4とIPv6の両方で、`PostUp`スクリプトに`TCPMSS`クランピングを実装します。`iptables`ルールがアクティブであることを確認します。
+    *   **確認:** `iptables -t mangle -nvL FORWARD`。`tcpdump -i wg0 -n -s0 port 51820`を使用してパケットサイズを検査します。
+
+3.  **NATトラバーサルの失敗:**
+    *   **症状:** 非アクティブ後に接続が切断され、NAT側からトラフィックが開始されたときにのみ復元される。
+    *   **問題:** NATデバイスのマッピングが期限切れになる。
+    *   **修正:** NATの背後にあるピアの`[Peer]`セクションで`PersistentKeepalive = 25`（または同様のもの）を設定します。
+    *   **確認:** `wg show wg0 latest-handshakes`。`latest-handshakes`が定期的に更新されている場合、キープアライブは機能しています。
+
+4.  **ファイアウォールルール:**
+    *   **症状:** WireGuardピアがハンドシェイクを示しても、接続がない。
+    *   **問題:** ファイアウォール（例：`ufw`、`firewalld`、`iptables`）がUDPポート51820をブロックしているか、転送トラフィックをブロックしている。
+    *   **修正:** WireGuardリスンポートでUDPトラフィックを許可します。`FORWARD`チェーンルールがWireGuardインターフェースと内部/外部インターフェース間のトラフィックを許可していることを確認します。
+    *   **確認:** `sudo iptables -nvL`または`sudo ufw status verbose`。
+
+5.  **IPフォワーディングが無効:**
+    *   **症状:** WireGuardトンネルは確立されるが、内部ネットワーク上のホストが互いに到達できない。
+    *   **問題:** カーネルIPフォワーディングが無効になっている。
+    *   **修正:** `/etc/sysctl.conf`で`net.ipv4.ip_forward = 1`と`net.ipv6.conf.all.forwarding = 1`（IPv6を使用している場合）を有効にし、`sudo sysctl -p`で適用します。
+    *   **確認:** `sysctl net.ipv4.ip_forward`。
+
+## よくある質問
+
+1.  **WireGuardがIPsecより高速なのはなぜですか？**
+    WireGuardのパフォーマンス上の利点は、いくつかの要因に起因します。そのミニマリストな設計、速度に最適化された最新の暗号プリミティブ（ChaCha20/Poly1305）、およびネイティブなカーネル空間実装です。これにより、ユーザー空間とカーネル空間間のコンテキストスイッチングが最小限に抑えられ、暗号化のオーバーヘッドが削減され、ステートマシンが簡素化され、より高いスループットと低いレイテンシにつながります。
+
+2.  **Linux以外のシステムでWireGuardを実行できますか？**
+    はい。WireGuardにはmacOS、Windows、Android、iOS用の公式クライアントがあります。カーネルモジュールはLinux固有ですが、これらのクライアントはユーザー空間実装またはOS固有のネットワーク拡張機能を使用しており、ネイティブなLinuxカーネルモジュールとは異なるパフォーマンス特性を持つ可能性がありますが、同様の機能を提供します。
+
+3.  **多数のサイトにWireGuardメッシュをスケールするにはどうすればよいですか？**
+    少数のサイト（例：10未満）の場合、各ゲートウェイが他のすべてのゲートウェイとピアリングするフルメッシュは管理可能です。大規模なデプロイメントの場合、中央のWireGuardゲートウェイを持つハブアンドスポークモデルを検討するか、WireGuardトンネル上でBGPのような動的ルーティングプロトコルを活用します。各ゲートウェイは、WireGuardインターフェースを介して中央のBGPルーター（または他のゲートウェイ）とピアリングし、ローカルサブネットをアドバタイズします。これにより、`N^2`ピア設定が回避されます。
+
+4.  **公開IPが変更された場合（ダイナミックDNS）はどうなりますか？**
+    ピアの`Endpoint`が動的IPの場合、WireGuardはDNSホスト名を解決できます。IPが変更された場合、WireGuardは最終的にDNS名を再解決します。ただし、*反対側*からの`PersistentKeepalive`が重要です。動的IPを持つピアがNATの背後にある場合、その`PersistentKeepalive`はNATマッピングを維持し、現在の公開IPを相手側に通知します。動的IPを持つピアがNATの背後に*ない*が、そのIPが変更された場合、新しいハンドシェイクが開始された後、相手のピアは最終的にエンドポイントを更新します。堅牢な動的エンドポイント更新のためには、IPが変更されたときに`wg set`経由で`Endpoint`を更新するカスタムスクリプトを使用するか、相手側からの`PersistentKeepalive`に依存することを検討してください。
+
+5.  **WireGuardのUDPポートをインターネットに公開するのは安全ですか？**
+    はい、WireGuardはUDPポートが公開されていても安全であるように設計されています。そのプロトコルは、ポートスキャンやサービス拒否などの一般的な攻撃に対して耐性があります。正しく認証されたパケットにのみ応答し、認証されていないパケットはサイレントに破棄されます。この「サイレント破棄」動作により、攻撃者がWireGuardエンドポイントがアクティブであるかどうかを判断することさえ困難になります。

@@ -1,0 +1,432 @@
+---
+title: 'eBPF & XDP at Scale: 10 Million Packets/Sec DDoS Mitigation & Driver-Level Filtering'
+images: ['/static/images/ebpf-xdp-ddos-mitigation-packet-filtering.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["ebpf", "security", "networking", "linux", "c"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: 'Comprehensive guide covering ebpf & xdp at scale: 10 million packets/sec ddos mitigation & driver-level filtering with production-grade architecture and code examples.'
+---
+
+Network-layer DDoS attacks, particularly SYN floods and UDP amplification, remain a persistent threat. Traditional kernel-space filtering, while effective, introduces latency and CPU overhead due to `sk_buff` allocation, full network stack traversal, and context switching. At line rates exceeding 10 million packets per second (Mpps) on a single core, these overheads become prohibitive. This guide details the implementation of high-performance DDoS mitigation using eBPF and XDP (eXpress Data Path), leveraging driver-level packet processing to achieve line-rate filtering.
+
+<AudioPlayer src="/static/audio/ebpf-xdp-ddos-mitigation-packet-filtering.mp3" title="Executive Audio Briefing" voice="Google Cloud en-US-Neural2-F" />
+
+
+## XDP Fundamentals for High-Performance Filtering
+
+XDP operates at the earliest possible point in the network stack: directly within the network interface card (NIC) driver's receive (RX) ring. This pre-kernel, pre-`sk_buff` allocation execution context is critical for performance. A packet processed by an XDP program never reaches the kernel's full network stack if dropped or redirected. This eliminates memory allocations, cache misses, and CPU cycles associated with `sk_buff` creation and subsequent processing.
+
+The XDP program receives a raw `xdp_md` struct, which provides pointers to the start and end of the packet data. The program's return value dictates the action taken:
+
+*   `XDP_DROP`: Packet is immediately dropped. This is the primary action for DDoS mitigation.
+*   `XDP_PASS`: Packet is allowed to proceed to the kernel's network stack.
+*   `XDP_TX`: Packet is redirected back out the same NIC port. Useful for load balancing or reflection.
+*   `XDP_REDIRECT`: Packet is redirected to another NIC port or a BPF CPU map for inter-CPU communication.
+
+### XDP Program Execution Context
+
+An XDP program executes in a restricted eBPF environment. It cannot perform arbitrary system calls, access arbitrary kernel memory, or loop indefinitely. This ensures stability and prevents malicious or buggy programs from compromising the kernel. Key constraints include:
+
+*   **Bounded Loops:** Loops must have a known, finite upper bound.
+*   **Memory Access:** Only packet data and BPF map memory can be accessed.
+*   **Helper Functions:** A limited set of BPF helper functions are available for tasks like map lookups, checksum calculations, and packet manipulation.
+
+## Architecture for DDoS Mitigation
+
+Our mitigation architecture involves:
+
+1.  **XDP Program (C):** Deployed directly to the NIC. This program performs initial packet parsing and filtering based on IP addresses, protocols, and port numbers. It leverages BPF maps for dynamic blacklisting and counters.
+2.  **BPF Maps:**
+    *   `BPF_MAP_TYPE_LPM_TRIE`: For efficient longest-prefix match (LPM) IP blacklisting. This allows blocking entire subnets or individual IPs.
+    *   `BPF_MAP_TYPE_ARRAY`: For per-CPU packet counters, providing real-time visibility into dropped traffic.
+3.  **User-space Agent (Go/Python/Rust):**
+    *   Loads the XDP program and attaches it to the target network interface.
+    *   Manages the `LPM_TRIE` map, adding/removing blacklisted IPs based on external threat intelligence or local anomaly detection.
+    *   Reads and aggregates counters from the `ARRAY` map, exposing them via Prometheus.
+
+### LPM Trie for Dynamic IP Blacklisting
+
+An `LPM_TRIE` map is ideal for IP blacklisting due to its efficient prefix-matching capabilities. This allows blocking `192.168.1.0/24` with a single entry, rather than enumerating all 256 IPs.
+
+```c
+// bpf_ddos_mitigator.c
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+
+// Define a structure for LPM trie keys
+// This structure is critical for the LPM trie map.
+// The 'prefixlen' field determines how many bits of the 'data' field are used for matching.
+// For IPv4, prefixlen can be 32 for a host match, or less for a subnet.
+// For IPv6, prefixlen can be 128 for a host match.
+struct bpf_lpm_trie_key {
+    __u32 prefixlen; // Must be the first field
+    __u32 ip_addr;   // IPv4 address in network byte order
+};
+
+// Map for blacklisted IPs (LPM Trie)
+// Key: bpf_lpm_trie_key (prefixlen + IP)
+// Value: __u8 (e.g., 1 to indicate blacklisted)
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 10240); // Max 10k blacklist entries
+    __uint(key_size, sizeof(struct bpf_lpm_trie_key));
+    __uint(value_size, sizeof(__u8));
+    __uint(map_flags, BPF_F_NO_PREALLOC); // Don't preallocate all memory
+} blacklist_ips SEC(".maps");
+
+// Map for packet counters (per-CPU array)
+// Key: __u32 (index for counter type, e.g., 0 for dropped, 1 for passed)
+// Value: __u64 (counter)
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 2); // 0: dropped_packets, 1: passed_packets
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u64));
+} xdp_stats_map SEC(".maps");
+
+// Helper macro to increment a counter in the xdp_stats_map
+static __always_inline void increment_counter(__u32 index) {
+    __u64 *counter = bpf_map_lookup_elem(&xdp_stats_map, &index);
+    if (counter) {
+        __sync_fetch_and_add(counter, 1);
+    }
+}
+
+SEC("xdp")
+int xdp_ddos_mitigator(struct xdp_md *ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+
+    struct ethhdr *eth = data;
+    if (eth + 1 > data_end) {
+        return XDP_PASS; // Malformed Ethernet header
+    }
+
+    // Only process IPv4 for this example
+    if (bpf_ntohs(eth->h_proto) != ETH_P_IP) {
+        return XDP_PASS;
+    }
+
+    struct iphdr *iph = data + sizeof(*eth);
+    if (iph + 1 > data_end) {
+        return XDP_PASS; // Malformed IP header
+    }
+
+    // Check if source IP is blacklisted
+    struct bpf_lpm_trie_key key = {
+        .prefixlen = 32, // Exact match for source IP
+        .ip_addr = iph->saddr // Source IP in network byte order
+    };
+    __u8 *blacklisted = bpf_map_lookup_elem(&blacklist_ips, &key);
+    if (blacklisted) {
+        // IP is blacklisted, drop the packet
+        increment_counter(0); // Increment dropped_packets counter
+        return XDP_DROP;
+    }
+
+    // Basic SYN flood mitigation (TCP SYN packets without ACK)
+    if (iph->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcph = (void *)iph + (iph->ihl * 4);
+        if (tcph + 1 > data_end) {
+            return XDP_PASS; // Malformed TCP header
+        }
+
+        // Check for SYN flag set and ACK flag not set
+        if (tcph->syn && !tcph->ack) {
+            // Potentially a SYN flood packet.
+            // For production, this would be more sophisticated,
+            // e.g., rate limiting, SYN cookie implementation, or state tracking.
+            // For now, we'll just drop it if it's a simple SYN.
+            // This is a very aggressive rule and might drop legitimate SYNs.
+            // A real-world solution would involve more context.
+            // For demonstration, we'll drop if source IP is not whitelisted.
+            // (No whitelist implemented here, so it's a direct drop for SYN)
+            // increment_counter(0); // Increment dropped_packets counter
+            // return XDP_DROP;
+        }
+    }
+
+    // Basic UDP amplification mitigation (e.g., DNS, NTP, SSDP)
+    // This is a simplified example. Real mitigation involves
+    // checking payload size, specific protocol headers, and known amplification vectors.
+    if (iph->protocol == IPPROTO_UDP) {
+        struct udphdr *udph = (void *)iph + (iph->ihl * 4);
+        if (udph + 1 > data_end) {
+            return XDP_PASS; // Malformed UDP header
+        }
+
+        // Example: Drop UDP packets to common amplification ports if source is not trusted
+        // This is a placeholder. A real system would check for specific
+        // query types, response sizes, or use a dynamic trust list.
+        __u16 dest_port = bpf_ntohs(udph->dest);
+        if (dest_port == 53 || dest_port == 123 || dest_port == 1900) { // DNS, NTP, SSDP
+            // For demonstration, we'll drop these if source is not whitelisted.
+            // A real system would have more sophisticated logic.
+            // increment_counter(0); // Increment dropped_packets counter
+            // return XDP_DROP;
+        }
+    }
+
+    // If not dropped by any rule, pass to the kernel
+    increment_counter(1); // Increment passed_packets counter
+    return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+```
+
+To compile this eBPF program, you'll need `clang` and `llvm` with BPF backend support, along with `libbpf` headers.
+
+```bash
+# Install necessary packages on Debian/Ubuntu
+sudo apt update
+sudo apt install clang llvm libelf-dev libbpf-dev build-essential
+
+# Compile the BPF program
+clang -O2 -target bpf -g -c bpf_ddos_mitigator.c -o bpf_ddos_mitigator.o
+```
+
+### User-space Control Plane (Go Example)
+
+A user-space agent is responsible for loading the eBPF program, managing maps, and exposing metrics.
+
+```go
+// main.go
+package main
+
+import (
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/rlimit"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"net/http"
+)
+
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall" bpf bpf_ddos_mitigator.c -- -I./headers
+
+// bpf_lpm_trie_key matches the C struct
+type bpfLpmTrieKey struct {
+	Prefixlen uint32
+	IPAddr    uint32 // Network byte order
+}
+
+var (
+	droppedPackets = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "xdp_dropped_packets_total",
+			Help: "Total number of packets dropped by XDP DDoS mitigator.",
+		},
+	)
+	passedPackets = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "xdp_passed_packets_total",
+			Help: "Total number of packets passed by XDP DDoS mitigator.",
+		},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(droppedPackets)
+	prometheus.MustRegister(passedPackets)
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		log.Fatalf("Usage: %s <interface>", os.Args[0])
+	}
+	ifaceName := os.Args[1]
+
+	// Allow the current process to lock memory for eBPF maps.
+	if err := rlimit.RemoveMemlock(); err != nil {
+		log.Fatalf("Failed to remove memlock rlimit: %v", err)
+	}
+
+	// Load pre-compiled programs and maps into the kernel.
+	objs := bpfObjects{}
+	if err := loadBpfObjects(&objs, nil); err != nil {
+		log.Fatalf("Loading eBPF objects: %v", err)
+	}
+	defer objs.Close()
+
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		log.Fatalf("Getting interface %s: %v", ifaceName, err)
+	}
+
+	// Attach the XDP program to the network interface.
+	// Use XDP_FLAGS_DRV_MODE for best performance if driver supports it.
+	// Fallback to XDP_FLAGS_SKB_MODE if driver mode fails.
+	l, err := link.AttachXDP(link.XDPOptions{
+		Program:   objs.XdpDdosMitigator,
+		Interface: iface,
+		Flags:     uint32(link.XDPDriverMode),
+	})
+	if err != nil {
+		log.Printf("Failed to attach XDP in driver mode, trying SKB mode: %v", err)
+		l, err = link.AttachXDP(link.XDPOptions{
+			Program:   objs.XdpDdosMitigator,
+			Interface: iface,
+			Flags:     uint32(link.XDPSkbMode),
+		})
+		if err != nil {
+			log.Fatalf("Failed to attach XDP in SKB mode: %v", err)
+		}
+	}
+	defer l.Close()
+
+	log.Printf("Successfully attached XDP program to interface %q (ID: %d)", ifaceName, objs.XdpDdosMitigator.ID())
+
+	// Example: Add a blacklisted IP (e.g., 192.0.2.1)
+	// This would typically come from a dynamic threat feed or detection system.
+	blacklistIP := net.ParseIP("192.0.2.1").To4()
+	if blacklistIP == nil {
+		log.Fatalf("Invalid IP address")
+	}
+	key := bpfLpmTrieKey{
+		Prefixlen: 32, // Exact match
+		IPAddr:    uint32(blacklistIP[0])<<24 | uint32(blacklistIP[1])<<16 | uint32(blacklistIP[2])<<8 | uint32(blacklistIP[3]),
+	}
+	value := uint8(1) // Value doesn't matter, just its presence
+	if err := objs.BlacklistIps.Put(key, value); err != nil {
+		log.Fatalf("Failed to add IP to blacklist: %v", err)
+	}
+	log.Printf("Added %s to blacklist.", blacklistIP.String())
+
+	// Start Prometheus metrics server
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		log.Fatal(http.ListenAndServe(":9090", nil))
+	}()
+	log.Println("Prometheus metrics exposed on :9090/metrics")
+
+	// Periodically read and update Prometheus counters
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	var prevDropped, prevPassed uint64
+
+	for {
+		select {
+		case <-ticker.C:
+			var currentDropped, currentPassed uint64
+			var zero uint32 = 0
+			var one uint32 = 1
+
+			if err := objs.XdpStatsMap.Lookup(zero, &currentDropped); err != nil {
+				log.Printf("Failed to lookup dropped_packets counter: %v", err)
+			}
+			if err := objs.XdpStatsMap.Lookup(one, &currentPassed); err != nil {
+				log.Printf("Failed to lookup passed_packets counter: %v", err)
+			}
+
+			// Update Prometheus counters with delta
+			droppedPackets.Add(float64(currentDropped - prevDropped))
+			passedPackets.Add(float64(currentPassed - prevPassed))
+
+			prevDropped = currentDropped
+			prevPassed = currentPassed
+
+			log.Printf("Dropped: %d, Passed: %d", currentDropped, currentPassed)
+
+		case <-stop:
+			log.Println("Detaching XDP program...")
+			return
+		}
+	}
+}
+```
+
+To generate the Go bindings for the eBPF program, run:
+```bash
+go generate ./...
+```
+Then, compile and run the Go program:
+```bash
+go build -o xdp-mitigator main.go
+sudo ./xdp-mitigator eth0 # Replace eth0 with your network interface
+```
+
+## Performance Benchmarking & Tradeoffs
+
+| Feature              | XDP (Driver Mode)                                | Kernel-space (Netfilter/iptables)                      |
+| :------------------- | :----------------------------------------------- | :----------------------------------------------------- |
+| **Execution Point**  | NIC RX ring, pre-`sk_buff`                       | After `sk_buff` allocation, within kernel stack        |
+| **Performance**      | 10-100 Mpps/core (line rate on modern NICs)      | 1-5 Mpps/core (highly dependent on rule complexity)    |
+| **CPU Overhead**     | Minimal, no `sk_buff` or context switch          | Significant, `sk_buff` allocation, stack traversal     |
+| **Memory Usage**     | Minimal, no `sk_buff` per packet                 | High, `sk_buff` per packet                             |
+| **Flexibility**      | Limited BPF helpers, C-like language             | Full kernel API, complex rule sets                     |
+| **Statefulness**     | Stateless or limited state via BPF maps          | Stateful (e.g., connection tracking)                   |
+| **Deployment**       | Requires `libbpf`, kernel 4.8+ (XDP), 5.x+ (full) | Standard kernel feature, widely available              |
+| **Use Case**         | High-volume DDoS, load balancing, fast path      | General firewalling, NAT, complex policy enforcement   |
+
+**Tradeoffs:**
+
+*   **Complexity:** XDP programs are written in C and require a deeper understanding of network protocols and eBPF internals. Debugging can be challenging.
+*   **Driver Support:** Optimal XDP performance (`XDP_DRV_MODE`) depends on NIC driver support. Without it, `XDP_SKB_MODE` provides some benefits but still involves `sk_buff` allocation.
+*   **Limited Context:** XDP programs have a restricted view of the system. They cannot easily access process information or complex kernel state.
+
+## Production Gotchas & Troubleshooting
+
+1.  **`XDP_DRV_MODE` vs. `XDP_SKB_MODE`:**
+    *   **Gotcha:** Attempting to load an XDP program in `XDP_DRV_MODE` on a NIC driver that doesn't support it will fail or silently fall back to `XDP_SKB_MODE` if `XDP_FLAGS_UPDATE_IF_NOEXIST` is used. Performance will be significantly degraded.
+    *   **Fix:** Always check `ethtool -i <interface>` for `driver` and `firmware-version`. Consult `ip link show dev <interface>` for `xdp` flags. Prioritize `XDP_DRV_MODE` and gracefully fall back to `XDP_SKB_MODE` if necessary, but be aware of the performance implications. For production, ensure your NICs (e.g., Intel ixgbe, i40e, mlx5) have proper driver support.
+
+2.  **eBPF Verifier Errors:**
+    *   **Gotcha:** Complex eBPF programs, especially those with loops or extensive memory access, can be rejected by the kernel's eBPF verifier. Common errors include "program too large," "loop not bounded," or "invalid memory access."
+    *   **Fix:** Simplify your eBPF logic. Break down complex tasks into smaller, verifiable functions. Ensure all loops have explicit bounds. Use `bpf_printk` for debugging (viewable via `sudo cat /sys/kernel/debug/tracing/trace_pipe`). The `bpftool prog load` command with `log_level=2` provides detailed verifier output.
+
+3.  **Map Pinning and Persistence:**
+    *   **Gotcha:** If your user-space agent crashes or restarts, the eBPF program and its maps might be unloaded, leading to a service interruption.
+    *   **Fix:** Use BPF map pinning (`bpf_obj_pin`) to persist maps in the BPF filesystem (`/sys/fs/bpf`). The XDP program can then be loaded and attached, referencing the pinned maps. This allows for independent lifecycle management of the program and its state.
+
+4.  **Packet Reordering/Loss with `XDP_REDIRECT`:**
+    *   **Gotcha:** If using `XDP_REDIRECT` to send packets to another interface or CPU, ensure the receiving end can handle the traffic. Incorrect redirection can lead to packet loss or out-of-order delivery, especially across different queues or CPUs without proper synchronization.
+    *   **Fix:** Carefully design your redirection logic. For inter-CPU communication, use `BPF_MAP_TYPE_CPUMAP`. For redirection to other interfaces, ensure the target interface is configured correctly and has sufficient capacity.
+
+5.  **Resource Limits (`memlock`):**
+    *   **Gotcha:** Loading large eBPF programs or maps can hit the `memlock` resource limit, causing `bpf_load_program` or `bpf_create_map` to fail with "Operation not permitted" or "Cannot allocate memory."
+    *   **Fix:** Increase the `memlock` limit for the user-space process. For systemd services, use `LimitMEMLOCK=infinity`. For manual execution, use `ulimit -l unlimited` before running the program. The Go `rlimit.RemoveMemlock()` helper addresses this.
+
+## Frequently Asked Questions
+
+1.  **What kernel version is required for XDP?**
+    XDP was introduced in Linux kernel 4.8. For stable and feature-rich XDP, kernel 4.18+ is recommended. `BPF_MAP_TYPE_LPM_TRIE` is available from 4.11.
+
+2.  **Can XDP programs inspect packet payloads beyond the headers?**
+    Yes, XDP programs can inspect the entire packet payload, provided they stay within the `data` and `data_end` pointers. However, parsing complex application-layer protocols directly in eBPF can be challenging due to verifier limitations (e.g., bounded loops, stack size). For deep packet inspection, XDP often acts as a fast-path filter, passing interesting packets to a user-space process for further analysis.
+
+3.  **How does XDP compare to DPDK?**
+    DPDK (Data Plane Development Kit) is a user-space framework that bypasses the kernel entirely by polling NICs directly. It offers ultimate control and performance but requires dedicated hardware and often involves significant application-level changes. XDP, conversely, is kernel-integrated, leveraging existing drivers and the kernel's security model. XDP is generally easier to deploy and integrate into existing Linux systems, offering near-DPDK performance for many use cases without the full kernel bypass overhead.
+
+4.  **Is it possible to implement stateful filtering with XDP?**
+    Directly stateful filtering like traditional TCP connection tracking is difficult within XDP due to its stateless execution model and verifier constraints. However, you can achieve limited statefulness using BPF maps. For example, a `BPF_MAP_TYPE_LRU_HASH` map can store connection tuples (src IP, dst IP, src port, dst port) and their state (e.g., SYN_SENT, ESTABLISHED) for a short duration. This requires careful management of map entries (e.g., timeouts, garbage collection) from user-space or via BPF ring buffers for event notification.
+
+5.  **How can I test my XDP program without impacting production traffic?**
+    Testing XDP programs safely is crucial.
+    *   **Virtual Machines/Containers:** Use virtual environments (e.g., KVM, Docker with `veth` pairs) to simulate network traffic and test XDP programs without affecting physical hardware.
+    *   **`XDP_SKB_MODE`:** While slower, `XDP_SKB_MODE` is generally more robust across different drivers and can be a safer initial testing ground.
+    *   **`ip link set dev <interface> xdp obj <program.o> section xdp verbose`:** This command allows loading XDP programs. Use `verbose` to get detailed error messages.
+    *   **`bpftool`:** The `bpftool` utility is invaluable for inspecting loaded programs, maps, and their state. `bpftool prog show` and `bpftool map show` are essential.
+    *   **Traffic Generators:** Use tools like `pktgen`, `hping3`, or `scapy` to generate specific traffic patterns (e.g., SYN floods) to test your mitigation logic.

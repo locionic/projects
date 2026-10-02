@@ -1,0 +1,427 @@
+---
+title: "RAG tác nhân có trạng thái: Máy trạng thái đồ thị, vòng lặp tự sửa lỗi & định tuyến dự phòng"
+images: ['/static/images/agentic-rag-router-graph-state-machine.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["ai", "rag", "agents", "python", "architecture"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về RAG tác nhân có trạng thái: máy trạng thái đồ thị, vòng lặp tự sửa lỗi & định tuyến dự phòng với kiến trúc cấp độ sản xuất và ví dụ code."
+---
+
+Hướng dẫn này trình bày chi tiết việc xây dựng các hệ thống RAG Agentic có trạng thái, bền bỉ, tận dụng máy trạng thái đồ thị. Chúng ta sẽ đối chiếu các pipeline truy xuất một lần đơn giản với định tuyến đa bước động, phân tách truy vấn và đánh giá lặp lại. Việc triển khai cốt lõi có một nút truy xuất tự điều chỉnh, xác thực mức độ liên quan của tài liệu bằng bộ phân loại LLM, kích hoạt dự phòng tìm kiếm web khi bị ảo giác và duy trì các điểm kiểm tra trạng thái hội thoại bằng Postgres và LangGraph.
+
+<AudioPlayer src="/static/audio/agentic-rag-router-graph-state-machine-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Hạn chế của RAG đơn giản
+
+Các triển khai RAG truyền thống thường tuân theo một mô hình đơn giản:
+1. Nhận truy vấn của người dùng.
+2. Nhúng truy vấn.
+3. Truy xuất k tài liệu hàng đầu từ kho vector.
+4. Nối các tài liệu với truy vấn.
+5. Tạo phản hồi bằng LLM.
+
+Cách tiếp cận này rất dễ hỏng. Nó giả định rằng:
+*   Truy vấn ban đầu được định dạng hoàn hảo để truy xuất.
+*   Kho vector chứa tất cả thông tin cần thiết.
+*   Các tài liệu được truy xuất luôn liên quan và đầy đủ.
+*   LLM sẽ không bị ảo giác nếu thông tin bị thiếu hoặc không liên quan.
+
+Các kịch bản thực tế làm mất hiệu lực các giả định này. Các truy vấn phức tạp yêu cầu phân tách. Thông tin bị thiếu đòi hỏi phải sử dụng công cụ bên ngoài. Các tài liệu không liên quan dẫn đến phản hồi kém hoặc ảo giác. RAG agentic có trạng thái giải quyết những thiếu sót này bằng cách giới thiệu luồng điều khiển động, tinh chỉnh lặp lại và các cơ chế tự điều chỉnh rõ ràng.
+
+## Tổng quan kiến trúc: Máy trạng thái đồ thị
+
+Kiến trúc của chúng tôi tập trung vào một máy trạng thái đồ thị, được triển khai bằng LangGraph. Mỗi nút trong đồ thị đại diện cho một bước xử lý hoặc điểm quyết định riêng biệt. Trạng thái được truyền rõ ràng giữa các nút, cho phép tương tác phức tạp, đa lượt và tinh chỉnh lặp lại.
+
+Các thành phần chính bao gồm:
+*   **Định nghĩa trạng thái**: Một mô hình Pydantic định nghĩa trạng thái hội thoại và xử lý.
+*   **Nút định tuyến**: Xác định hành động tiếp theo dựa trên truy vấn và trạng thái hiện tại (ví dụ: truy xuất trực tiếp, phân tách truy vấn, tìm kiếm web).
+*   **Nút truy xuất**: Thực hiện tra cứu kho vector.
+*   **Nút phân loại LLM**: Đánh giá mức độ liên quan của các tài liệu được truy xuất với truy vấn.
+*   **Nút tìm kiếm web**: Thực hiện tìm kiếm web bên ngoài như một phương án dự phòng.
+*   **Nút tạo phản hồi**: Tổng hợp câu trả lời cuối cùng.
+*   **Lưu trữ trạng thái**: Postgres để kiểm tra trạng thái đồ thị, cho phép các cuộc hội thoại dài và phục hồi.
+
+```python
+# rag_graph/state.py
+from typing import List, Optional, Literal
+from langchain_core.documents import Document
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langgraph.graph import StateGraph, END
+from pydantic import BaseModel, Field
+
+class AgentState(BaseModel):
+    """
+    Represents the state of our RAG agent.
+    This state is passed between nodes in the graph.
+    """
+    query: str = Field(description="The original user query.")
+    chat_history: List[BaseMessage] = Field(default_factory=list, description="Full chat history.")
+    documents: List[Document] = Field(default_factory=list, description="Retrieved documents.")
+    generation: Optional[str] = Field(None, description="Generated LLM response.")
+    retrieval_attempts: int = Field(0, description="Number of retrieval attempts.")
+    web_search_performed: bool = Field(False, description="Flag indicating if web search was performed.")
+    # Add a field to track the current decision path for debugging/logging
+    current_path: List[str] = Field(default_factory=list, description="Path taken through the graph.")
+
+    class Config:
+        arbitrary_types_allowed = True # Allow BaseMessage
+```
+
+## Các thành phần cốt lõi & Vòng lặp tự điều chỉnh
+
+### 1. Bộ định tuyến truy vấn
+
+Bộ định tuyến là điểm vào cho hành vi động. Nó phân tích truy vấn của người dùng và quyết định hành động ban đầu. Điều này có thể bao gồm:
+*   **Truy xuất trực tiếp**: Nếu truy vấn đơn giản và có khả năng được bao phủ bởi cơ sở kiến thức nội bộ.
+*   **Phân tách truy vấn**: Đối với các câu hỏi phức tạp, nhiều phần, chia chúng thành các truy vấn con. (Không được triển khai đầy đủ trong ví dụ này để ngắn gọn, nhưng là một phần mở rộng phổ biến).
+*   **Tìm kiếm web**: Nếu truy vấn rõ ràng nằm ngoài phạm vi của cơ sở kiến thức nội bộ (ví dụ: "Thời tiết ở London thế nào?").
+
+```python
+# rag_graph/nodes.py
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_openai import ChatOpenAI
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_core.output_parsers import StrOutputParser
+from typing import List, Dict, Any
+
+# Assume these are initialized globally or passed in
+# For production, use environment variables for API keys and proper vector store setup
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+embeddings = OpenAIEmbeddings()
+vectorstore = FAISS.from_texts(["LangGraph is a library for building stateful, multi-actor applications with LLMs.",
+                                "RAG stands for Retrieval Augmented Generation.",
+                                "Self-correction in RAG improves accuracy.",
+                                "Postgres can be used for state persistence."], embeddings)
+retriever = vectorstore.as_retriever()
+web_search_tool = DuckDuckGoSearchRun()
+
+# --- Prompts ---
+ROUTER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You are a smart routing agent. Your goal is to determine the best next step for a user query."),
+    ("human", """Given the user query and chat history, decide whether to:
+    1. 'retrieve': Perform a standard RAG retrieval from our internal knowledge base.
+    2. 'web_search': Perform a web search for external information.
+    3. 'generate': Directly generate a response if the query is simple and doesn't require retrieval or search.
+
+    Respond with only one of the keywords: 'retrieve', 'web_search', 'generate'.
+
+    Chat History: {chat_history}
+    User Query: {query}
+    """)
+])
+
+RETRIEVAL_GRADER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You are a document relevance grader. Your task is to assess if the retrieved documents are relevant to the user's query."),
+    ("human", """User Query: {query}
+    Retrieved Documents: {documents}
+
+    Are the retrieved documents relevant to the user's query?
+    Respond with 'yes' or 'no'.
+    """)
+])
+
+HALLUCINATION_GRADER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You are a hallucination grader. Your task is to assess if the generated answer is grounded in the provided documents."),
+    ("human", """User Query: {query}
+    Retrieved Documents: {documents}
+    Generated Answer: {generation}
+
+    Is the generated answer fully supported by the retrieved documents?
+    Respond with 'yes' or 'no'.
+    """)
+])
+
+ANSWER_GENERATION_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You are an AI assistant. Use the following retrieved context to answer the user's question. If the context does not contain the answer, state that you don't know."),
+    ("human", """Context: {documents}
+    Chat History: {chat_history}
+    Question: {query}
+    """)
+])
+
+# --- Nodes ---
+def route_query(state: AgentState) -> str:
+    """Decides the next step based on the query."""
+    print("---ROUTE QUERY---")
+    state.current_path.append("route_query")
+    router_chain = ROUTER_PROMPT | llm | StrOutputParser()
+    decision = router_chain.invoke({"query": state.query, "chat_history": state.chat_history})
+    print(f"Router decision: {decision}")
+    if "web_search" in decision.lower():
+        return "web_search"
+    elif "retrieve" in decision.lower():
+        return "retrieve"
+    else: # Default to generate if not explicitly retrieve or web_search
+        return "generate"
+
+def retrieve(state: AgentState) -> AgentState:
+    """Retrieves documents from the vector store."""
+    print("---RETRIEVE DOCUMENTS---")
+    state.current_path.append("retrieve")
+    state.retrieval_attempts += 1
+    documents = retriever.invoke(state.query)
+    state.documents = documents
+    return state
+
+def grade_documents(state: AgentState) -> str:
+    """Grades the relevance of retrieved documents."""
+    print("---GRADE DOCUMENTS---")
+    state.current_path.append("grade_documents")
+    if not state.documents:
+        print("No documents retrieved, initiating web search.")
+        return "no_documents"
+
+    grader_chain = RETRIEVAL_GRADER_PROMPT | llm | StrOutputParser()
+    decision = grader_chain.invoke({"query": state.query, "documents": state.documents})
+    print(f"Document relevance decision: {decision}")
+    if "yes" in decision.lower():
+        print("Documents are relevant.")
+        return "relevant"
+    else:
+        print("Documents are not relevant, initiating web search.")
+        return "not_relevant"
+
+def web_search(state: AgentState) -> AgentState:
+    """Performs a web search and adds results to documents."""
+    print("---WEB SEARCH---")
+    state.current_path.append("web_search")
+    state.web_search_performed = True
+    web_results = web_search_tool.invoke({"query": state.query})
+    # Convert web results to Document objects
+    state.documents.extend([Document(page_content=web_results, metadata={"source": "web_search"})])
+    return state
+
+def generate_response(state: AgentState) -> AgentState:
+    """Generates a final answer based on retrieved documents and query."""
+    print("---GENERATE RESPONSE---")
+    state.current_path.append("generate_response")
+    # Format documents for the prompt
+    docs_content = "\n\n".join([doc.page_content for doc in state.documents])
+
+    generation_chain = ANSWER_GENERATION_PROMPT | llm | StrOutputParser()
+    response = generation_chain.invoke({
+        "query": state.query,
+        "documents": docs_content,
+        "chat_history": state.chat_history
+    })
+    state.generation = response
+    return state
+
+def grade_generation_for_hallucination(state: AgentState) -> str:
+    """Grades the generated answer for hallucination against retrieved documents."""
+    print("---GRADE GENERATION FOR HALLUCINATION---")
+    state.current_path.append("grade_generation_for_hallucination")
+    if not state.documents: # If no documents were used, we can't grade against them
+        print("No documents to grade against, assuming no hallucination for now.")
+        return "no_hallucination"
+
+    grader_chain = HALLUCINATION_GRADER_PROMPT | llm | StrOutputParser()
+    decision = grader_chain.invoke({
+        "query": state.query,
+        "documents": state.documents,
+        "generation": state.generation
+    })
+    print(f"Hallucination decision: {decision}")
+    if "yes" in decision.lower():
+        print("Generation is grounded in documents.")
+        return "no_hallucination"
+    else:
+        print("Generation contains hallucination, attempting web search fallback.")
+        return "hallucination"
+
+def update_chat_history(state: AgentState) -> AgentState:
+    """Updates the chat history with the latest query and response."""
+    print("---UPDATE CHAT HISTORY---")
+    state.current_path.append("update_chat_history")
+    state.chat_history.append(HumanMessage(content=state.query))
+    if state.generation:
+        state.chat_history.append(AIMessage(content=state.generation))
+    return state
+```
+
+### 2. Nút truy xuất tự điều chỉnh
+
+Đây là một thành phần quan trọng. Sau khi truy xuất ban đầu, một LLM hoạt động như một "bộ phân loại" để đánh giá mức độ liên quan của các tài liệu.
+
+*   **Nếu liên quan**: Chuyển sang tạo phản hồi.
+*   **Nếu không liên quan**: Kích hoạt cơ chế dự phòng, chẳng hạn như tìm kiếm web. Điều này ngăn LLM tạo câu trả lời dựa trên dữ liệu nội bộ kém hoặc thiếu.
+
+Vòng lặp này có thể được mở rộng: nếu tìm kiếm web cũng thất bại, hệ thống có thể yêu cầu người dùng làm rõ hoặc chuyển cho con người.
+
+### 3. Phát hiện ảo giác & Dự phòng
+
+Sau khi tạo, một bộ phân loại LLM khác đánh giá phản hồi được tạo dựa trên *các tài liệu được truy xuất*. Đây là một bước tự điều chỉnh quan trọng.
+
+*   **Nếu có cơ sở**: Phản hồi được coi là hợp lệ và được trả về cho người dùng.
+*   **Nếu bị ảo giác**: Hệ thống có thể kích hoạt tìm kiếm web (nếu chưa thực hiện) hoặc thử lại truy xuất với một truy vấn đã sửa đổi. Việc tinh chỉnh lặp lại này giúp tăng đáng kể độ tin cậy.
+
+### 4. Lưu trữ trạng thái với Postgres
+
+LangGraph cung cấp hỗ trợ tích hợp để lưu trữ trạng thái. Chúng tôi sử dụng Postgres để kiểm tra điểm mạnh mẽ, có thể mở rộng. Điều này cho phép:
+*   **Các cuộc hội thoại dài**: Người dùng có thể quay lại cuộc hội thoại sau nhiều ngày.
+*   **Khôi phục từ lỗi**: Nếu quá trình tác nhân gặp sự cố, trạng thái có thể được tải lại.
+*   **Gỡ lỗi và kiểm tra**: Toàn bộ lịch sử trạng thái có sẵn.
+
+```python
+# rag_graph/graph.py
+from langgraph.checkpoint.sqlite import SqliteSaver # For local testing
+from langgraph.checkpoint.postgres import PostgresSaver # For production
+from langgraph.graph import StateGraph, END
+from rag_graph.state import AgentState
+from rag_graph.nodes import (
+    route_query, retrieve, grade_documents, web_search,
+    generate_response, grade_generation_for_hallucination, update_chat_history
+)
+import os
+
+# For production, configure PostgresSaver
+# memory = PostgresSaver.from_conn_string(os.environ["POSTGRES_CONNECTION_STRING"])
+# For local testing, use SqliteSaver
+memory = SqliteSaver.from_conn_string(":memory:") # In-memory SQLite for quick testing
+
+def build_graph():
+    workflow = StateGraph(AgentState)
+
+    # Define nodes
+    workflow.add_node("retrieve", retrieve)
+    workflow.add_node("grade_documents", grade_documents)
+    workflow.add_node("web_search", web_search)
+    workflow.add_node("generate_response", generate_response)
+    workflow.add_node("grade_generation_for_hallucination", grade_generation_for_hallucination)
+    workflow.add_node("update_chat_history", update_chat_history)
+
+    # Set entry point
+    workflow.set_entry_point("route_query")
+
+    # Define edges
+    workflow.add_conditional_edges(
+        "route_query",
+        route_query,
+        {
+            "retrieve": "retrieve",
+            "web_search": "web_search",
+            "generate": "generate_response" # Direct generation for simple queries
+        }
+    )
+
+    workflow.add_edge("retrieve", "grade_documents")
+
+    workflow.add_conditional_edges(
+        "grade_documents",
+        grade_documents,
+        {
+            "relevant": "generate_response",
+            "not_relevant": "web_search",
+            "no_documents": "web_search" # If retrieval yielded nothing, try web search
+        }
+    )
+
+    workflow.add_edge("web_search", "generate_response") # After web search, always try to generate
+
+    workflow.add_edge("generate_response", "grade_generation_for_hallucination")
+
+    workflow.add_conditional_edges(
+        "grade_generation_for_hallucination",
+        grade_generation_for_hallucination,
+        {
+            "no_hallucination": "update_chat_history",
+            "hallucination": "web_search" # If hallucination, try web search (if not already done)
+        }
+    )
+
+    workflow.add_edge("update_chat_history", END)
+
+    # Compile the graph
+    app = workflow.compile(checkpointer=memory)
+    return app
+
+# Example usage (in a separate script or main block)
+if __name__ == "__main__":
+    app = build_graph()
+
+    # Example 1: Simple RAG query
+    print("\n--- Running Example 1: Simple RAG ---")
+    config = {"configurable": {"thread_id": "1"}}
+    inputs = {"query": "What is LangGraph?", "chat_history": []}
+    for s in app.stream(inputs, config=config):
+        print(s)
+    final_state = app.get_state(config)
+    print(f"\nFinal Answer (Thread 1): {final_state.values['generation']}")
+    print(f"Path taken (Thread 1): {final_state.values['current_path']}")
+
+    # Example 2: Query requiring web search (e.g., current events)
+    print("\n--- Running Example 2: Web Search Fallback ---")
+    config = {"configurable": {"thread_id": "2"}}
+    inputs = {"query": "What is the capital of France?", "chat_history": []} # Assume internal KB doesn't have this
+    for s in app.stream(inputs, config=config):
+        print(s)
+    final_state = app.get_state(config)
+    print(f"\nFinal Answer (Thread 2): {final_state.values['generation']}")
+    print(f"Path taken (Thread 2): {final_state.values['current_path']}")
+
+    # Example 3: Query that might lead to hallucination or irrelevant docs
+    print("\n--- Running Example 3: Hallucination/Irrelevant Docs ---")
+    config = {"configurable": {"thread_id": "3"}}
+    inputs = {"query": "Tell me about the latest advancements in quantum computing, specifically related to cold fusion.", "chat_history": []}
+    for s in app.stream(inputs, config=config):
+        print(s)
+    final_state = app.get_state(config)
+    print(f"\nFinal Answer (Thread 3): {final_state.values['generation']}")
+    print(f"Path taken (Thread 3): {final_state.values['current_path']}")
+```
+
+## Đánh đổi kiến trúc
+
+| Tính năng                  | RAG đơn giản                               | RAG Agentic có trạng thái (Máy trạng thái đồ thị)                                |
+|--------------------------|--------------------------------------------|---------------------------------------------------------------------------|
+| **Độ phức tạp**           | Thấp                                       | Cao (định nghĩa đồ thị, quản lý trạng thái, nhiều lệnh gọi LLM)             |
+| **Độ bền**               | Thấp (dễ bị ảo giác, truy xuất kém)        | Cao (tự điều chỉnh, dự phòng, tinh chỉnh lặp lại)                   |
+| **Tính linh hoạt**          | Thấp (pipeline cố định)                    | Cao (định tuyến động, dễ dàng thêm/xóa nút, logic tùy chỉnh)             |
+| **Chi phí (Lệnh gọi LLM)**     | Thấp (1-2 lệnh gọi mỗi truy vấn)           | Cao (nhiều lệnh gọi LLM để định tuyến, phân loại, tạo, có thể là vòng lặp) |
+| **Độ trễ**              | Thấp                                       | Cao hơn (nhiều lệnh gọi LLM tuần tự, sử dụng công cụ)                      |
+| **Quản lý trạng thái**     | Không (không trạng thái mỗi truy vấn)      | Rõ ràng (trạng thái được lưu trữ, các cuộc hội thoại nhiều lượt)                      |
+| **Gỡ lỗi**            | Đơn giản                                   | Phức tạp (theo dõi thực thi đồ thị, chuyển đổi trạng thái)                  |
+| **Khả năng mở rộng**          | Dễ dàng mở rộng các thành phần không trạng thái | Lưu trữ trạng thái yêu cầu cơ sở dữ liệu mạnh mẽ, thực thi đồ thị có thể được song song hóa trên mỗi luồng |
+
+## Các vấn đề và khắc phục sự cố trong sản xuất
+
+1.  **Trôi dạt của bộ phân loại LLM**: Hiệu suất của các bộ phân loại LLM (đối với mức độ liên quan, ảo giác) có thể giảm sút với các phiên bản LLM mới hoặc thay đổi lời nhắc.
+    *   **Khắc phục**: Triển khai đánh giá liên tục. Duy trì một tập dữ liệu vàng gồm các truy vấn, tài liệu và đầu ra bộ phân loại dự kiến. Chạy thử nghiệm hàng đêm và cảnh báo về các sai lệch đáng kể. Ghim các phiên bản mô hình LLM.
+2.  **Vòng lặp vô hạn trong đồ thị**: Một cạnh điều kiện được thiết kế kém có thể dẫn đến các nút liên tục gọi nhau (ví dụ: `grade_documents` -> `web_search` -> `grade_documents` nếu tìm kiếm web không giúp ích).
+    *   **Khắc phục**: Triển khai phát hiện vòng lặp và số lần thử lại tối đa trong trạng thái. Ví dụ: cờ `state.retrieval_attempts` hoặc `state.web_search_performed` ngăn chặn các hành động dư thừa. `max_steps` của LangGraph cũng có thể được đặt.
+3.  **Tiến hóa lược đồ trạng thái**: Khi mô hình Pydantic `AgentState` của bạn phát triển, các điểm kiểm tra hiện có trong Postgres có thể trở nên không tương thích.
+    *   **Khắc phục**: Lập kế hoạch di chuyển lược đồ. Sử dụng các công cụ như Alembic để thay đổi lược đồ cơ sở dữ liệu. Đối với các điểm kiểm tra LangGraph, hãy xem xét việc tạo phiên bản trạng thái của bạn hoặc có chiến lược di chuyển cho các điểm kiểm tra cũ hơn (ví dụ: tải, chuyển đổi, lưu).
+4.  **Độ trễ công cụ & Giới hạn tốc độ**: Tìm kiếm web hoặc các công cụ bên ngoài khác có thể gây ra độ trễ đáng kể hoặc đạt giới hạn tốc độ API.
+    *   **Khắc phục**: Triển khai bộ nhớ đệm cho các thuật ngữ được tìm kiếm thường xuyên. Sử dụng các lệnh gọi không đồng bộ cho các công cụ bên ngoài. Triển khai các cơ chế thử lại mạnh mẽ với thời gian chờ tăng dần. Giám sát việc sử dụng công cụ và đặt giới hạn tốc độ phù hợp.
+5.  **Tràn cửa sổ ngữ cảnh**: Nối quá nhiều tài liệu (đặc biệt là sau khi tìm kiếm web) có thể vượt quá cửa sổ ngữ cảnh của LLM.
+    *   **Khắc phục**: Triển khai tóm tắt tài liệu thông minh hoặc sắp xếp lại trước khi chuyển sang bước tạo cuối cùng. Ưu tiên các tài liệu dựa trên điểm liên quan. Cắt bớt tài liệu một cách hợp lý.
+6.  **Vượt quá chi phí**: Nhiều lệnh gọi LLM cho mỗi truy vấn có thể nhanh chóng làm tăng chi phí.
+    *   **Khắc phục**: Tối ưu hóa lời nhắc để tiết kiệm token. Sử dụng các mô hình rẻ hơn cho các tác vụ đơn giản hơn (ví dụ: `gpt-3.5-turbo` để định tuyến/phân loại nếu đủ). Triển khai bộ nhớ đệm cho các phản hồi LLM khi thích hợp. Giám sát việc sử dụng token cho mỗi cuộc hội thoại.
+7.  **Gỡ lỗi các đường dẫn đồ thị phức tạp**: Theo dõi luồng thực thi thông qua một đồ thị đa nút có thể là một thách thức.
+    *   **Khắc phục**: Nâng cao `AgentState` với trường `current_path: List[str]` để ghi lại chuỗi các nút đã truy cập. Tích hợp với các công cụ quan sát (ví dụ: LangSmith, OpenTelemetry) để trực quan hóa việc thực thi đồ thị. Thêm ghi nhật ký chi tiết trong mỗi nút.
+
+## Các câu hỏi thường gặp
+
+### Q1: Làm cách nào để xử lý các cuộc hội thoại nhiều lượt và duy trì ngữ cảnh hiệu quả?
+A1: Trường `chat_history` trong `AgentState` là rất quan trọng. Mỗi lượt, truy vấn của người dùng và phản hồi của AI được thêm vào. Khi tạo phản hồi, LLM được nhắc với lịch sử này, cho phép nó hiểu cuộc hội thoại đang diễn ra. Việc lưu trữ trạng thái của LangGraph đảm bảo lịch sử này được duy trì qua các phiên.
+
+### Q2: Chiến lược tốt nhất để chọn LLM phù hợp cho các nút khác nhau (ví dụ: bộ định tuyến so với bộ tạo) là gì?
+A2: Sử dụng cách tiếp cận phân cấp. Đối với các tác vụ đơn giản, ít rủi ro như định tuyến hoặc phân loại ban đầu, một mô hình nhanh hơn, rẻ hơn (ví dụ: `gpt-3.5-turbo`, Llama 3 8B) có thể đủ. Đối với lý luận phức tạp, tóm tắt hoặc tạo câu trả lời cuối cùng, một mô hình có khả năng hơn nhưng đắt hơn (ví dụ: `gpt-4o`, Claude 3 Opus) thường được ưu tiên. Đánh giá các mô hình khác nhau cho tác vụ cụ thể của mỗi nút.
+
+### Q3: Làm cách nào để tích hợp các công cụ phức tạp hơn ngoài tìm kiếm web, như API nội bộ hoặc cơ sở dữ liệu?
+A3: Mỗi công cụ có thể được đóng gói trong nút LangGraph riêng của nó. Nút `route_query` có thể được mở rộng để quyết định công cụ nào sẽ gọi. Ví dụ, nếu một truy vấn yêu cầu "trạng thái đơn hàng của khách hàng", bộ định tuyến có thể chuyển hướng đến một nút `order_lookup` gọi một API nội bộ. Đảm bảo các công cụ trả về dữ liệu ở định dạng (ví dụ: đối tượng `Document`) có thể dễ dàng được các nút tiếp theo sử dụng.
+
+### Q4: LangGraph có phù hợp với môi trường sản xuất thông lượng cao, độ trễ thấp không?
+A4: LangGraph cung cấp một khung mạnh mẽ cho các quy trình làm việc tác nhân phức tạp. Hiệu suất của nó phụ thuộc rất nhiều vào các lệnh gọi LLM cơ bản và độ trễ của công cụ bên ngoài. Đối với thông lượng cao, hãy tối ưu hóa các lệnh gọi LLM (bộ nhớ đệm, mô hình nhỏ hơn), sử dụng các hoạt động không đồng bộ và đảm bảo lớp lưu trữ trạng thái của bạn (Postgres) có hiệu suất cao. Bản thân việc thực thi đồ thị rất hiệu quả, nhưng các hoạt động I/O thường là nút thắt cổ chai. Cân nhắc nhóm các yêu cầu khi có thể.
+
+### Q5: Làm cách nào để đảm bảo hệ thống RAG không làm rò rỉ thông tin nhạy cảm từ các tài liệu được truy xuất?
+A5: Triển khai phát hiện và biên tập PII mạnh mẽ *trước khi* các tài liệu được chuyển đến LLM để tạo. Đây có thể là một nút chuyên dụng trong đồ thị của bạn. Ngoài ra, hãy đảm bảo kho vector và cơ chế truy xuất của bạn được cấu hình với các kiểm soát truy cập phù hợp. Đối với dữ liệu có độ nhạy cao, hãy cân nhắc tinh chỉnh một LLM nhỏ hơn, riêng tư hoặc sử dụng các kỹ thuật như quyền riêng tư khác biệt.

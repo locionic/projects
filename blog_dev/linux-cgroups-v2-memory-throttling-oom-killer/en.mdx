@@ -1,0 +1,258 @@
+---
+title: 'Linux cgroups v2 in Kubernetes: PSI Pressure Stall Information, Memory Throttling & OOM Shields'
+images: ['/static/images/linux-cgroups-v2-memory-throttling-oom-killer.png']
+date: '2026-10-02'
+lastUpdated: '2026-10-02'
+tags: ["linux", "kubernetes", "devops", "systems", "performance"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: 'Comprehensive guide covering linux cgroups v2 in kubernetes: psi pressure stall information, memory throttling & oom shields with production-grade architecture and code examples.'
+---
+
+Linux cgroups v2 represents a fundamental architectural shift in resource management, moving from the fragmented hierarchy of v1 to a unified, tree-like structure. This evolution is critical for modern container orchestration platforms like Kubernetes, enabling more precise and predictable resource isolation. This guide details the operational implications of cgroups v2, focusing on memory management, Pressure Stall Information (PSI), and strategies for OOM protection in Kubernetes.
+
+<AudioPlayer src="/static/audio/linux-cgroups-v2-memory-throttling-oom-killer.mp3" title="Executive Audio Briefing" voice="Google Cloud en-US-Neural2-F" />
+
+
+## Cgroups v1 vs. v2: Architectural Paradigm Shift
+
+Cgroups v1 suffered from a fragmented hierarchy problem. Each controller (e.g., `cpu`, `memory`, `blkio`) could have its own independent hierarchy, leading to complex and often conflicting resource assignments for a single process. A process could belong to different cgroups for different resource types, making consistent resource management challenging.
+
+Cgroups v2 introduces a unified hierarchy. All controllers are attached to a single, tree-like hierarchy. A process belongs to exactly one cgroup in this hierarchy, and all resource controllers applicable to that cgroup apply to the process. This simplification provides a more coherent and robust resource management model.
+
+### Key Architectural Differences
+
+| Feature | Cgroups v1 | Cgroups v2 |
+|---|---|---|
+| Hierarchy | Multiple, independent | Single, unified |
+| Process Membership | Multiple cgroups (one per controller) | Single cgroup |
+| Controller Attachment | Any cgroup | Leaf nodes only (with exceptions) |
+| Delegation | Complex, error-prone | Simplified, explicit |
+| Resource Files | Inconsistent naming | Standardized naming (`cgroup.<controller>.<metric>`) |
+| Memory Accounting | Less precise | More granular, `memory.stat` |
+| PSI | Not available | Integrated |
+
+The unified hierarchy in v2 simplifies delegation and resource accounting. A parent cgroup can delegate a subtree to a child, granting the child full control over resource management within that subtree without affecting other parts of the hierarchy. This is crucial for container runtimes like containerd and CRI-O, which manage cgroups for individual pods and containers.
+
+## Memory Management in Cgroups v2
+
+Cgroups v2 significantly enhances memory management capabilities, introducing `memory.high` for progressive throttling and refining OOM behavior.
+
+### `memory.max`: The Hard Limit
+
+`memory.max` defines the absolute memory limit for a cgroup. When a cgroup's memory usage exceeds this value, the kernel's OOM killer is invoked to terminate processes within that cgroup. This is analogous to `memory.limit_in_bytes` in cgroups v1.
+
+### `memory.high`: The Soft Limit and Throttling Mechanism
+
+`memory.high` is a crucial addition in cgroups v2. It acts as a soft memory limit. When a cgroup's memory usage exceeds `memory.high`, the kernel attempts to reclaim memory from that cgroup *before* reaching `memory.max`. This is achieved by:
+
+1.  **Page cache eviction:** Aggressively dropping clean page cache pages.
+2.  **Swap out:** Swapping anonymous memory pages to disk (if swap is enabled).
+3.  **Direct reclaim:** Forcing processes within the cgroup to reclaim memory synchronously.
+
+This progressive throttling mechanism aims to prevent OOM kills by slowing down memory-intensive processes, giving them a chance to reduce their footprint or allowing other processes to free up resources. It provides a more graceful degradation under memory pressure compared to the abrupt OOM kill triggered by `memory.max`.
+
+### Practical Example: Configuring Memory Limits
+
+Consider a Kubernetes Pod with a memory request and limit. Kubernetes translates these into cgroup v2 settings.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: memory-intensive-app
+spec:
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh", "-c", "while true; do sleep 1; done"]
+    resources:
+      requests:
+        memory: "256Mi"
+      limits:
+        memory: "512Mi"
+```
+
+Assuming a cgroup v2 enabled system and `kubelet` configured to use cgroups v2, the container runtime (e.g., containerd) will create a cgroup for this pod. The `memory.max` for the container's cgroup will be set to 512Mi. The `memory.high` value is typically derived from the `memory.request` or a percentage of `memory.max`, depending on the container runtime's configuration. For containerd, `memory.high` is often set to `memory.max` by default unless explicitly configured otherwise or if `memory.request` is specified.
+
+Let's manually inspect cgroup v2 settings for a running container.
+
+```bash
+# Find the cgroup path for a container (e.g., from a pod named 'memory-intensive-app')
+# First, get the container ID
+CONTAINER_ID=$(kubectl get pod memory-intensive-app -o jsonpath='{.status.containerStatuses[0].containerID}' | cut -d'/' -f2)
+
+# Assuming containerd, the cgroup path is typically under /sys/fs/cgroup/system.slice/containerd.service/
+# and then a path derived from the container ID.
+# A more robust way is to use systemd-cgls or findmnt
+CGROUP_PATH=$(find /sys/fs/cgroup -name "*${CONTAINER_ID}*" -type d | head -n 1)
+
+echo "Cgroup path: $CGROUP_PATH"
+
+# Read memory limits
+cat "${CGROUP_PATH}/memory.max"
+cat "${CGROUP_PATH}/memory.high"
+cat "${CGROUP_PATH}/memory.current"
+cat "${CGROUP_PATH}/memory.stat"
+```
+
+The `memory.stat` file provides detailed memory accounting, including `anon` (anonymous memory), `file` (page cache), `kernel_stack`, `slab`, and various other metrics. This granular data is invaluable for debugging memory issues.
+
+## Pressure Stall Information (PSI)
+
+PSI is a kernel feature introduced in Linux 4.20 that provides aggregated metrics on how much time tasks spend waiting for CPU, memory, or I/O resources. Unlike traditional metrics that show resource utilization (e.g., CPU usage), PSI quantifies *resource contention* and *starvation*. It answers the question: "How much time are my processes stalled because a resource is unavailable?"
+
+PSI metrics are exposed via `/proc/pressure/` and within cgroup v2 directories.
+
+### PSI Metrics Explained
+
+For each resource (CPU, Memory, I/O), PSI provides three metrics:
+
+*   **`some`**: The percentage of time at least one task was stalled waiting for this resource.
+*   **`full`**: The percentage of time *all* tasks were stalled waiting for this resource. This indicates a complete system-wide or cgroup-wide bottleneck.
+*   **`total`**: The cumulative time (in microseconds) that tasks were stalled.
+
+Example output from `/proc/pressure/memory`:
+
+```
+some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+```
+
+Here, `avg10`, `avg60`, `avg300` represent the average stall percentage over 10, 60, and 300 seconds, respectively.
+
+### PSI in Cgroups v2
+
+Each cgroup v2 directory contains `cpu.pressure`, `memory.pressure`, and `io.pressure` files. These files report PSI metrics specifically for the tasks within that cgroup and its descendants. This allows for fine-grained monitoring of resource contention within individual pods or applications.
+
+```bash
+# Example: Read memory pressure for a specific cgroup
+cat "${CGROUP_PATH}/memory.pressure"
+```
+
+### Using PSI for Observability
+
+PSI is a powerful signal for detecting resource bottlenecks *before* they lead to catastrophic failures like OOM kills or application unresponsiveness.
+
+*   **High `memory.pressure some`**: Indicates that some processes within the cgroup are experiencing memory contention. This might be a precursor to `memory.high` throttling or even an OOM kill.
+*   **High `memory.pressure full`**: Suggests that the entire cgroup is severely memory-starved, potentially leading to application freezes.
+*   **High `cpu.pressure some`**: Some tasks are waiting for CPU. Could indicate CPU throttling or an overloaded CPU.
+*   **High `io.pressure full`**: All tasks are waiting for I/O. A clear sign of an I/O bottleneck.
+
+Monitoring PSI metrics in Kubernetes can provide early warnings for resource saturation, enabling proactive scaling or resource adjustment. Prometheus exporters can scrape these metrics from cgroup paths for centralized monitoring.
+
+## OOM Shields and `systemd-oomd`
+
+While `memory.high` provides a throttling mechanism, severe memory pressure can still lead to OOM kills. In a Kubernetes cluster, critical system daemons (e.g., `kubelet`, `containerd`, `kube-proxy`, `node-exporter`) must be protected from being OOM-killed by user workloads.
+
+### Node Allocatable and Critical Pods
+
+Kubernetes uses the "Node Allocatable" feature to reserve resources for system daemons. This is configured via `kubelet` flags:
+
+*   `--kube-reserved`: Resources reserved for Kubernetes system daemons (e.g., `kubelet`, `kube-proxy`).
+*   `--system-reserved`: Resources reserved for OS system daemons (e.g., `sshd`, `journald`).
+*   `--eviction-hard`: Defines thresholds for eviction.
+
+These reservations ensure that the sum of pod requests does not exceed the allocatable capacity, leaving headroom for critical components. However, this is a scheduling mechanism, not a strict OOM protection. If a user pod consumes more than its limit or if system daemons themselves have a memory leak, OOM can still occur.
+
+### `systemd-oomd`: Proactive OOM Prevention
+
+`systemd-oomd` is a userspace OOM killer that works in conjunction with cgroups v2 and PSI. Instead of waiting for the kernel OOM killer (which is reactive and often kills the "wrong" process), `systemd-oomd` monitors cgroups for memory pressure using PSI metrics and `memory.high` events. When it detects sustained memory pressure, it proactively terminates processes or cgroups that are contributing most to the pressure, based on configurable policies.
+
+`systemd-oomd` can be configured to:
+
+*   **Monitor specific cgroups**: Protect critical system cgroups.
+*   **Define OOM thresholds**: Based on PSI `some` or `full` percentages, or `memory.high` events.
+*   **Specify kill policies**: Which processes to kill first (e.g., largest memory consumer, oldest process).
+
+#### Example `systemd-oomd` Configuration (`/etc/systemd/oomd.conf`)
+
+```ini
+[OOM]
+# Enable oomd
+Enable=true
+
+# Global memory pressure thresholds
+# If memory.pressure.some reaches 20% for 30s, consider action
+MemoryPressureDurationSec=30s
+MemoryPressureThreshold=20%
+
+# Action to take when pressure is detected
+# Can be 'kill', 'warn', 'none'
+DefaultMemoryPressureAction=kill
+
+# Protect system services from being killed by oomd
+# This is crucial for Kubernetes nodes
+ProtectSystem=true
+
+# Protect specific cgroups (e.g., kubelet)
+# This is typically handled by ProtectSystem=true if kubelet is a systemd service
+# or by configuring specific cgroup paths.
+# Example: Protect the cgroup for kubelet.service
+# CGroup=/system.slice/kubelet.service
+```
+
+For Kubernetes, `systemd-oomd` can be configured to protect the cgroups of `kubelet.service`, `containerd.service`, and other critical components. This ensures that even under severe memory pressure from user workloads, the control plane and node infrastructure remain stable.
+
+### Integrating `systemd-oomd` with Kubernetes
+
+1.  **Enable cgroups v2**: Ensure your Linux distribution and kernel support and are configured for cgroups v2. Most modern distributions (e.g., Fedora 31+, Ubuntu 20.04+, RHEL 8+) default to or support cgroups v2.
+    *   Verify: `stat -f /sys/fs/cgroup` should show `Type: cgroup2fs`.
+    *   Verify `kubelet` is running in cgroup v2 mode: Check `kubelet` logs for `cgroupfs` driver and `systemd` cgroup driver.
+2.  **Install and Configure `systemd-oomd`**: Install the `systemd-oomd` package. Configure `/etc/systemd/oomd.conf` to protect system services.
+3.  **Monitor PSI**: Integrate PSI metrics into your monitoring stack (e.g., Prometheus Node Exporter). Alert on high `memory.pressure` values.
+4.  **Node Allocatable**: Properly configure `--kube-reserved` and `--system-reserved` in `kubelet` to reserve resources for critical components.
+
+## Production Gotchas & Troubleshooting
+
+1.  **Cgroups v1 vs. v2 Mismatch**:
+    *   **Symptom**: `kubelet` fails to start or containers fail to launch with cgroup errors. `kubectl describe node` shows cgroup driver warnings.
+    *   **Cause**: The host OS is running cgroups v1, but `kubelet` is configured for v2, or vice-versa. Or, the kernel is v2 but `kubelet` is configured for `cgroupfs` driver instead of `systemd`.
+    *   **Fix**: Ensure the host OS is running cgroups v2 (kernel 5.x+). Configure `kubelet` to use the `systemd` cgroup driver, which is recommended for cgroups v2.
+        ```yaml
+        # /etc/kubernetes/kubelet.conf (or similar kubelet config file)
+        apiVersion: kubelet.config.k8s.io/v1beta1
+        kind: KubeletConfiguration
+        cgroupDriver: systemd
+        ```
+        Reboot the node after changing cgroup mode if necessary.
+
+2.  **Aggressive `memory.high` Throttling**:
+    *   **Symptom**: Applications become unresponsive or experience high latency under moderate memory load, but don't get OOM-killed.
+    *   **Cause**: `memory.high` is set too low, causing premature throttling. This can happen if `memory.request` is significantly lower than actual working set, and `memory.high` is derived from `memory.request`.
+    *   **Fix**: Adjust `memory.request` to better reflect the application's typical memory usage. For critical applications, consider setting `memory.high` closer to `memory.max` or disabling it if the application is sensitive to throttling (though this increases OOM risk). Container runtimes like containerd might have configuration options to tune how `memory.high` is set.
+
+3.  **`systemd-oomd` Killing Unexpected Processes**:
+    *   **Symptom**: Critical application processes are killed by `systemd-oomd` instead of user workloads.
+    *   **Cause**: `systemd-oomd` configuration is too aggressive or doesn't properly exclude critical cgroups.
+    *   **Fix**: Review `oomd.conf`. Ensure `ProtectSystem=true` is set. If specific critical applications are running as user services, ensure their cgroups are explicitly protected or that `oomd`'s policies prioritize killing less critical workloads. Use `oomctl` to inspect `systemd-oomd`'s state and decisions.
+
+4.  **Misinterpreting PSI Metrics**:
+    *   **Symptom**: Alerts fire on PSI metrics, but no actual performance degradation is observed.
+    *   **Cause**: Misunderstanding the meaning of `some` vs. `full` or setting alert thresholds too low. Brief spikes in `some` pressure are often normal.
+    *   **Fix**: Focus on sustained high `full` pressure for critical services. For `some` pressure, look for trends and correlate with other metrics (e.g., latency, error rates). Tune alert thresholds based on observed baseline and acceptable performance degradation.
+
+5.  **Kernel OOM Killer Still Active**:
+    *   **Symptom**: Despite `systemd-oomd` being enabled, the kernel OOM killer still intervenes.
+    *   **Cause**: `systemd-oomd`'s thresholds are not aggressive enough, or the memory pressure escalates too quickly for `oomd` to react. The kernel OOM killer is the ultimate fallback.
+    *   **Fix**: Adjust `systemd-oomd`'s `MemoryPressureThreshold` and `MemoryPressureDurationSec` to be more proactive. Ensure `oomd` is monitoring the correct cgroups. Investigate the root cause of the rapid memory pressure.
+
+## Frequently Asked Questions
+
+1.  **Why should I migrate to cgroups v2?**
+    Cgroups v2 offers a unified hierarchy, simplifying resource management, improving delegation, and providing more granular memory accounting and proactive throttling with `memory.high`. It's the future of Linux resource control and is required for features like PSI and `systemd-oomd`. Modern Kubernetes versions and container runtimes are increasingly optimized for cgroups v2.
+
+2.  **How does `memory.high` differ from `memory.max`?**
+    `memory.max` is a hard limit; exceeding it triggers the kernel OOM killer. `memory.high` is a soft limit; exceeding it triggers proactive memory reclamation and throttling *within* the cgroup, aiming to prevent reaching `memory.max` and an OOM kill. `memory.high` provides a more graceful degradation under memory pressure.
+
+3.  **Can I run Kubernetes with cgroups v1 and `systemd-oomd`?**
+    No. `systemd-oomd` relies heavily on cgroups v2's unified hierarchy and PSI metrics, which are not fully available or consistently exposed in cgroups v1. To leverage `systemd-oomd` for proactive OOM prevention, a cgroups v2 environment is mandatory.
+
+4.  **What are the best practices for setting `memory.request` and `memory.limit` with cgroups v2?**
+    Set `memory.request` to the typical working set size of your application. This influences `memory.high` and ensures adequate scheduling. Set `memory.limit` (which becomes `memory.max`) to the absolute maximum memory your application can consume without causing instability. Avoid setting `memory.limit` too high, as it can lead to resource exhaustion on the node. A common strategy is to set `memory.request` to a value that allows for some burst, and `memory.limit` to a value that prevents runaway memory usage.
+
+5.  **How can I monitor PSI metrics in Kubernetes?**
+    The Prometheus Node Exporter can expose PSI metrics from `/proc/pressure/` and cgroup v2 paths. You can configure Prometheus to scrape these metrics and set up Grafana dashboards and alerting rules based on `node_pressure_cpu_some_total`, `node_pressure_memory_full_total`, and similar metrics for specific cgroups. This provides crucial insights into resource contention.
