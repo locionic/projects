@@ -1,0 +1,474 @@
+---
+title: "PostgreSQLコネクションプーリング: 高並行性下でのPgCat、PgBouncer、Supavisor比較"
+date: '2026-10-03'
+lastUpdated: '2026-10-03'
+tags: ["postgresql", "database", "performance", "backend"]
+draft: false
+featured: true
+summary: "高並行性下におけるPostgreSQLコネクションプーリングのPgCat、PgBouncer、Supavisorを、実運用で検証された事例を交えて深く掘り下げたアーキテクチャガイドです。"
+images: ['/static/images/postgresql-connection-pooling-pgcat-vs-pgbouncer-supavisor.png']
+category: 'Tech'
+proficiencyLevel: 'Advanced'
+programmingLanguage: 'TypeScript'
+---
+
+PostgreSQLの堅牢なアーキテクチャと豊富な機能セットは、数えきれないほどのアプリケーションの基盤となっています。しかし、PostgreSQLサーバーへの直接クライアント接続は、特に高並行性（high concurrency）の状況下では、かなりのオーバーヘッドを伴います。新しい接続ごとに認証、プロセス割り当て、メモリ予約、状態初期化が必要です。数千の同時ユーザーや、頻繁に短期間の接続を行うマイクロサービスを持つアプリケーションにとって、このオーバーヘッドはすぐにパフォーマンスを低下させ、サーバーリソースを枯渇させ、連鎖的な障害を引き起こす可能性があります。コネクションプーリングは単なる最適化ではなく、スケーラブルなPostgreSQLデプロイメントにとって不可欠な要件です。
+
+このガイドでは、3つの主要なPostgreSQLコネクションプーラーであるPgBouncer、PgCat、Supavisorについて、信頼できるデータに基づいた比較を行います。それぞれのアーキテクチャを詳細に分析し、プーリング戦略を評価し、高並行性（特に20,000の同時クライアント接続）下でのパフォーマンスを測定し、リードレプリカルーティングやシャーディングといった高度な機能についても議論します。この分析は、高性能なPostgreSQLシステムを設計・運用するシニアエンジニアやアーキテクトを対象としています。
+
+<AudioPlayer src="/static/audio/postgresql-connection-pooling-pgcat-vs-pgbouncer-supavisor-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+## 問題点：PostgreSQLの接続オーバーヘッド
+
+PostgreSQLへの直接接続には、以下の要素が含まれます。
+1.  **TCPハンドシェイク**: ネットワークオーバーヘッド。
+2.  **SSL/TLSハンドシェイク**: 暗号化されている場合、CPUとレイテンシを追加します。
+3.  **認証**: ユーザー名/パスワード、Kerberos、証明書など、CPUサイクルを消費します。
+4.  **バックエンドプロセスのフォーク/割り当て**: PostgreSQLのプロセス・パー・コネクションモデルでは、クライアントごとに新しい`postgres`プロセスが生成されるか、事前にフォークされたプールから割り当てられ、メモリとCPUを消費します。
+5.  **メモリ割り当て**: 各バックエンドプロセスは一定量のメモリ（`work_mem`、`maintenance_work_mem`など）を必要とし、数千の接続がある場合、これが急速に蓄積される可能性があります。
+6.  **状態初期化**: セッション固有のパラメータ、一時テーブル、プリペアドステートメントなどの設定。
+
+大規模な環境では、これらの操作がボトルネックになります。`max_connections = 1000`に設定されたサーバーでも、接続のチャーン率が高い場合、数百のアクティブなクエリを処理するのに苦労する可能性があります。コネクションプーラーは、PostgreSQLサーバーへの永続的な接続プールを維持し、これらのプールされた接続を介してクライアントリクエストを多重化することで、この問題を軽減します。
+
+## コネクションプーリングの基本
+
+適切なツールを選択し、正しく設定するためには、プーリングモードを理解することが重要です。
+
+### セッションプーリング（クライアント-サーバーマッピング）
+
+セッションプーリングでは、クライアント接続は、プーラーとの確立後、その存続期間中、プールから専用のバックエンド接続を割り当てられます。クライアントが切断すると、そのバックエンド接続はプールに戻されます。このモードはアプリケーションに対して透過的であり、クライアントが一貫したセッション状態を維持するため、プリペアドステートメント、一時テーブル、アドバイザリロックを含むすべてのPostgreSQL機能をサポートします。
+
+**長所**:
+*   PostgreSQLの全機能との互換性。
+*   アプリケーションに対して透過的。
+
+**短所**:
+*   クライアントがアイドル状態であってもバックエンド接続が保持されるため、トランザクションプーリングよりもリソース利用効率が低い。
+*   `max_client_conn`（プーラー）と`default_pool_size`（プーラー）が`max_connections`（PostgreSQL）に対して慎重にバランスされていない場合、接続枯渇の影響を受けやすい。
+
+### トランザクションプーリング（リクエスト-レスポンスマッピング）
+
+トランザクションプーリングは、リソース利用効率が最も高いモードです。クライアント接続は、*単一のトランザクションの期間のみ*バックエンド接続を割り当てられます。トランザクションがコミットまたはロールバックされると、バックエンド接続はすぐにプールに戻され、他のクライアントが利用できるようになります。これにより、少数のバックエンド接続で非常に多数のクライアント接続を処理できます。
+
+**長所**:
+*   バックエンド接続の最大限の再利用。
+*   短期間のトランザクションワークロードに対する最高のスケーラビリティ。
+*   PostgreSQLサーバーの負荷を大幅に軽減。
+
+**短所**:
+*   **セッション固有の状態を破壊する**: プリペアドステートメント、一時テーブル、アドバイザリロック、`SET`コマンド（例：`SET search_path`）、および`LISTEN/NOTIFY`は、トランザクション間で永続化される保証がありません。これは最も一般的で重大な落とし穴です。
+*   アプリケーションがステートレスなトランザクションを念頭に置いて設計されている必要があります。
+
+### ステートメントプーリング（ほとんど使用されない）
+
+ステートメントプーリングは、トランザクションプーリングをさらに一歩進め、*すべてのステートメントの実行後*にバックエンド接続をプールに戻します。これはさらに積極的であり、単一トランザクション内で複数のステートメントにわたってセッション状態が永続することを期待するアプリケーションロジックを破壊する可能性が高いため、一般的には推奨されません。PgBouncerは技術的にはこれをサポートしていますが、使用しないようアドバイスしています。
+
+## プーラーの詳細
+
+### PgBouncer
+
+PgBouncerは、C言語で書かれた由緒ある軽量なシングルプロセス接続プーラーです。その安定性、効率性、シンプルさから、10年以上にわたりPostgreSQL接続プーリングのデファクトスタンダードとなっています。
+
+#### アーキテクチャ
+
+PgBouncerは、クライアントアプリケーションとPostgreSQLサーバー間のプロキシとして機能します。PostgreSQLサーバーへの設定可能な数の接続を維持し、受信するクライアント接続をこれらのプールされた接続に多重化します。シングルスレッドですが、ノンブロッキングI/Oを使用するため、その主要なタスクにおいて非常に効率的です。
+
+#### 主要機能
+*   **プーリングモード**: セッション、トランザクション、ステートメント。
+*   **認証**: `md5`、`plain`、`hba`（`auth_query`経由）を含む様々なメソッドをサポート。
+*   **軽量**: 最小限のメモリフットプリントとCPU使用率。
+*   **モニタリング**: 統計情報と管理のために擬似データベース`pgbouncer`を提供。
+
+#### 設定例（`pgbouncer.ini`）
+
+この設定は、高並行性シナリオにおけるトランザクションプーリングを示しています。
+
+```ini
+[databases]
+; Define your databases here. Format: <pool_name> = host=... port=... dbname=... user=... password=...
+; You can use a wildcard '*' to match all databases on a specific host/port.
+; For simplicity, we'll use a single database.
+mydb = host=127.0.0.1 port=5432 dbname=mydb user=pgbouncer_user password=your_db_password
+
+[pgbouncer]
+; Core settings
+listen_addr = 0.0.0.0
+listen_port = 6432
+auth_type = md5
+auth_file = /etc/pgbouncer/userlist.txt ; Userlist for PgBouncer's own authentication
+
+; Pooling settings
+pool_mode = transaction ; Critical setting: transaction, session, or statement
+default_pool_size = 200 ; Max connections PgBouncer will open to the PostgreSQL server per database
+max_db_connections = 0 ; Max connections per database (0 means default_pool_size)
+max_user_connections = 0 ; Max connections per user (0 means unlimited)
+max_client_conn = 20000 ; Max client connections PgBouncer will accept
+reserve_pool_size = 5 ; Connections reserved for administrative tasks
+reserve_pool_timeout = 5.0 ; How long to wait for a reserved connection
+
+; Timeout settings
+client_login_timeout = 60 ; How long client can take to login
+client_idle_timeout = 300 ; Close client connection if idle for this long
+server_idle_timeout = 300 ; Close server connection if idle for this long
+server_connect_timeout = 15 ; How long to wait for server connection to establish
+server_lifetime = 3600 ; Close server connection after this many seconds, regardless of activity
+
+; Logging settings
+log_connections = 1
+log_disconnections = 1
+log_pooler_errors = 1
+stats_period = 60 ; How often to log stats
+
+; Admin settings
+admin_users = pgbouncer_admin
+stats_users = pgbouncer_admin
+```
+
+そして`userlist.txt`：
+
+```
+"pgbouncer_user" "your_db_password"
+"pgbouncer_admin" "your_admin_password"
+```
+
+#### 長所
+*   **成熟度と安定性**: 長年にわたり本番環境で実証済み。
+*   **シンプルさ**: 設定とデプロイが簡単。
+*   **効率性**: C言語実装とノンブロッキングI/Oにより、オーバーヘッドが非常に低い。
+*   **トランザクションプーリング**: ステートレスで高スループットのワークロードに優れている。
+
+#### 短所
+*   **シングルスレッド**: 効率的ではあるものの、単一スレッドのCPU容量を超えた場合、非常に多くのコアを持つマシンではボトルネックになる可能性がある。
+*   **マルチノード機能なし**: 基本的な接続フェイルオーバー以外のリードレプリカルーティング、シャーディング、高可用性に対する組み込みサポートがない。
+*   **プリペアドステートメントの問題**: トランザクションプーリングを使用する場合、慎重なアプリケーション設計が必要。
+*   **拡張性の制限**: 複雑なカスタムロジック向けには設計されていない。
+
+### PgCat
+
+PgCatは、Rustで書かれたモダンな高性能接続プーラーです。PgBouncerよりも機能豊富なソリューションを提供することを目指しており、特にシャーディングとリードレプリカルーティングの組み込みサポートを備えた分散PostgreSQLデプロイメントをターゲットにしています。
+
+#### アーキテクチャ
+
+PgCatはRustの並行性モデルとメモリ安全性の保証を活用しています。マルチスレッドで設計されており、PgBouncerよりも複数のCPUコアにわたってより効果的にスケーリングできます。スマートプロキシとして機能し、クエリを検査して適切なバックエンドサーバー（例：読み取り専用クエリをレプリカへ、シャーディングされたクエリを特定のシャードへ）にルーティングできます。
+
+#### 主要機能
+*   **マルチスレッド**: 最新のマルチコアCPUをより有効活用。
+*   **リードレプリカルーティング**: `SELECT`クエリをリードレプリカに自動的にルーティング可能。
+*   **シャーディング**: クエリから抽出されたシャーディングキーに基づいてシャーディングをサポート。
+*   **ロードバランシング**: 複数のバックエンドサーバーにクエリを分散。
+*   **コネクションプーリング**: セッションプーリングとトランザクションプーリングをサポート。
+*   **Rustのパフォーマンス**: 高性能と低レイテンシで知られる。
+
+#### 設定例（`pgcat.toml`）
+
+この例は、リードレプリカルーティングと基本的なシャーディングを示しています。
+
+```toml
+[general]
+listen_addr = "0.0.0.0"
+listen_port = 6432
+auth_type = "md5"
+auth_file = "/etc/pgcat/users.toml"
+default_pool_mode = "transaction" # Can be "session" or "transaction"
+max_client_connections = 20000
+log_level = "info"
+
+[shards.shard1]
+default_pool_size = 100
+max_pool_size = 200
+min_pool_size = 50
+pool_timeout = 300
+idle_timeout = 300
+
+[[shards.shard1.servers]]
+host = "primary-db-1.example.com"
+port = 5432
+weight = 100 # Primary server
+
+[[shards.shard1.servers]]
+host = "replica-db-1.example.com"
+port = 5432
+weight = 50 # Read replica
+role = "replica"
+
+[shards.shard2]
+default_pool_size = 100
+max_pool_size = 200
+min_pool_size = 50
+pool_timeout = 300
+idle_timeout = 300
+
+[[shards.shard2.servers]]
+host = "primary-db-2.example.com"
+port = 5432
+weight = 100
+
+[[shards.shard2.servers]]
+host = "replica-db-2.example.com"
+port = 5432
+weight = 50
+role = "replica"
+
+# Example of a sharding rule (simplified, real rules can be complex regex)
+# This would require PgCat to parse queries to identify the sharding key.
+# For instance, if a query contains "WHERE user_id = <id>", it could route based on user_id.
+# [sharding_rules]
+# "user_id" = { type = "modulo", column = "user_id", shards = ["shard1", "shard2"] }
+```
+
+そして`users.toml`：
+
+```toml
+[[users]]
+username = "pgcat_user"
+password = "your_db_password"
+
+[[users]]
+username = "pgcat_admin"
+password = "your_admin_password"
+```
+
+#### 長所
+*   **パフォーマンス**: Rustの効率性とマルチスレッドの組み合わせにより、最新のハードウェアで優れたパフォーマンスを発揮。
+*   **高度な機能**: 組み込みのリードレプリカルーティングとシャーディングにより、分散データベースアーキテクチャが大幅に簡素化。
+*   **モダンな設計**: クラウドネイティブなデプロイメントに焦点を当てて積極的に開発されている。
+*   **可観測性**: より優れたメトリクスとロギング機能。
+
+#### 短所
+*   **成熟度**: PgBouncerよりも新しいため、非常に多様な本番環境での実証経験が少ない。
+*   **複雑さ**: 設定オプションと機能が多いため、学習曲線が急。
+*   **クエリ解析オーバーヘッド**: ルーティングとシャーディングにはクエリ解析が必要であり、PgBouncerのような純粋な透過型プロキシと比較してわずかなオーバーヘッドが追加される。
+
+### Supavisor
+
+Supavisorは、Elixir/OTP上に構築されたクラウドネイティブな分散コネクションプーラーです。高可用性、耐障害性、水平スケーラビリティのために設計されており、マイクロサービスアーキテクチャやサーバーレス環境に特に適しています。
+
+#### アーキテクチャ
+
+Supavisorは、Erlang VM (BEAM) の強みである軽量プロセス、耐障害性、分散コンピューティングを活用しています。各Supavisorノードは他のノードと通信でき、接続状態と負荷を共有するクラスターを形成します。これにより、シームレスなスケーリングと回復力が可能になります。PgCatと同様にスマートプロキシとして機能しますが、その分散性に重点が置かれています。
+
+#### 主要機能
+*   **分散型と高可用性**: クラスターとして実行でき、耐障害性と水平スケーラビリティを提供。
+*   **Elixir/OTP**: Erlangの「let it crash」哲学と堅牢な並行性モデルを継承。
+*   **クラウドネイティブ**: コンテナ化されたデプロイメントやサーバーレスデプロイメント向けに設計。
+*   **コネクションプーリング**: セッションプーリングとトランザクションプーリングをサポート。
+*   **リードレプリカルーティング**: 読み取りクエリのルーティングを組み込みでサポート。
+*   **認証**: 柔軟な認証メカニズム。
+
+#### 設定例（`config/runtime.exs`）
+
+Supavisorの設定は通常、環境変数またはElixir設定ファイルを通じて行われます。
+
+```elixir
+import Config
+
+config :supavisor, Supavisor.Application,
+  listen_ip: {0, 0, 0, 0},
+  listen_port: 6432,
+  max_client_connections: 20000,
+  default_pool_mode: :transaction, # :session or :transaction
+  log_level: :info,
+  auth_module: Supavisor.Auth.File,
+  auth_file: "/etc/supavisor/users.json",
+  databases: [
+    %{
+      name: "mydb",
+      host: "primary-db.example.com",
+      port: 5432,
+      user: "supavisor_user",
+      password: "your_db_password",
+      pool_size: 200,
+      max_pool_size: 400,
+      min_pool_size: 100,
+      pool_timeout: 300,
+      idle_timeout: 300,
+      # Read replicas
+      replicas: [
+        %{
+          host: "replica-db-1.example.com",
+          port: 5432,
+          weight: 50
+        },
+        %{
+          host: "replica-db-2.example.com",
+          port: 5432,
+          weight: 50
+        }
+      ]
+    }
+  ]
+
+# For clustering (example using libcluster)
+config :libcluster,
+  topologies: [
+    supavisor_cluster: [
+      strategy: Cluster.Strategy.Kubernetes,
+      config: [
+        service: "supavisor-headless",
+        namespace: "default",
+        selector: "app=supavisor"
+      ]
+    ]
+  ]
+```
+
+そして`users.json`：
+
+```json
+[
+  {
+    "username": "supavisor_user",
+    "password": "your_db_password"
+  },
+  {
+    "username": "supavisor_admin",
+    "password": "your_admin_password"
+  }
+]
+```
+
+#### 長所
+*   **高可用性とスケーラビリティ**: 分散アーキテクチャにより、固有の耐障害性と水平スケーリングを提供。
+*   **耐障害性**: Erlang/OTPの「let it crash」哲学により、非常に回復力がある。
+*   **クラウドネイティブ**: Kubernetesやその他のコンテナオーケストレーションプラットフォームに最適。
+*   **リードレプリカルーティング**: 組み込み。
+*   **可観測性**: BEAMからの豊富なメトリクスとトレース機能。
+
+#### 短所
+*   **リソースフットプリント**: Elixir/OTPアプリケーションは、特に非常にシンプルなプーリングタスクの場合、CまたはRustバイナリと比較してメモリフットプリントが高くなる可能性がある。
+*   **成熟度**: Elixir/OTPは成熟しているが、Supavisor自体はPgBouncerと比較して新しいプロジェクト。
+*   **複雑さ**: 分散Elixirクラスターのデプロイと管理は、単一のPgBouncerインスタンスよりも複雑になる可能性がある。
+*   **学習曲線**: 高度なデバッグやカスタマイズには、Elixir/OTPの概念に精通している必要がある。
+
+## アーキテクチャ上の考慮事項と高度な機能
+
+### リードレプリカルーティング
+
+この機能により、プーラーは`SELECT`クエリを読み取り専用レプリカにインテリジェントに振り向け、プライマリデータベースの負荷を軽減し、読み取りスケーラビリティを向上させることができます。
+*   **PgBouncer**: ネイティブではサポートしていません。外部のロードバランサーまたはアプリケーションレベルのロジックが必要です。
+*   **PgCat**: 組み込みで、サーバーロールと重み付けによって設定可能です。読み取り専用操作を識別するためにクエリを解析します。
+*   **Supavisor**: 組み込みで、レプリカリストと重み付けによって設定可能です。クエリも解析します。
+
+### シャーディング
+
+シャーディングは、データを複数の独立したデータベースインスタンスに分散させ、単一サーバーの限界を超えて水平スケーリングを可能にします。
+*   **PgBouncer**: ネイティブのシャーディングサポートはありません。アプリケーションレベルのシャーディングロジックまたは外部のシャーディングプロキシが必要です。
+*   **PgCat**: ネイティブのシャーディング機能を提供します。クエリを解析し、シャーディングキーを抽出し、正しいシャードにリクエストをルーティングできます。これにより、シャーディングロジックがアプリケーションからオフロードされます。
+*   **Supavisor**: 現在、シャーディングはPgCatのような主要な組み込み機能ではありません。その焦点は、分散プーリングとレプリカルーティングにあります。カスタムルーティングロジックは可能かもしれませんが、すぐに使えるシャーディングではありません。
+
+### プリペアドステートメントの処理
+
+これは、特にトランザクションプーリングを使用する場合に重要な差別化要因です。
+*   **セッションプーリング**: バックエンド接続がクライアント専用であるため、すべてのプーラーはセッションプーリングモードでプリペアドステートメントを正しく処理します。
+*   **トランザクションプーリング**:
+    *   **PgBouncer**: プリペアドステートメントはトランザクション間で*保持されません*。アプリケーションがステートメントを準備し、その後のトランザクションで実行しようとすると、`prepared statement "..." does not exist`のようなエラーで失敗します。アプリケーションは、各トランザクションでステートメントを再準備するか、トランザクションプーリングを使用する場合はプリペアドステートメントを完全に避ける必要があります。
+    *   **PgCat**: プリペアドステートメントを使用するセッションのトランザクションプーリングを無効にするか、バックエンドで再準備を試みる（ただし、これにはオーバーヘッドと複雑さが伴う）ことで、プリペアドステートメントを処理するように設定できます。デフォルトの動作はPgBouncerに似ており、慎重なアプリケーション設計が必要です。
+    *   **Supavisor**: PgBouncerと同様に、トランザクションプーリングモードでは、プリペアドステートメントがトランザクション間で永続することは保証されません。
+
+### 高可用性
+
+プーラー自体が高可用性であることを保証することは非常に重要です。
+*   **PgBouncer**: デフォルトでは単一障害点です。HAには、フェイルオーバーのためのkeepalived/HAProxyのような外部ソリューション、またはロードバランサーの背後に複数のPgBouncerインスタンスを実行する必要があります。
+*   **PgCat**: 単一インスタンスはSPOFです。HAには、ロードバランサーの背後に複数のインスタンスが必要です。本質的にクラスター化はしません。
+*   **Supavisor**: Elixir/OTPを使用してクラスター化するように設計されています。複数のSupavisorノードが分散クラスターを形成し、プーラー自体に固有の耐障害性と水平スケーラビリティを提供します。
+
+### 認証
+
+すべてのプーラーは様々な認証メソッドをサポートしています。
+*   **PgBouncer**: `md5`、`plain`、`hba`（`auth_query`経由）、`cert`。データベースへの`userlist.txt`または`auth_query`を使用します。
+*   **PgCat**: `md5`、`plain`、`scram-sha-256`、`cert`。`users.toml`または外部認証を使用します。
+*   **Supavisor**: `md5`、`plain`、`scram-sha-256`。`users.json`を使用するか、カスタム認証モジュールと統合できます。
+
+## ベンチマーク方法論
+
+データに基づいた比較を提供するために、高並行性に焦点を当てたベンチマークシナリオを定義します。
+
+**ハードウェア設定（例示）**:
+*   **PostgreSQLサーバー**: 16コアCPU、64GB RAM、NVMe SSD。PostgreSQL 16。
+*   **プーラーサーバー**: 8コアCPU、16GB RAM、SSD。（PgBouncer/PgCatは単一インスタンス。Supavisorは3ノードクラスター）。
+*   **クライアント負荷生成器**: 20,000の同時接続を生成するための複数のマシン。
+
+**PostgreSQL設定**:
+*   `max_connections = 500`（これはプーリングで克服しようとしているボトルネックです）
+*   `shared_buffers = 16GB`
+*   `work_mem = 4MB`
+*   `effective_cache_size = 48GB`
+
+**ベンチマークツール**: `pgbench`
+
+**テストシナリオ**:
+1.  **ベースライン（プーラーなし）**: PostgreSQLへの直接接続。高並行性では失敗するか、パフォーマンスが著しく低下すると予想されます。
+2.  **PgBouncer（トランザクションプーリング）**: `pool_mode = transaction`、`default_pool_size = 200`、`max_client_conn = 20000`。
+3.  **PgBouncer（セッションプーリング）**: `pool_mode = session`、`default_pool_size = 500`、`max_client_conn = 20000`。
+4.  **PgCat（トランザクションプーリング）**: `default_pool_mode = transaction`、`default_pool_size = 200`、`max_client_connections = 20000`。
+5.  **PgCat（セッションプーリング）**: `default_pool_mode = session`、`default_pool_size = 500`、`max_client_connections = 20000`。
+6.  **Supavisor（トランザクションプーリング）**: `default_pool_mode = :transaction`、`pool_size = 200`、`max_client_connections = 20000`。
+7.  **Supavisor（セッションプーリング）**: `default_pool_mode = :session`、`pool_size = 500`、`max_client_connections = 20000`。
+
+**`pgbench`スクリプト（`simple_transaction.sql`）**:
+このスクリプトは、トランザクションプーリングに適したシンプルで短いトランザクションをシミュレートします。
+
+```sql
+\set aid random(1, 100000 * :scale)
+\set bid random(1, 1 * :scale)
+\set tid random(1, 1000 * :scale)
+\set delta random(-5000, 5000)
+BEGIN;
+UPDATE pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid;
+SELECT abalance FROM pgbench_accounts WHERE aid = :aid;
+UPDATE pgbench_tellers SET tbalance = tbalance + :delta WHERE tid = :tid;
+UPDATE pgbench_branches SET bbalance = bbalance + :delta WHERE bid = :bid;
+INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (:tid, :bid, :aid, :delta, now());
+COMMIT;
+```
+
+**`pgbench`コマンド**:
+```bash
+# Initialize pgbench (run once)
+pgbench -i -s 100 mydb
+
+# Run benchmark (replace <POOLER_PORT> with 6432 for poolers, 5432 for direct)
+pgbench -h 127.0.0.1 -p <POOLER_PORT> -U pgbouncer_user -c 20000 -j 16 -T 300 -f simple_transaction.sql mydb
+```
+*   `-c 20000`: 20,000の同時クライアント。
+*   `-j 16`: 16の`pgbench`ワーカー スレッド。
+*   `-T 300`: 300秒間実行。
+*   `-f simple_transaction.sql`: カスタムトランザクションスクリプトを使用。
+
+**収集されるメトリクス**:
+*   **Transactions Per Second (TPS)**: 主要なスループットメトリクス。
+*   **Latency (Average, 95th percentile)**: 応答性。
+*   **CPU Utilization**: プーラーとPostgreSQLサーバー。
+*   **Memory Consumption**: プーラーとPostgreSQLサーバー。
+
+## ベンチマーク結果と分析（例示）
+
+以下の結果は例示であり、本番環境で観察される典型的なパフォーマンス特性と各プーラーの理論的な利点に基づいています。実際の数値は、ハードウェア、ネットワーク、PostgreSQLの設定、およびワークロードによって異なります。
+
+| シナリオ                       | プーラー      | プールモード   | 最大クライアント数 | バックエンドプールサイズ | TPS (平均) | レイテンシ (平均/95パーセンタイル ms) | プーラーCPU (%) | プーラーメモリ (MB) | PG CPU (%) | PGメモリ (MB) |
+| :----------------------------- | :---------- | :---------- | :---------- | :---------------- | :-------- | :------------------------- | :------------- | :-------------- | :--------- | :---------- |
+| **ベースライン（直接接続）**          | N/A         | N/A         | 20000       | 500 (PG制限)    | ~500      | 1500 / 5000+               | N/A            | N/A             | 90+        | 30000+      |
+| **PgBouncer**                  | PgBouncer   | トランザクション | 20000       | 200               | 18000     | 5 / 20                     | 15             | 50              | 70         | 10000       |
+| **PgBouncer**                  | PgBouncer   | セッション     | 20000       | 500               | 12000     | 8 / 35                     | 20             | 70              | 85         | 20000       |
+| **PgCat**                      | PgCat       | トランザクション | 20000       | 200               | 20000     | 4 / 18                     | 25             | 100             | 65         | 10000       |
+| **PgCat**                      | PgCat       | セッション     | 20000       | 500               | 14000     | 7 / 30                     | 30             | 120             | 80         | 20000       |
+| **Supavisor (1ノード)**         | Supavisor   | トランザクション | 20000       | 200               | 16000     | 6 / 25                     | 40             | 250             | 75         | 10000       |
+| **Supavisor (1ノード)**         | Supavisor   | セッション     | 20000       | 500               | 10000     | 10 / 40                    | 50             | 300             | 90         | 20000       |
+| **Supavisor (3ノードクラスター)** | Supavisor   | トランザクション | 20000       | 200 (ノードあたり)    | 22000     | 4 / 15                     | 20 (ノードあたり)  | 250 (ノードあたり)  | 60         | 10000       |
+
+**分析**:
+
+*   **ベースライン**: 予想通り、20,000の同時接続での直接接続はPostgreSQLをすぐに圧倒し、極端に低いTPSと高いレイテンシ、または接続障害を引き起こします。
+*   **トランザクションプーリングの優位性**: `simple_transaction.sql`ワークロードの場合、トランザクションプーリングはすべてのプーラーで一貫して大幅に高いTPSと低いレイテンシを提供します。これは、バックエンド接続の効率的な再利用によるものです。
+*   **PgCatのパフォーマンス**: PgCatは、Rustの効率性とマルチスレッドを活用し、単一ノードのトランザクションプーリングシナリオで最高のTPSと最低のレイテンシを示します。複数のコアを利用できる能力が、シングルスレッドのPgBouncerよりも優位に立っています。
+*   **PgBouncerの効率性**: シングルスレッドであるにもかかわらず、PgBouncerは驚くべき効率性と低いリソース消費を示します。C言語実装によりCPUとメモリ使用量が最小限に抑えられ、シンプルで高スループットのトランザクションプーリングにおいて強力な候補となります。
+*   **Supavisorのスケーラビリティ**: 単一のSupavisorノードは、BEAMのオーバーヘッドのため、同じワークロードでPgCatやPgBouncerよりもわずかに高いリソースフットプリントとわずかに低い生のTPSを持つ可能性があります。しかし、その真の強みは分散性にあります。3ノードのSupavisorクラスターは、クライアント負荷とバックエンド接続を分散することで、単一ノードのプーラーを大幅に上回り、クラスター設定で最高の全体TPSと最低のレイテンシを達成します。
+*   **メモリ消費**: PgBouncerは最も低いメモリフットプリントです。PgCatはわずかに高いですが、それでも非常に効率的です。Supavisorは、Erlang VMのため、一般的にベースメモリ使用量が高くなりますが、これはHAと分散機能にとってしばしば価値のあるトレードオフです。
+*   **セッションプーリング**: プーリングなしと比較して依然として大きな利点がありますが、セッションプーリングは、バックエンド接続がより長く保持されるため、トランザクションプーリングと比較してTPSが低く、リソース使用量が高くなります。セッションプーリングの`default_pool_size`は、予想される*同時にアクティブな*クライアント数に近づける必要があり、これは依然としてかなりの数になる可能性があります。
+
+## 比較表
+
+| 機能 / メトリクス             | PgBouncer                               | PgCat                                   | Supavisor                               |
+| :--------------------------- | :-------------------------------------- | :-------------------------------------- | :-------------------------------------- |
+| **言語 / ランタイム**       | C                                       | Rust

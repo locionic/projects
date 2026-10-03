@@ -1,0 +1,308 @@
+---
+title: 'Cilium Service Mesh with eBPF: Sidecarless mTLS, L7 Traffic Management & Benchmarks'
+date: '2026-10-03'
+lastUpdated: '2026-10-03'
+tags: ["ebpf", "cilium", "kubernetes", "networking"]
+draft: false
+featured: true
+summary: 'Deep-dive architectural guide covering cilium service mesh with ebpf: sidecarless mtls, l7 traffic management & benchmarks with battle-tested production examples.'
+images: ['/static/images/cilium-service-mesh-ebpf-vs-envoy.png']
+category: 'Tech'
+proficiencyLevel: 'Advanced'
+programmingLanguage: 'TypeScript'
+---
+
+This guide details the architectural underpinnings, operational mechanics, and performance characteristics of Cilium Service Mesh, emphasizing its eBPF-driven, sidecarless approach to mTLS and L7 traffic management within Kubernetes environments.
+
+<AudioPlayer src="/static/audio/cilium-service-mesh-ebpf-vs-envoy.mp3" title="Executive Audio Briefing" voice="Google Cloud en-US-Neural2-F" />
+
+
+## The eBPF Foundation for Service Mesh
+
+Cilium's fundamental advantage stems from its deep integration with eBPF (extended Berkeley Packet Filter). eBPF enables the execution of sandboxed programs within the Linux kernel, triggered by various events such as network packet reception, system calls, or kernel tracepoints. This capability allows Cilium to implement networking, security, and observability functions directly in the kernel's data path, bypassing traditional overheads associated with user-space proxies or `iptables` rules.
+
+### Kernel-Native Data Plane with `sk_msg` and `sockmap`
+
+Traditional service meshes inject a sidecar proxy (e.g., Envoy) into each application pod. This proxy intercepts all inbound and outbound traffic, adding latency due to context switching between kernel and user space, TCP stack processing, and proxy processing. Cilium mitigates this by leveraging eBPF for direct socket-to-socket communication.
+
+The core eBPF features enabling this are `sk_msg` and `sockmap`:
+
+*   **`sk_msg` eBPF programs**: These programs attach to sockets and can redirect messages directly between sockets within the kernel. When an application sends data, an `sk_msg` program can intercept it and, instead of letting it traverse the full TCP/IP stack, redirect it to the receiving socket of another application *on the same node*. This bypasses the entire network stack, `iptables`, and even the loopback device, significantly reducing latency and CPU cycles.
+*   **`sockmap`**: A specialized eBPF map type that holds references to sockets. `sk_msg` programs use `sockmap` to identify and redirect traffic to the correct destination socket.
+
+For inter-node communication, while `sk_msg` cannot directly bypass the physical network, Cilium still uses eBPF to optimize packet forwarding, policy enforcement, and load balancing at the kernel level, avoiding `iptables` entirely. This results in a highly efficient data plane where traffic is processed with minimal overhead.
+
+## Cilium Service Mesh Architecture
+
+Cilium's service mesh architecture is characterized by its hybrid approach: a default eBPF-powered sidecarless data plane for L3/L4, and a conditional, shared Envoy proxy for L7 capabilities.
+
+### Sidecarless Data Plane for L3/L4 and mTLS
+
+By default, Cilium handles all L3/L4 policy enforcement, load balancing, and mutual TLS (mTLS) directly within the kernel using eBPF.
+
+*   **L3/L4 Policy Enforcement**: `CiliumNetworkPolicy` objects are translated into eBPF programs that enforce network policies at the earliest possible point in the kernel's network stack. This is significantly more efficient than `iptables` chains, which can become complex and slow with a large number of rules.
+*   **Load Balancing**: Cilium performs DSR (Direct Server Return) based load balancing using eBPF, ensuring that return traffic from backend pods goes directly to the client, bypassing the load balancer for the return path. This improves performance and reduces load balancer bottlenecks.
+*   **Sidecarless mTLS**: Cilium implements mTLS by injecting eBPF programs that handle TLS handshake and encryption/decryption at the socket layer. This means the application itself does not need to be TLS-aware, and no user-space sidecar proxy is required to terminate and re-encrypt TLS connections. The eBPF program intercepts the raw TCP stream, performs TLS operations, and presents a decrypted stream to the application, and vice-versa for outbound traffic. This is a critical differentiator, as it removes the performance penalty and operational complexity of per-pod sidecar proxies for mTLS.
+
+### Conditional L7 Traffic Management with Shared Envoy
+
+While eBPF excels at L3/L4 operations, deep L7 inspection and manipulation (e.g., HTTP header modification, gRPC method routing, advanced retry logic) are complex and resource-intensive. Instead of forcing all traffic through a sidecar for these capabilities, Cilium adopts an intelligent, conditional approach:
+
+*   **Shared Node-Level Envoy Daemon**: When an L7 `CiliumNetworkPolicy` is applied to a pod, Cilium deploys a *single, shared Envoy proxy* daemon on the Kubernetes node. This Envoy instance is not a sidecar; it runs as a separate process on the node and is shared by all pods on that node requiring L7 policy enforcement.
+*   **eBPF Redirection to Envoy**: For traffic destined for a service with an L7 policy, eBPF programs redirect the relevant connections to the node-local Envoy proxy. The Envoy then applies the L7 policy (e.g., HTTP path matching, header-based routing, rate limiting) and forwards the traffic.
+*   **Bypass for L3/L4 Traffic**: Crucially, traffic that *does not* require L7 policy enforcement continues to flow directly through the eBPF data plane, completely bypassing the Envoy proxy. This hybrid model ensures that the performance overhead of Envoy is only incurred when strictly necessary, and its resource consumption is amortized across multiple pods on a node.
+
+This architecture provides the best of both worlds: kernel-level performance for the majority of traffic, and powerful L7 capabilities when required, without the pervasive overhead of per-pod sidecars.
+
+### Control Plane
+
+The Cilium control plane consists of:
+
+*   **Cilium Agent**: Runs as a DaemonSet on each Kubernetes node. It programs the eBPF data plane, enforces policies, and manages the lifecycle of the node-local Envoy proxy.
+*   **Cilium Operator**: Runs as a Deployment and handles cluster-wide tasks such as IP address management (IPAM), managing `CiliumNetworkPolicy` objects, and ensuring consistency across the cluster.
+*   **Kubernetes API Server**: Cilium integrates seamlessly with Kubernetes, using Custom Resource Definitions (CRDs) like `CiliumNetworkPolicy`, `CiliumClusterWideNetworkPolicy`, and `CiliumService` to define and manage its behavior.
+
+## Configuring Cilium Service Mesh
+
+This section provides practical examples of configuring Cilium for mTLS and L7 traffic management.
+
+### Installation
+
+Cilium can be installed via Helm. Ensure your Kubernetes cluster meets the eBPF kernel requirements (Linux kernel 4.9+ for basic features, 5.10+ for advanced features like `sockmap` and `sk_msg` for service mesh).
+
+```bash
+helm repo add cilium https://helm.cilium.io/
+helm repo update
+
+helm install cilium cilium/cilium --version 1.15.0 \
+  --namespace kube-system \
+  --set ipam.mode=kubernetes \
+  --set egressGateway.enabled=true \
+  --set hubble.enabled=true \
+  --set hubble.ui.enabled=true \
+  --set hubble.relay.enabled=true \
+  --set serviceMesh.enabled=true \
+  --set serviceMesh.mtls.enabled=true \
+  --set serviceMesh.mtls.certProvider.certgen.enabled=true \
+  --set serviceMesh.mtls.certProvider.certgen.provisionCertificates=true \
+  --set serviceMesh.proxy.enabled=true \
+  --set serviceMesh.proxy.envoy.enabled=true \
+  --set serviceMesh.proxy.envoy.resources.requests.cpu="100m" \
+  --set serviceMesh.proxy.envoy.resources.requests.memory="128Mi" \
+  --set serviceMesh.proxy.envoy.resources.limits.cpu="500m" \
+  --set serviceMesh.proxy.envoy.resources.limits.memory="512Mi" \
+  --set k8sServiceHost=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}') \
+  --set k8sServicePort=$(kubectl get service kubernetes -n default -o jsonpath='{.spec.ports[0].port}')
+```
+
+This Helm command enables the service mesh features, including mTLS with a built-in certificate provider, and the shared Envoy proxy. Adjust resource requests/limits for Envoy based on your cluster's needs.
+
+### Enforcing Mutual TLS with `CiliumNetworkPolicy`
+
+To enforce mTLS between services, you define a `CiliumNetworkPolicy` that specifies the required authentication. Cilium automatically handles certificate issuance and rotation for services within the mesh.
+
+Consider two services, `frontend` and `backend`, in the `default` namespace. We want `frontend` to only communicate with `backend` using mTLS.
+
+```yaml
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: "backend-mtls-policy"
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: backend
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    authentication:
+      mode: required
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        app: frontend
+    authentication:
+      mode: required
+```
+
+This policy, applied to `backend` pods, dictates that ingress traffic from `frontend` pods *must* be mutually authenticated. Similarly, the egress rule ensures `backend` initiates mTLS when communicating with `frontend`. Cilium's eBPF programs will enforce this at the socket layer, rejecting unauthenticated connections.
+
+### L7 Traffic Management with `CiliumNetworkPolicy`
+
+For L7 policies, Cilium leverages the shared Envoy proxy. Here, we'll define a policy that allows `frontend` to access specific paths on `backend` and enforces HTTP method restrictions.
+
+```yaml
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: "backend-l7-policy"
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: backend
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    toPorts:
+    - ports:
+      - port: "8080"
+        protocol: TCP
+      rules:
+        http:
+        - method: "GET"
+          path: "/api/v1/data"
+        - method: "POST"
+          path: "/api/v1/submit"
+          headers:
+          - "X-Request-ID"
+          - "Content-Type"
+```
+
+In this example:
+*   The `endpointSelector` targets `backend` pods.
+*   The `ingress` rule specifies that traffic from `frontend` pods to port `8080` of `backend` will be subject to L7 HTTP rules.
+*   The `rules.http` section defines allowed HTTP methods and paths. It also demonstrates header presence checks (`headers` field).
+
+When this policy is applied, Cilium detects the L7 rules and configures the node-local Envoy proxy to intercept and enforce these HTTP policies for traffic between `frontend` and `backend`. Traffic not matching these rules or not destined for `backend`'s port `8080` will continue to flow through the eBPF data plane without Envoy intervention.
+
+### Ingress/Egress Gateway
+
+Cilium can also act as an Ingress or Egress Gateway, providing a unified control point for traffic entering or leaving the mesh. This is particularly useful for applying consistent policies, mTLS, and observability to external communications.
+
+```yaml
+apiVersion: "cilium.io/v2"
+kind: CiliumEgressGatewayPolicy
+metadata:
+  name: "egress-to-external-db"
+  namespace: default
+spec:
+  selectors:
+  - podSelector:
+      matchLabels:
+        app: my-app
+  destinationCIDRs:
+  - "192.0.2.0/24" # Example external database CIDR
+  egressGateway:
+    nodeSelector:
+      matchLabels:
+        egress-gateway: "true" # Label your gateway node
+```
+
+This `CiliumEgressGatewayPolicy` directs all egress traffic from pods labeled `app: my-app` to the `192.0.2.0/24` CIDR through a designated egress gateway node. This allows for centralized policy enforcement, IP masquerading, and observability for external traffic.
+
+## Performance Benchmarks & Trade-offs
+
+Benchmarking service mesh solutions is critical for understanding their operational impact. Cilium's eBPF-driven architecture consistently demonstrates superior performance characteristics compared to traditional sidecar-based meshes, especially for L3/L4 traffic.
+
+### Methodology
+
+Benchmarks typically involve:
+*   **Throughput**: Measuring the amount of data transferred per unit of time (e.g., Gbps) or requests per second (RPS) for HTTP/gRPC. Tools like `iperf3`, `wrk`, `fortio`.
+*   **Latency**: Measuring the time taken for a request to complete (e.g., P99 latency in milliseconds).
+*   **Resource Consumption**: Monitoring CPU and memory usage of data plane components (sidecars, Cilium agents, Envoy daemons).
+
+Test scenarios often include:
+*   **Intra-node communication**: Pod-to-pod communication on the same Kubernetes node. This is where `sk_msg` provides the most significant advantage.
+*   **Inter-node communication**: Pod-to-pod communication across different Kubernetes nodes.
+*   **mTLS overhead**: Measuring the impact of encryption/decryption.
+*   **L7 policy overhead**: Measuring the impact of HTTP/gRPC policy enforcement.
+
+### Benchmark Comparison Table
+
+The following table presents representative performance metrics, synthesizing results from various industry benchmarks and Cilium's own performance reports. Actual numbers will vary based on hardware, kernel version, workload, and network conditions.
+
+| Feature / Metric          | Cilium (eBPF L3/L4)                               | Cilium (eBPF + Shared Envoy L7)                   | Istio (Envoy Sidecar)                               | Linkerd (Linkerd2-proxy Sidecar)                    |
+| :------------------------ | :------------------------------------------------ | :------------------------------------------------ | :-------------------------------------------------- | :-------------------------------------------------- |
+| **Architecture**          | Kernel-native eBPF                                | Hybrid: eBPF + Node-local Envoy                   | Per-pod Envoy sidecar                               | Per-pod Linkerd2-proxy sidecar                      |
+| **Data Plane Location**   | Linux Kernel                                      | Linux Kernel (L3/L4) + User-space (L7)            | User-space (per-pod)                                | User-space (per-pod)                                |
+| **mTLS Implementation**   | eBPF (kernel-level)                               | eBPF (kernel-level)                               | Envoy (user-space)                                  | Linkerd2-proxy (user-space)                         |
+| **L7 Policy Enforcement** | N/A (L3/L4 only)                                  | Shared Envoy (node-local)                         | Envoy (per-pod)                                     | Linkerd2-proxy (per-pod)                            |
+| **Intra-node Latency**    | **~0.1 - 0.2 ms** (P99)                           | **~0.3 - 0.5 ms** (P99, if L7 policy active)      | ~1.0 - 1.5 ms (P99)                                 | ~0.8 - 1.2 ms (P99)                                 |
+| **Inter-node Latency**    | **~0.2 - 0.4 ms** (P99)                           | **~0.4 - 0.6 ms** (P99, if L7 policy active)      | ~1.2 - 1.8 ms (P99)                                 | ~1.0 - 1.5 ms (P99)                                 |
+| **Throughput (Gbps)**     | **~20-40 Gbps** (raw TCP)                         | **~15-30 Gbps** (raw TCP, if L7 policy active)    | ~10-20 Gbps (raw TCP)                               | ~12-25 Gbps (raw TCP)                               |
+| **RPS (HTTP/1.1)**        | N/A (L3/L4 only)                                  | **~20,000 - 40,000 RPS** (simple L7 policy)       | ~10,000 - 25,000 RPS (simple L7 policy)             | ~15,000 - 30,000 RPS (simple L7 policy)             |
+| **CPU Overhead (per pod)**| **Negligible** (eBPF agent per node)              | **Negligible** (eBPF agent + shared Envoy per node)| ~50-150 mCPU (per sidecar)                          | ~30-100 mCPU (per sidecar)                          |
+| **Memory Overhead (per pod)**| **Negligible** (eBPF agent per node)              | **Negligible** (eBPF agent + shared Envoy per node)| ~50-150 MiB (per sidecar)                           | ~30-100 MiB (per sidecar)                           |
+| **Operational Complexity**| Low (single agent per node)                       | Moderate (single agent + conditional Envoy)       | High (per-pod sidecar lifecycle, resource mgmt)     | Moderate (per-pod sidecar lifecycle, resource mgmt) |
+| **Trade-offs**            | Requires modern Linux kernel                      | L7 still incurs user-space overhead, but shared   | High resource consumption, increased latency        | Moderate resource consumption, increased latency    |
+
+### Analysis
+
+*   **Latency**: Cilium's eBPF data plane significantly reduces latency, particularly for intra-node communication, by leveraging `sk_msg` to bypass the network stack. Even for inter-node traffic, eBPF-based forwarding is more efficient than `iptables` or sidecar proxies. When L7 policies are active, the redirection to the shared Envoy introduces some latency, but it's still generally lower than per-pod sidecars due to the optimized eBPF path for non-L7 traffic and the amortized cost of a single Envoy instance.
+*   **Throughput**: The kernel-native data path allows Cilium to achieve higher raw TCP throughput. For L7 traffic, the shared Envoy can still handle substantial RPS, often outperforming per-pod sidecars due to reduced contention and optimized resource utilization.
+*   **Resource Consumption**: This is where Cilium shines. By eliminating per-pod sidecars for most traffic, it drastically reduces the aggregate CPU and memory footprint across the cluster. The shared Envoy daemon's resources are consumed once per node, not per pod, leading to substantial savings in large deployments.
+*   **Operational Complexity**: Managing a single Cilium agent and a conditional Envoy per node is inherently simpler than managing hundreds or thousands of sidecar proxies, each with its own lifecycle, configuration, and resource requirements.
+
+## Common Gotchas & Production Pitfalls
+
+Deploying and operating a service mesh, especially one as deeply integrated with the kernel as Cilium, comes with its own set of challenges.
+
+1.  **Kernel Version Requirements**:
+    *   **Gotcha**: Running Cilium on older Linux kernel versions (e.g., < 5.10) might mean certain advanced eBPF features like `sockmap` and `sk_msg` are unavailable or less optimized. This can degrade performance or prevent certain service mesh features from working.
+    *   **Pitfall**: Not validating kernel versions across all nodes before deployment can lead to inconsistent behavior or feature gaps.
+    *   **Mitigation**: Always check Cilium's documentation for minimum and recommended kernel versions. Use `cilium status` and `cilium sysdump` to diagnose eBPF feature availability. Plan kernel upgrades carefully.
+
+2.  **`CiliumNetworkPolicy` Complexity**:
+    *   **Gotcha**: Overly broad or overly specific policies can lead to unexpected traffic drops or allow unintended access. L7 policies, especially with complex regex or header matching, can be difficult to debug.
+    *   **Pitfall**: Applying policies without thorough testing in a staging environment. Not using `dry-run` or `audit` modes.
+    *   **Mitigation**: Start with permissive policies and gradually tighten them. Use `cilium policy get` and `cilium policy trace` to understand policy evaluation. Leverage Hubble for real-time visibility into policy decisions and dropped connections.
+
+3.  **Shared Envoy Resource Contention**:
+    *   **Gotcha**: While shared Envoy is efficient, a node with many L7-enabled pods and high traffic volume can still exhaust the shared Envoy's CPU or memory limits, leading to performance degradation or crashes.
+    *   **Pitfall**: Under-provisioning the shared Envoy proxy's resources (`serviceMesh.proxy.envoy.resources` in Helm values).
+    *   **Mitigation**: Monitor the shared Envoy daemon's resource usage (e.g., `kubectl top pod -n kube-system -l k8s-app=cilium-envoy`). Adjust resource requests/limits based on observed load. Distribute L7-heavy workloads across more nodes if necessary.
+
+4.  **eBPF Program Debugging**:
+    *   **Gotcha**: eBPF programs run in the kernel, making them harder to debug than user-space applications. Errors in eBPF programs can lead to kernel panics or unexpected network behavior.
+    *   **Pitfall**: Lack of familiarity with eBPF tooling or kernel debugging techniques.
+    *   **Mitigation**: Cilium provides excellent observability tools like Hubble. Use `cilium monitor`, `cilium status`, and `cilium debug` for insights. For deeper issues, `bpftool` and kernel logs (`dmesg`) are essential. Ensure `debug` logging is enabled for Cilium agents when troubleshooting.
+
+5.  **Interaction with Other Network Components**:
+    *   **Gotcha**: Cilium is a CNI. Running another CNI plugin alongside Cilium is generally not supported and will lead to conflicts.
+    *   **Pitfall**: Attempting to integrate Cilium with existing `iptables` rules or other network overlays without proper understanding.
+    *   **Mitigation**: Cilium should be the sole CNI. If migrating from another CNI, follow official migration guides. Understand how Cilium handles `kube-proxy` replacement and `hostPort` services.
+
+6.  **mTLS Certificate Management**:
+    *   **Gotcha**: While Cilium automates mTLS certificate management, issues with the certificate provider (e.g., `certgen` or integration with Vault/SPIFFE) can prevent services from establishing mTLS connections.
+    *   **Pitfall**: Not monitoring certificate rotation or validity.
+    *   **Mitigation**: Monitor Cilium agent logs for certificate-related errors. Ensure the chosen certificate provider is correctly configured and has necessary permissions.
+
+7.  **Observability Gaps**:
+    *   **Gotcha**: While Hubble provides excellent network observability, it might not cover all application-level metrics or traces that a traditional sidecar mesh might expose by default (e.g., HTTP status codes, request durations from the proxy's perspective).
+    *   **Pitfall**: Relying solely on Cilium's network observability for application performance monitoring.
+    *   **Mitigation**: Complement Hubble with application-level instrumentation (e.g., Prometheus, OpenTelemetry) for comprehensive observability. Understand what metrics are exposed by Cilium and what needs to be collected from the application itself.
+
+## Frequently Asked Questions (FAQ)
+
+### What is Cilium Service Mesh?
+Cilium Service Mesh is a Kubernetes-native service mesh solution that leverages eBPF (extended Berkeley Packet Filter) in the Linux kernel to provide high-performance networking, security, and observability for microservices. It aims to deliver service mesh capabilities with significantly reduced overhead compared to traditional sidecar-based architectures.
+
+### How does Cilium achieve sidecarless service mesh?
+Cilium achieves a sidecarless service mesh by implementing L3/L4 policy enforcement, load balancing, and mutual TLS (mTLS) directly within the Linux kernel using eBPF programs. This bypasses the need for per-pod user-space sidecar proxies for these core functionalities, reducing latency and resource consumption.
+
+### What is `sk_msg` in eBPF?
+`sk_msg` is an eBPF program type that allows direct message redirection between sockets within the Linux kernel. When an application sends data, an `sk_msg` program can intercept it and redirect it to another application's receiving socket on the same node, completely bypassing the traditional TCP/IP stack, `iptables`, and loopback device. This significantly reduces latency for intra-node communication.
+
+### When does Cilium use Envoy?
+Cilium uses Envoy only when advanced Layer 7 (L7) traffic management policies (e.g., HTTP path routing, header manipulation, gRPC method matching) are explicitly configured via `CiliumNetworkPolicy`. Instead of deploying Envoy as a per-pod sidecar, Cilium runs a single, shared Envoy proxy daemon on each Kubernetes node. eBPF programs then intelligently redirect only the traffic requiring L7 inspection to this node-local Envoy, while all other traffic continues through the high-performance eBPF data plane.
+
+### Is Cilium a CNI or a Service Mesh?
+Cilium is both a Container Network Interface (CNI) plugin and a service mesh. It functions as the primary CNI for Kubernetes, providing networking and network policy enforcement. Building upon its CNI capabilities, Cilium extends its functionality to offer service mesh features like mTLS, L7 traffic management, and advanced observability, all powered by eBPF.
+
+### What are the performance benefits of Cilium Service Mesh?
+Cilium Service Mesh offers significant performance benefits, including:
+*   **Lower Latency**: Achieved by bypassing the network stack with eBPF `sk_msg` for intra-node communication and optimized kernel-level processing for inter-node traffic.
+*   **Higher Throughput**: Direct kernel data path allows for greater data transfer rates.
+*   **Reduced Resource Consumption**: Eliminates the need for per-pod sidecar proxies for most traffic, leading to substantial savings in CPU and memory across the cluster.
+*   **Efficient mTLS**: Kernel-level mTLS offloads encryption/decryption from user-space proxies, improving performance.
+
+### Does Cilium support multi-cluster?
+Yes, Cilium supports multi-cluster deployments. It provides features like Cluster Mesh, which enables seamless connectivity, policy enforcement, and service discovery across multiple Kubernetes clusters, treating them as a single logical network. This is achieved through secure, encrypted tunnels and shared identity across clusters.
+
+## Conclusion
+
+Cilium Service Mesh represents a paradigm shift in how service mesh capabilities are delivered within Kubernetes. By leveraging the power of eBPF, Cilium provides a highly performant, resource-efficient, and operationally simpler alternative to traditional sidecar-based meshes. Its intelligent hybrid architecture, which defaults to a kernel-native data plane and conditionally employs a shared Envoy proxy for L7, ensures that performance overhead is only incurred when strictly necessary. For organizations prioritizing low latency, high throughput, and reduced operational costs in their microservices architectures, Cilium Service Mesh with eBPF offers a compelling and future-proof solution.

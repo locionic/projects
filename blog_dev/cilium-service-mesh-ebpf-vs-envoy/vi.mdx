@@ -1,0 +1,308 @@
+---
+title: "Cilium Service Mesh với eBPF: mTLS không sidecar, Quản lý lưu lượng L7 & Điểm chuẩn"
+date: '2026-10-03'
+lastUpdated: '2026-10-03'
+tags: ["ebpf", "cilium", "kubernetes", "networking"]
+draft: false
+featured: true
+summary: "Hướng dẫn kiến trúc chuyên sâu về Cilium service mesh với eBPF: mTLS không sidecar, quản lý lưu lượng L7 & điểm chuẩn cùng các ví dụ thực tế đã được kiểm chứng trong môi trường sản xuất."
+images: ['/static/images/cilium-service-mesh-ebpf-vs-envoy.png']
+category: 'Tech'
+proficiencyLevel: 'Advanced'
+programmingLanguage: 'TypeScript'
+---
+
+Hướng dẫn này trình bày chi tiết các nền tảng kiến trúc, cơ chế vận hành và đặc tính hiệu suất của Cilium Service Mesh, nhấn mạnh phương pháp tiếp cận không sidecar, dựa trên eBPF của nó để quản lý lưu lượng mTLS và L7 trong môi trường Kubernetes.
+
+<AudioPlayer src="/static/audio/cilium-service-mesh-ebpf-vs-envoy-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Nền tảng eBPF cho Service Mesh
+
+Lợi thế cơ bản của Cilium xuất phát từ sự tích hợp sâu sắc với eBPF (extended Berkeley Packet Filter). eBPF cho phép thực thi các chương trình được đóng hộp (sandboxed) trong nhân Linux, được kích hoạt bởi nhiều sự kiện khác nhau như nhận gói mạng, lệnh gọi hệ thống hoặc các điểm theo dõi nhân (kernel tracepoints). Khả năng này cho phép Cilium triển khai các chức năng mạng, bảo mật và khả năng quan sát trực tiếp trong đường dẫn dữ liệu của nhân, bỏ qua các chi phí truyền thống liên quan đến proxy không gian người dùng hoặc các quy tắc `iptables`.
+
+### Mặt phẳng dữ liệu gốc nhân với `sk_msg` và `sockmap`
+
+Các service mesh truyền thống chèn một proxy sidecar (ví dụ: Envoy) vào mỗi pod ứng dụng. Proxy này chặn tất cả lưu lượng vào và ra, làm tăng độ trễ do chuyển đổi ngữ cảnh giữa nhân và không gian người dùng, xử lý ngăn xếp TCP và xử lý proxy. Cilium giảm thiểu điều này bằng cách tận dụng eBPF để giao tiếp trực tiếp giữa các socket.
+
+Các tính năng eBPF cốt lõi cho phép điều này là `sk_msg` và `sockmap`:
+
+*   **Các chương trình eBPF `sk_msg`**: Các chương trình này gắn vào các socket và có thể chuyển hướng tin nhắn trực tiếp giữa các socket trong nhân. Khi một ứng dụng gửi dữ liệu, một chương trình `sk_msg` có thể chặn nó và, thay vì để nó đi qua toàn bộ ngăn xếp TCP/IP, chuyển hướng nó đến socket nhận của một ứng dụng khác *trên cùng một node*. Điều này bỏ qua toàn bộ ngăn xếp mạng, `iptables`, và thậm chí cả thiết bị loopback, giảm đáng kể độ trễ và chu kỳ CPU.
+*   **`sockmap`**: Một loại bản đồ eBPF chuyên biệt chứa các tham chiếu đến các socket. Các chương trình `sk_msg` sử dụng `sockmap` để xác định và chuyển hướng lưu lượng đến socket đích chính xác.
+
+Đối với giao tiếp giữa các node, mặc dù `sk_msg` không thể trực tiếp bỏ qua mạng vật lý, Cilium vẫn sử dụng eBPF để tối ưu hóa việc chuyển tiếp gói tin, thực thi chính sách và cân bằng tải ở cấp độ nhân, tránh hoàn toàn `iptables`. Điều này dẫn đến một mặt phẳng dữ liệu hiệu quả cao, nơi lưu lượng được xử lý với chi phí tối thiểu.
+
+## Kiến trúc Cilium Service Mesh
+
+Kiến trúc service mesh của Cilium được đặc trưng bởi phương pháp tiếp cận lai của nó: một mặt phẳng dữ liệu không sidecar mặc định được hỗ trợ bởi eBPF cho L3/L4, và một proxy Envoy chia sẻ, có điều kiện cho các khả năng L7.
+
+### Mặt phẳng dữ liệu không sidecar cho L3/L4 và mTLS
+
+Theo mặc định, Cilium xử lý tất cả việc thực thi chính sách L3/L4, cân bằng tải và mTLS (mutual TLS) trực tiếp trong nhân bằng cách sử dụng eBPF.
+
+*   **Thực thi chính sách L3/L4**: Các đối tượng `CiliumNetworkPolicy` được dịch thành các chương trình eBPF thực thi các chính sách mạng tại điểm sớm nhất có thể trong ngăn xếp mạng của nhân. Điều này hiệu quả hơn đáng kể so với các chuỗi `iptables`, có thể trở nên phức tạp và chậm với số lượng lớn các quy tắc.
+*   **Cân bằng tải**: Cilium thực hiện cân bằng tải dựa trên DSR (Direct Server Return) bằng cách sử dụng eBPF, đảm bảo rằng lưu lượng trả về từ các pod backend đi trực tiếp đến máy khách, bỏ qua bộ cân bằng tải cho đường dẫn trả về. Điều này cải thiện hiệu suất và giảm tắc nghẽn bộ cân bằng tải.
+*   **mTLS không sidecar**: Cilium triển khai mTLS bằng cách chèn các chương trình eBPF xử lý bắt tay TLS và mã hóa/giải mã ở lớp socket. Điều này có nghĩa là bản thân ứng dụng không cần phải nhận biết TLS, và không cần proxy sidecar không gian người dùng để chấm dứt và mã hóa lại các kết nối TLS. Chương trình eBPF chặn luồng TCP thô, thực hiện các hoạt động TLS và trình bày một luồng đã giải mã cho ứng dụng, và ngược lại đối với lưu lượng đi. Đây là một điểm khác biệt quan trọng, vì nó loại bỏ hình phạt hiệu suất và sự phức tạp trong vận hành của các proxy sidecar trên mỗi pod cho mTLS.
+
+### Quản lý lưu lượng L7 có điều kiện với Envoy chia sẻ
+
+Trong khi eBPF vượt trội trong các hoạt động L3/L4, việc kiểm tra và thao tác L7 sâu (ví dụ: sửa đổi tiêu đề HTTP, định tuyến phương thức gRPC, logic thử lại nâng cao) rất phức tạp và tốn nhiều tài nguyên. Thay vì buộc tất cả lưu lượng phải đi qua một sidecar cho các khả năng này, Cilium áp dụng một phương pháp thông minh, có điều kiện:
+
+*   **Daemon Envoy cấp độ node chia sẻ**: Khi một `CiliumNetworkPolicy` L7 được áp dụng cho một pod, Cilium triển khai một *daemon proxy Envoy duy nhất, chia sẻ* trên node Kubernetes. Phiên bản Envoy này không phải là sidecar; nó chạy như một tiến trình riêng biệt trên node và được chia sẻ bởi tất cả các pod trên node đó yêu cầu thực thi chính sách L7.
+*   **Chuyển hướng eBPF đến Envoy**: Đối với lưu lượng đến một dịch vụ có chính sách L7, các chương trình eBPF chuyển hướng các kết nối liên quan đến proxy Envoy cục bộ trên node. Envoy sau đó áp dụng chính sách L7 (ví dụ: khớp đường dẫn HTTP, định tuyến dựa trên tiêu đề, giới hạn tốc độ) và chuyển tiếp lưu lượng.
+*   **Bỏ qua cho lưu lượng L3/L4**: Quan trọng là, lưu lượng *không* yêu cầu thực thi chính sách L7 tiếp tục chảy trực tiếp qua mặt phẳng dữ liệu eBPF, hoàn toàn bỏ qua proxy Envoy. Mô hình lai này đảm bảo rằng chi phí hiệu suất của Envoy chỉ phát sinh khi thực sự cần thiết, và mức tiêu thụ tài nguyên của nó được phân bổ trên nhiều pod trên một node.
+
+Kiến trúc này cung cấp những điều tốt nhất của cả hai thế giới: hiệu suất cấp độ nhân cho phần lớn lưu lượng, và các khả năng L7 mạnh mẽ khi cần, mà không có chi phí phổ biến của các sidecar trên mỗi pod.
+
+### Mặt phẳng điều khiển
+
+Mặt phẳng điều khiển của Cilium bao gồm:
+
+*   **Cilium Agent**: Chạy dưới dạng DaemonSet trên mỗi node Kubernetes. Nó lập trình mặt phẳng dữ liệu eBPF, thực thi các chính sách và quản lý vòng đời của proxy Envoy cục bộ trên node.
+*   **Cilium Operator**: Chạy dưới dạng Deployment và xử lý các tác vụ toàn cụm như quản lý địa chỉ IP (IPAM), quản lý các đối tượng `CiliumNetworkPolicy` và đảm bảo tính nhất quán trên toàn cụm.
+*   **Kubernetes API Server**: Cilium tích hợp liền mạch với Kubernetes, sử dụng các Định nghĩa tài nguyên tùy chỉnh (CRD) như `CiliumNetworkPolicy`, `CiliumClusterWideNetworkPolicy` và `CiliumService` để định nghĩa và quản lý hành vi của nó.
+
+## Cấu hình Cilium Service Mesh
+
+Phần này cung cấp các ví dụ thực tế về cấu hình Cilium cho mTLS và quản lý lưu lượng L7.
+
+### Cài đặt
+
+Cilium có thể được cài đặt qua Helm. Đảm bảo cụm Kubernetes của bạn đáp ứng các yêu cầu về nhân eBPF (nhân Linux 4.9+ cho các tính năng cơ bản, 5.10+ cho các tính năng nâng cao như `sockmap` và `sk_msg` cho service mesh).
+
+```bash
+helm repo add cilium https://helm.cilium.io/
+helm repo update
+
+helm install cilium cilium/cilium --version 1.15.0 \
+  --namespace kube-system \
+  --set ipam.mode=kubernetes \
+  --set egressGateway.enabled=true \
+  --set hubble.enabled=true \
+  --set hubble.ui.enabled=true \
+  --set hubble.relay.enabled=true \
+  --set serviceMesh.enabled=true \
+  --set serviceMesh.mtls.enabled=true \
+  --set serviceMesh.mtls.certProvider.certgen.enabled=true \
+  --set serviceMesh.mtls.certProvider.certgen.provisionCertificates=true \
+  --set serviceMesh.proxy.enabled=true \
+  --set serviceMesh.proxy.envoy.enabled=true \
+  --set serviceMesh.proxy.envoy.resources.requests.cpu="100m" \
+  --set serviceMesh.proxy.envoy.resources.requests.memory="128Mi" \
+  --set serviceMesh.proxy.envoy.resources.limits.cpu="500m" \
+  --set serviceMesh.proxy.envoy.resources.limits.memory="512Mi" \
+  --set k8sServiceHost=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}') \
+  --set k8sServicePort=$(kubectl get service kubernetes -n default -o jsonpath='{.spec.ports[0].port}')
+```
+
+Lệnh Helm này cho phép các tính năng service mesh, bao gồm mTLS với nhà cung cấp chứng chỉ tích hợp, và proxy Envoy chia sẻ. Điều chỉnh yêu cầu/giới hạn tài nguyên cho Envoy dựa trên nhu cầu của cụm của bạn.
+
+### Thực thi Mutual TLS với `CiliumNetworkPolicy`
+
+Để thực thi mTLS giữa các dịch vụ, bạn định nghĩa một `CiliumNetworkPolicy` chỉ định xác thực bắt buộc. Cilium tự động xử lý việc cấp và xoay vòng chứng chỉ cho các dịch vụ trong mesh.
+
+Xem xét hai dịch vụ, `frontend` và `backend`, trong namespace `default`. Chúng ta muốn `frontend` chỉ giao tiếp với `backend` bằng cách sử dụng mTLS.
+
+```yaml
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: "backend-mtls-policy"
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: backend
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    authentication:
+      mode: required
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        app: frontend
+    authentication:
+      mode: required
+```
+
+Chính sách này, được áp dụng cho các pod `backend`, quy định rằng lưu lượng vào từ các pod `frontend` *phải* được xác thực lẫn nhau. Tương tự, quy tắc egress đảm bảo `backend` khởi tạo mTLS khi giao tiếp với `frontend`. Các chương trình eBPF của Cilium sẽ thực thi điều này ở lớp socket, từ chối các kết nối không được xác thực.
+
+### Quản lý lưu lượng L7 với `CiliumNetworkPolicy`
+
+Đối với các chính sách L7, Cilium tận dụng proxy Envoy chia sẻ. Ở đây, chúng ta sẽ định nghĩa một chính sách cho phép `frontend` truy cập các đường dẫn cụ thể trên `backend` và thực thi các hạn chế phương thức HTTP.
+
+```yaml
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: "backend-l7-policy"
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: backend
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    toPorts:
+    - ports:
+      - port: "8080"
+        protocol: TCP
+      rules:
+        http:
+        - method: "GET"
+          path: "/api/v1/data"
+        - method: "POST"
+          path: "/api/v1/submit"
+          headers:
+          - "X-Request-ID"
+          - "Content-Type"
+```
+
+Trong ví dụ này:
+*   `endpointSelector` nhắm mục tiêu các pod `backend`.
+*   Quy tắc `ingress` chỉ định rằng lưu lượng từ các pod `frontend` đến cổng `8080` của `backend` sẽ tuân theo các quy tắc HTTP L7.
+*   Phần `rules.http` định nghĩa các phương thức và đường dẫn HTTP được phép. Nó cũng trình bày các kiểm tra sự hiện diện của tiêu đề (trường `headers`).
+
+Khi chính sách này được áp dụng, Cilium phát hiện các quy tắc L7 và cấu hình proxy Envoy cục bộ trên node để chặn và thực thi các chính sách HTTP này cho lưu lượng giữa `frontend` và `backend`. Lưu lượng không khớp với các quy tắc này hoặc không đến cổng `8080` của `backend` sẽ tiếp tục chảy qua mặt phẳng dữ liệu eBPF mà không có sự can thiệp của Envoy.
+
+### Cổng Ingress/Egress
+
+Cilium cũng có thể hoạt động như một Cổng Ingress hoặc Egress, cung cấp một điểm kiểm soát thống nhất cho lưu lượng vào hoặc ra khỏi mesh. Điều này đặc biệt hữu ích để áp dụng các chính sách nhất quán, mTLS và khả năng quan sát cho các giao tiếp bên ngoài.
+
+```yaml
+apiVersion: "cilium.io/v2"
+kind: CiliumEgressGatewayPolicy
+metadata:
+  name: "egress-to-external-db"
+  namespace: default
+spec:
+  selectors:
+  - podSelector:
+      matchLabels:
+        app: my-app
+  destinationCIDRs:
+  - "192.0.2.0/24" # Example external database CIDR
+  egressGateway:
+    nodeSelector:
+      matchLabels:
+        egress-gateway: "true" # Label your gateway node
+```
+
+`CiliumEgressGatewayPolicy` này hướng tất cả lưu lượng egress từ các pod được gắn nhãn `app: my-app` đến CIDR `192.0.2.0/24` thông qua một node cổng egress được chỉ định. Điều này cho phép thực thi chính sách tập trung, IP masquerading và khả năng quan sát cho lưu lượng bên ngoài.
+
+## Điểm chuẩn hiệu suất & Đánh đổi
+
+Đánh giá điểm chuẩn các giải pháp service mesh là rất quan trọng để hiểu tác động hoạt động của chúng. Kiến trúc dựa trên eBPF của Cilium luôn thể hiện các đặc tính hiệu suất vượt trội so với các mesh dựa trên sidecar truyền thống, đặc biệt đối với lưu lượng L3/L4.
+
+### Phương pháp luận
+
+Các điểm chuẩn thường bao gồm:
+*   **Thông lượng**: Đo lượng dữ liệu được truyền trên một đơn vị thời gian (ví dụ: Gbps) hoặc số yêu cầu mỗi giây (RPS) cho HTTP/gRPC. Các công cụ như `iperf3`, `wrk`, `fortio`.
+*   **Độ trễ**: Đo thời gian cần thiết để hoàn thành một yêu cầu (ví dụ: độ trễ P99 tính bằng mili giây).
+*   **Mức tiêu thụ tài nguyên**: Giám sát mức sử dụng CPU và bộ nhớ của các thành phần mặt phẳng dữ liệu (sidecar, Cilium agent, Envoy daemon).
+
+Các kịch bản thử nghiệm thường bao gồm:
+*   **Giao tiếp nội node**: Giao tiếp giữa các pod trên cùng một node Kubernetes. Đây là nơi `sk_msg` mang lại lợi thế đáng kể nhất.
+*   **Giao tiếp giữa các node**: Giao tiếp giữa các pod trên các node Kubernetes khác nhau.
+*   **Chi phí mTLS**: Đo tác động của mã hóa/giải mã.
+*   **Chi phí chính sách L7**: Đo tác động của việc thực thi chính sách HTTP/gRPC.
+
+### Bảng so sánh điểm chuẩn
+
+Bảng sau đây trình bày các số liệu hiệu suất đại diện, tổng hợp kết quả từ các điểm chuẩn ngành khác nhau và các báo cáo hiệu suất của Cilium. Các con số thực tế sẽ khác nhau tùy thuộc vào phần cứng, phiên bản nhân, khối lượng công việc và điều kiện mạng.
+
+| Tính năng / Số liệu       | Cilium (eBPF L3/L4)                               | Cilium (eBPF + Envoy chia sẻ L7)                   | Istio (Envoy Sidecar)                               | Linkerd (Linkerd2-proxy Sidecar)                    |
+| :------------------------ | :------------------------------------------------ | :------------------------------------------------ | :-------------------------------------------------- | :-------------------------------------------------- |
+| **Kiến trúc**             | eBPF gốc nhân                                     | Lai: eBPF + Envoy cục bộ trên node                   | Sidecar Envoy trên mỗi pod                               | Sidecar Linkerd2-proxy trên mỗi pod                      |
+| **Vị trí mặt phẳng dữ liệu**   | Nhân Linux                                      | Nhân Linux (L3/L4) + Không gian người dùng (L7)            | Không gian người dùng (trên mỗi pod)                                | Không gian người dùng (trên mỗi pod)                                |
+| **Triển khai mTLS**       | eBPF (cấp độ nhân)                               | eBPF (cấp độ nhân)                               | Envoy (không gian người dùng)                                  | Linkerd2-proxy (không gian người dùng)                         |
+| **Thực thi chính sách L7** | N/A (chỉ L3/L4)                                  | Envoy chia sẻ (cục bộ trên node)                         | Envoy (trên mỗi pod)                                     | Linkerd2-proxy (trên mỗi pod)                            |
+| **Độ trễ nội node**       | **~0.1 - 0.2 ms** (P99)                           | **~0.3 - 0.5 ms** (P99, nếu chính sách L7 hoạt động)      | ~1.0 - 1.5 ms (P99)                                 | ~0.8 - 1.2 ms (P99)                                 |
+| **Độ trễ giữa các node**    | **~0.2 - 0.4 ms** (P99)                           | **~0.4 - 0.6 ms** (P99, nếu chính sách L7 hoạt động)      | ~1.2 - 1.8 ms (P99)                                 | ~1.0 - 1.5 ms (P99)                                 |
+| **Thông lượng (Gbps)**     | **~20-40 Gbps** (TCP thô)                         | **~15-30 Gbps** (TCP thô, nếu chính sách L7 hoạt động)    | ~10-20 Gbps (TCP thô)                               | ~12-25 Gbps (TCP thô)                               |
+| **RPS (HTTP/1.1)**        | N/A (chỉ L3/L4)                                  | **~20,000 - 40,000 RPS** (chính sách L7 đơn giản)       | ~10,000 - 25,000 RPS (chính sách L7 đơn giản)             | ~15,000 - 30,000 RPS (chính sách L7 đơn giản)             |
+| **Chi phí CPU (trên mỗi pod)**| **Không đáng kể** (agent eBPF trên mỗi node)              | **Không đáng kể** (agent eBPF + Envoy chia sẻ trên mỗi node)| ~50-150 mCPU (trên mỗi sidecar)                          | ~30-100 mCPU (trên mỗi sidecar)                          |
+| **Chi phí bộ nhớ (trên mỗi pod)**| **Không đáng kể** (agent eBPF trên mỗi node)              | **Không đáng kể** (agent eBPF + Envoy chia sẻ trên mỗi node)| ~50-150 MiB (trên mỗi sidecar)                           | ~30-100 MiB (trên mỗi sidecar)                           |
+| **Độ phức tạp vận hành**| Thấp (một agent trên mỗi node)                       | Trung bình (một agent + Envoy có điều kiện)       | Cao (vòng đời sidecar trên mỗi pod, quản lý tài nguyên)     | Trung bình (vòng đời sidecar trên mỗi pod, quản lý tài nguyên) |
+| **Đánh đổi**              | Yêu cầu nhân Linux hiện đại                      | L7 vẫn phát sinh chi phí không gian người dùng, nhưng được chia sẻ   | Mức tiêu thụ tài nguyên cao, độ trễ tăng        | Mức tiêu thụ tài nguyên trung bình, độ trễ tăng    |
+
+### Phân tích
+
+*   **Độ trễ**: Mặt phẳng dữ liệu eBPF của Cilium giảm đáng kể độ trễ, đặc biệt đối với giao tiếp nội node, bằng cách tận dụng `sk_msg` để bỏ qua ngăn xếp mạng. Ngay cả đối với lưu lượng giữa các node, việc chuyển tiếp dựa trên eBPF hiệu quả hơn `iptables` hoặc các proxy sidecar. Khi các chính sách L7 hoạt động, việc chuyển hướng đến Envoy chia sẻ sẽ gây ra một số độ trễ, nhưng nhìn chung vẫn thấp hơn so với các sidecar trên mỗi pod do đường dẫn eBPF được tối ưu hóa cho lưu lượng không phải L7 và chi phí được phân bổ của một phiên bản Envoy duy nhất.
+*   **Thông lượng**: Đường dẫn dữ liệu gốc nhân cho phép Cilium đạt được thông lượng TCP thô cao hơn. Đối với lưu lượng L7, Envoy chia sẻ vẫn có thể xử lý RPS đáng kể, thường vượt trội hơn các sidecar trên mỗi pod do giảm tranh chấp và tối ưu hóa việc sử dụng tài nguyên.
+*   **Mức tiêu thụ tài nguyên**: Đây là điểm Cilium tỏa sáng. Bằng cách loại bỏ các sidecar trên mỗi pod cho hầu hết lưu lượng, nó giảm đáng kể tổng mức tiêu thụ CPU và bộ nhớ trên toàn cụm. Tài nguyên của daemon Envoy chia sẻ được tiêu thụ một lần trên mỗi node, không phải trên mỗi pod, dẫn đến tiết kiệm đáng kể trong các triển khai lớn.
+*   **Độ phức tạp vận hành**: Quản lý một agent Cilium duy nhất và một Envoy có điều kiện trên mỗi node vốn dĩ đơn giản hơn việc quản lý hàng trăm hoặc hàng nghìn proxy sidecar, mỗi proxy có vòng đời, cấu hình và yêu cầu tài nguyên riêng.
+
+## Các lỗi thường gặp & Cạm bẫy trong sản xuất
+
+Triển khai và vận hành một service mesh, đặc biệt là một mesh được tích hợp sâu với nhân như Cilium, đi kèm với những thách thức riêng.
+
+1.  **Yêu cầu phiên bản nhân**:
+    *   **Lỗi thường gặp**: Chạy Cilium trên các phiên bản nhân Linux cũ hơn (ví dụ: < 5.10) có thể có nghĩa là một số tính năng eBPF nâng cao như `sockmap` và `sk_msg` không khả dụng hoặc ít được tối ưu hóa. Điều này có thể làm giảm hiệu suất hoặc ngăn một số tính năng service mesh hoạt động.
+    *   **Cạm bẫy**: Không xác thực phiên bản nhân trên tất cả các node trước khi triển khai có thể dẫn đến hành vi không nhất quán hoặc thiếu tính năng.
+    *   **Giảm thiểu**: Luôn kiểm tra tài liệu của Cilium để biết các phiên bản nhân tối thiểu và được khuyến nghị. Sử dụng `cilium status` và `cilium sysdump` để chẩn đoán tính khả dụng của tính năng eBPF. Lập kế hoạch nâng cấp nhân cẩn thận.
+
+2.  **Độ phức tạp của `CiliumNetworkPolicy`**:
+    *   **Lỗi thường gặp**: Các chính sách quá rộng hoặc quá cụ thể có thể dẫn đến việc lưu lượng bị chặn bất ngờ hoặc cho phép truy cập không mong muốn. Các chính sách L7, đặc biệt với regex hoặc khớp tiêu đề phức tạp, có thể khó gỡ lỗi.
+    *   **Cạm bẫy**: Áp dụng các chính sách mà không thử nghiệm kỹ lưỡng trong môi trường staging. Không sử dụng chế độ `dry-run` hoặc `audit`.
+    *   **Giảm thiểu**: Bắt đầu với các chính sách cho phép và dần dần thắt chặt chúng. Sử dụng `cilium policy get` và `cilium policy trace` để hiểu việc đánh giá chính sách. Tận dụng Hubble để có khả năng quan sát theo thời gian thực các quyết định chính sách và các kết nối bị chặn.
+
+3.  **Tranh chấp tài nguyên Envoy chia sẻ**:
+    *   **Lỗi thường gặp**: Mặc dù Envoy chia sẻ hiệu quả, một node có nhiều pod hỗ trợ L7 và khối lượng lưu lượng cao vẫn có thể làm cạn kiệt giới hạn CPU hoặc bộ nhớ của Envoy chia sẻ, dẫn đến giảm hiệu suất hoặc sự cố.
+    *   **Cạm bẫy**: Cung cấp tài nguyên không đủ cho proxy Envoy chia sẻ (`serviceMesh.proxy.envoy.resources` trong giá trị Helm).
+    *   **Giảm thiểu**: Giám sát mức sử dụng tài nguyên của daemon Envoy chia sẻ (ví dụ: `kubectl top pod -n kube-system -l k8s-app=cilium-envoy`). Điều chỉnh yêu cầu/giới hạn tài nguyên dựa trên tải quan sát được. Phân phối khối lượng công việc nặng L7 trên nhiều node hơn nếu cần.
+
+4.  **Gỡ lỗi chương trình eBPF**:
+    *   **Lỗi thường gặp**: Các chương trình eBPF chạy trong nhân, khiến chúng khó gỡ lỗi hơn các ứng dụng không gian người dùng. Lỗi trong các chương trình eBPF có thể dẫn đến lỗi nhân (kernel panics) hoặc hành vi mạng không mong muốn.
+    *   **Cạm bẫy**: Thiếu kiến thức về các công cụ eBPF hoặc kỹ thuật gỡ lỗi nhân.
+    *   **Giảm thiểu**: Cilium cung cấp các công cụ quan sát tuyệt vời như Hubble. Sử dụng `cilium monitor`, `cilium status` và `cilium debug` để có thông tin chi tiết. Đối với các vấn đề sâu hơn, `bpftool` và nhật ký nhân (`dmesg`) là rất cần thiết. Đảm bảo bật ghi nhật ký `debug` cho các agent Cilium khi khắc phục sự cố.
+
+5.  **Tương tác với các thành phần mạng khác**:
+    *   **Lỗi thường gặp**: Cilium là một CNI. Chạy một plugin CNI khác cùng với Cilium thường không được hỗ trợ và sẽ dẫn đến xung đột.
+    *   **Cạm bẫy**: Cố gắng tích hợp Cilium với các quy tắc `iptables` hiện có hoặc các lớp phủ mạng khác mà không hiểu rõ.
+    *   **Giảm thiểu**: Cilium nên là CNI duy nhất. Nếu di chuyển từ một CNI khác, hãy làm theo hướng dẫn di chuyển chính thức. Hiểu cách Cilium xử lý việc thay thế `kube-proxy` và các dịch vụ `hostPort`.
+
+6.  **Quản lý chứng chỉ mTLS**:
+    *   **Lỗi thường gặp**: Mặc dù Cilium tự động hóa việc quản lý chứng chỉ mTLS, các vấn đề với nhà cung cấp chứng chỉ (ví dụ: `certgen` hoặc tích hợp với Vault/SPIFFE) có thể ngăn các dịch vụ thiết lập kết nối mTLS.
+    *   **Cạm bẫy**: Không giám sát việc xoay vòng hoặc tính hợp lệ của chứng chỉ.
+    *   **Giảm thiểu**: Giám sát nhật ký agent Cilium để tìm lỗi liên quan đến chứng chỉ. Đảm bảo nhà cung cấp chứng chỉ đã chọn được cấu hình chính xác và có các quyền cần thiết.
+
+7.  **Khoảng trống khả năng quan sát**:
+    *   **Lỗi thường gặp**: Mặc dù Hubble cung cấp khả năng quan sát mạng tuyệt vời, nó có thể không bao gồm tất cả các số liệu hoặc dấu vết cấp ứng dụng mà một mesh sidecar truyền thống có thể hiển thị theo mặc định (ví dụ: mã trạng thái HTTP, thời lượng yêu cầu từ góc độ của proxy).
+    *   **Cạm bẫy**: Chỉ dựa vào khả năng quan sát mạng của Cilium để giám sát hiệu suất ứng dụng.
+    *   **Giảm thiểu**: Bổ sung Hubble bằng công cụ cấp ứng dụng (ví dụ: Prometheus, OpenTelemetry) để có khả năng quan sát toàn diện. Hiểu các số liệu nào được Cilium hiển thị và những gì cần được thu thập từ chính ứng dụng.
+
+## Câu hỏi thường gặp (FAQ)
+
+### Cilium Service Mesh là gì?
+Cilium Service Mesh là một giải pháp service mesh gốc Kubernetes tận dụng eBPF (extended Berkeley Packet Filter) trong nhân Linux để cung cấp mạng, bảo mật và khả năng quan sát hiệu suất cao cho các microservice. Nó nhằm mục đích cung cấp các khả năng service mesh với chi phí giảm đáng kể so với các kiến trúc dựa trên sidecar truyền thống.
+
+### Làm thế nào Cilium đạt được service mesh không sidecar?
+Cilium đạt được service mesh không sidecar bằng cách triển khai thực thi chính sách L3/L4, cân bằng tải và mTLS (mutual TLS) trực tiếp trong nhân Linux bằng cách sử dụng các chương trình eBPF. Điều này bỏ qua nhu cầu về các proxy sidecar không gian người dùng trên mỗi pod cho các chức năng cốt lõi này, giảm độ trễ và mức tiêu thụ tài nguyên.
+
+### `sk_msg` trong eBPF là gì?
+`sk_msg` là một loại chương trình eBPF cho phép chuyển hướng tin nhắn trực tiếp giữa các socket trong nhân Linux. Khi một ứng dụng gửi dữ liệu, một chương trình `sk_msg` có thể chặn nó và chuyển hướng nó đến socket nhận của một ứng dụng khác trên cùng một node, hoàn toàn bỏ qua ngăn xếp TCP/IP truyền thống, `iptables` và thiết bị loopback. Điều này giảm đáng kể độ trễ cho giao tiếp nội node.
+
+### Khi nào Cilium sử dụng Envoy?
+Cilium chỉ sử dụng Envoy khi các chính sách quản lý lưu lượng L7 nâng cao (ví dụ: định tuyến đường dẫn HTTP, thao tác tiêu đề, khớp phương thức gRPC) được cấu hình rõ ràng thông qua `CiliumNetworkPolicy`. Thay vì triển khai Envoy dưới dạng sidecar trên mỗi pod, Cilium chạy một daemon proxy Envoy duy nhất, chia sẻ trên mỗi node Kubernetes. Các chương trình eBPF sau đó sẽ chuyển hướng một cách thông minh chỉ lưu lượng yêu cầu kiểm tra L7 đến Envoy cục bộ trên node này, trong khi tất cả lưu lượng khác tiếp tục đi qua mặt phẳng dữ liệu eBPF hiệu suất cao.
+
+### Cilium là CNI hay Service Mesh?
+Cilium vừa là một plugin CNI (Container Network Interface) vừa là một service mesh. Nó hoạt động như CNI chính cho Kubernetes, cung cấp mạng và thực thi chính sách mạng. Dựa trên các khả năng CNI của mình, Cilium mở rộng chức năng của mình để cung cấp các tính năng service mesh như mTLS, quản lý lưu lượng L7 và khả năng quan sát nâng cao, tất cả đều được hỗ trợ bởi eBPF.
+
+### Lợi ích hiệu suất của Cilium Service Mesh là gì?
+Cilium Service Mesh mang lại những lợi ích hiệu suất đáng kể, bao gồm:
+*   **Độ trễ thấp hơn**: Đạt được bằng cách bỏ qua ngăn xếp mạng với `sk_msg` eBPF cho giao tiếp nội node và xử lý cấp độ nhân được tối ưu hóa cho lưu lượng giữa các node.
+*   **Thông lượng cao hơn**: Đường dẫn dữ liệu nhân trực tiếp cho phép tốc độ truyền dữ liệu lớn hơn.
+*   **Giảm mức tiêu thụ tài nguyên**: Loại bỏ nhu cầu về các proxy sidecar trên mỗi pod cho hầu hết lưu lượng, dẫn đến tiết kiệm đáng kể CPU và bộ nhớ trên toàn cụm.
+*   **mTLS hiệu quả**: mTLS cấp độ nhân giảm tải mã hóa/giải mã từ các proxy không gian người dùng, cải thiện hiệu suất.
+
+### Cilium có hỗ trợ đa cụm không?
+Có, Cilium hỗ trợ triển khai đa cụm. Nó cung cấp các tính năng như Cluster Mesh, cho phép kết nối liền mạch, thực thi chính sách và khám phá dịch vụ trên nhiều cụm Kubernetes, coi chúng như một mạng logic duy nhất. Điều này đạt được thông qua các đường hầm an toàn, được mã hóa và nhận dạng chia sẻ trên các cụm.
+
+## Kết luận
+
+Cilium Service Mesh đại diện cho một sự thay đổi mô hình trong cách các khả năng service mesh được cung cấp trong Kubernetes. Bằng cách tận dụng sức mạnh của eBPF, Cilium cung cấp một giải pháp thay thế hiệu suất cao, hiệu quả tài nguyên và đơn giản hơn về mặt vận hành so với các mesh dựa trên sidecar truyền thống. Kiến trúc lai thông minh của nó, mặc định là mặt phẳng dữ liệu gốc nhân và có điều kiện sử dụng proxy Envoy chia sẻ cho L7, đảm bảo rằng chi phí hiệu suất chỉ phát sinh khi thực sự cần thiết. Đối với các tổ chức ưu tiên độ trễ thấp, thông lượng cao và giảm chi phí vận hành trong kiến trúc microservice của họ, Cilium Service Mesh với eBPF mang đến một giải pháp hấp dẫn và bền vững trong tương lai.

@@ -1,0 +1,609 @@
+---
+title: "Kubernetes Gateway API với Envoy Gateway: Thay thế Ingress-NGINX bằng Định tuyến Lưu lượng Hiện đại"
+date: '2026-10-03'
+lastUpdated: '2026-10-03'
+tags: ["kubernetes", "envoy", "devops", "networking"]
+draft: false
+featured: true
+summary: "Hướng dẫn kiến trúc chuyên sâu về Kubernetes Gateway API với Envoy Gateway: thay thế Ingress-NGINX bằng định tuyến lưu lượng hiện đại với các ví dụ thực tế đã được kiểm chứng trong môi trường production."
+images: ['/static/images/envoy-gateway-api-kubernetes-ingress-deep-dive.png']
+category: 'Tech'
+proficiencyLevel: 'Advanced'
+programmingLanguage: 'TypeScript'
+---
+
+API Ingress của Kubernetes, dù là nền tảng, vẫn bộc lộ những hạn chế cố hữu trong việc thể hiện các chính sách quản lý lưu lượng nâng cao, kiểm soát truy cập dựa trên vai trò và định tuyến nhận biết giao thức. Những hạn chế này thường đòi hỏi các chú thích dành riêng cho nhà cung cấp hoặc định nghĩa tài nguyên tùy chỉnh (CRD), dẫn đến cấu hình rời rạc và giảm khả năng di động. API Gateway của Kubernetes nổi lên như một người kế nhiệm chiến lược, cung cấp một cách tiếp cận quản lý lưu lượng linh hoạt, mở rộng và định hướng vai trò hơn.
+
+Hướng dẫn này trình bày chi tiết sự thay đổi kiến trúc từ Ingress-NGINX sang API Gateway của Kubernetes, đặc biệt tận dụng Envoy Gateway. Chúng ta sẽ đề cập đến các tài nguyên cốt lõi của API Gateway, trình bày các mẫu định tuyến lưu lượng nâng cao, triển khai giới hạn tốc độ toàn cầu, tự động hóa chấm dứt TLS với `cert-manager` và phác thảo chiến lược di chuyển không gián đoạn.
+
+<AudioPlayer src="/static/audio/envoy-gateway-api-kubernetes-ingress-deep-dive-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## Tìm hiểu API Gateway của Kubernetes
+
+API Gateway giới thiệu một mô hình phân cấp, có cấu trúc để quản lý lưu lượng truy cập vào, được thiết kế để khắc phục những thiếu sót của API Ingress. Nó phân tách các mối quan tâm giữa các vai trò khác nhau: nhà cung cấp cơ sở hạ tầng, nhà điều hành cụm và nhà phát triển ứng dụng.
+
+### Tài nguyên cốt lõi
+
+API Gateway định nghĩa một số tài nguyên chính:
+
+1.  **`GatewayClass`**:
+    *   Định nghĩa một lớp Gateway, tương tự như `StorageClass` cho các ổ đĩa vật lý.
+    *   Chỉ định bộ điều khiển chịu trách nhiệm cung cấp và quản lý các Gateway của lớp này (ví dụ: `envoy-gateway`).
+    *   Được quản lý bởi các nhà cung cấp cơ sở hạ tầng.
+
+    ```yaml
+    apiVersion: gateway.networking.k8s.io/v1
+    kind: GatewayClass
+    metadata:
+      name: eg-standard
+    spec:
+      controllerName: gateway.envoyproxy.io/gatewayclass-controller
+      description: Envoy Gateway managed by Envoy Gateway project.
+    ```
+
+2.  **`Gateway`**:
+    *   Đại diện cho một điểm vào logic cho lưu lượng truy cập vào cụm.
+    *   Cung cấp một bộ cân bằng tải hoặc proxy thực tế (ví dụ: triển khai proxy Envoy và dịch vụ LoadBalancer).
+    *   Chỉ định các trình nghe (cổng, giao thức, tên máy chủ) và tham chiếu đến `GatewayClass`.
+    *   Được quản lý bởi các nhà điều hành cụm.
+
+    ```yaml
+    apiVersion: gateway.networking.k8s.io/v1
+    kind: Gateway
+    metadata:
+      name: eg-gateway
+      namespace: envoy-gateway-system
+    spec:
+      gatewayClassName: eg-standard
+      listeners:
+        - name: http
+          protocol: HTTP
+          port: 80
+          allowedRoutes:
+            namespaces:
+              from: All
+        - name: https
+          protocol: HTTPS
+          port: 443
+          tls:
+            mode: Terminate
+            certificateRefs:
+              - kind: Secret
+                name: example-com-tls
+          allowedRoutes:
+            namespaces:
+              from: All
+    ```
+
+3.  **`HTTPRoute`**:
+    *   Định nghĩa các quy tắc để định tuyến lưu lượng HTTP/HTTPS từ `Gateway` đến các dịch vụ phụ trợ.
+    *   Hỗ trợ khớp theo máy chủ, đường dẫn, tiêu đề và tham số truy vấn.
+    *   Cho phép các tính năng nâng cao như chia tách lưu lượng theo trọng số, chuyển hướng và viết lại.
+    *   Được quản lý bởi các nhà phát triển ứng dụng.
+
+    ```yaml
+    apiVersion: gateway.networking.k8s.io/v1
+    kind: HTTPRoute
+    metadata:
+      name: example-httproute
+      namespace: default
+    spec:
+      parentRefs:
+        - name: eg-gateway
+          namespace: envoy-gateway-system
+      hostnames:
+        - "example.com"
+      rules:
+        - matches:
+            - path:
+                type: PathPrefix
+                value: /api
+          backendRefs:
+            - name: my-service
+              port: 8080
+    ```
+
+4.  **`GRPCRoute`**:
+    *   Định tuyến chuyên biệt cho lưu lượng gRPC, cho phép khớp theo tên dịch vụ và phương thức gRPC.
+    *   Được quản lý bởi các nhà phát triển ứng dụng.
+
+    ```yaml
+    apiVersion: gateway.networking.k8s.io/v1
+    kind: GRPCRoute
+    metadata:
+      name: example-grpcroute
+      namespace: default
+    spec:
+      parentRefs:
+        - name: eg-gateway
+          namespace: envoy-gateway-system
+      hostnames:
+        - "grpc.example.com"
+      rules:
+        - matches:
+            - method:
+                service: "com.example.MyService"
+                method: "MyMethod"
+          backendRefs:
+            - name: my-grpc-service
+              port: 50051
+    ```
+
+5.  **`TLSRoute`**:
+    *   Định tuyến lưu lượng TLS dựa trên SNI (Server Name Indication) đến các dịch vụ phụ trợ.
+    *   Thường được sử dụng cho TLS truyền qua hoặc khi dịch vụ phụ trợ xử lý việc chấm dứt TLS.
+    *   Được quản lý bởi các nhà phát triển ứng dụng.
+
+    ```yaml
+    apiVersion: gateway.networking.k8s.io/v1
+    kind: TLSRoute
+    metadata:
+      name: example-tlsroute
+      namespace: default
+    spec:
+      parentRefs:
+        - name: eg-gateway
+          namespace: envoy-gateway-system
+      hostnames:
+        - "secure.example.com"
+      rules:
+        - backendRefs:
+            - name: my-secure-service
+              port: 8443
+    ```
+
+### Lợi ích kiến trúc
+
+*   **Phân tách dựa trên vai trò**: Xác định rõ ràng trách nhiệm cho các nhóm cơ sở hạ tầng, cụm và ứng dụng.
+*   **Khả năng mở rộng**: Các chính sách (ví dụ: giới hạn tốc độ, xác thực) có thể được gắn ở nhiều cấp độ khác nhau (Gateway, Route, Service) bằng cách sử dụng CRD `Policy`.
+*   **Nhận biết giao thức**: Hỗ trợ gốc cho HTTP, HTTPS, gRPC và TCP/UDP, vượt qua các hạn chế chỉ HTTP của Ingress.
+*   **Khả năng di động**: API tiêu chuẩn hóa giảm sự phụ thuộc vào nhà cung cấp và đơn giản hóa việc di chuyển giữa các triển khai.
+
+## Giới thiệu Envoy Gateway
+
+Envoy Gateway là một dự án Envoy chính thức được thiết kế để cung cấp và quản lý các proxy Envoy như một triển khai API Gateway. Nó hoạt động như một mặt phẳng điều khiển, dịch các tài nguyên API Gateway thành cấu hình động của Envoy (API xDS).
+
+### Tại sao lại là Envoy Gateway?
+
+*   **Hiệu suất**: Được xây dựng trên Envoy Proxy, nổi tiếng với hiệu suất cao, độ trễ thấp và bộ tính năng mạnh mẽ.
+*   **Khả năng mở rộng**: Tận dụng kiến trúc chuỗi bộ lọc của Envoy để thao tác lưu lượng nâng cao.
+*   **Hệ sinh thái trưởng thành**: Hưởng lợi từ các tính năng mở rộng và sự hỗ trợ của cộng đồng từ dự án Envoy Proxy.
+*   **Tính năng nâng cao**: Hỗ trợ sẵn có cho cân bằng tải theo trọng số, ngắt mạch, giới hạn tốc độ toàn cầu, khả năng quan sát nâng cao, v.v.
+*   **Hỗ trợ chính thức**: Là một dự án Envoy chính thức, nó đảm bảo sự phù hợp với lộ trình và các phương pháp hay nhất của Envoy.
+
+### So sánh: Ingress-NGINX so với Envoy Gateway
+
+| Tính năng / Chỉ số | Ingress-NGINX | Envoy Gateway (với API Gateway) | Đánh đổi |
+|---|---|---|---|
+| **Mô hình API** | API Ingress (đơn giản, dựa trên chú thích) | API Gateway (phân cấp, dựa trên vai trò) | API Gateway phức tạp hơn nhưng linh hoạt và mạnh mẽ hơn. |
+| **Khả năng mở rộng** | Hạn chế, chủ yếu thông qua chú thích dành riêng cho nhà cung cấp | Rất cao, thông qua các chính sách và CRD | Envoy Gateway cung cấp khả năng tùy chỉnh sâu hơn. |
+| **Nhận biết giao thức** | Chủ yếu HTTP/HTTPS | HTTP, HTTPS, gRPC, TCP, UDP | Envoy Gateway hỗ trợ nhiều giao thức hơn. |
+| **Hiệu suất** | Tốt, nhưng có thể bị giới hạn bởi kiến trúc NGINX | Tuyệt vời, dựa trên Envoy Proxy | Envoy Gateway thường có hiệu suất tốt hơn ở quy mô lớn. |
+| **Tính năng nâng cao** | Yêu cầu cấu hình NGINX tùy chỉnh hoặc chú thích | Hỗ trợ gốc cho nhiều tính năng nâng cao | Envoy Gateway đơn giản hóa việc triển khai các tính năng phức tạp. |
+| **Phân tách vai trò** | Hạn chế, thường trộn lẫn vai trò | Rõ ràng, phân tách vai trò hạ tầng, vận hành, phát triển | API Gateway thúc đẩy sự phân tách trách nhiệm tốt hơn. |
+| **Khả năng di động** | Có thể bị khóa nhà cung cấp do chú thích | Cao, API tiêu chuẩn hóa | API Gateway giảm sự phụ thuộc vào nhà cung cấp. |
+| **Cộng đồng & Hỗ trợ** | Lớn, cộng đồng NGINX trưởng thành | Đang phát triển nhanh chóng, được hỗ trợ bởi dự án Envoy chính thức | Cả hai đều có cộng đồng mạnh mẽ. |
+| **Độ phức tạp** | Đơn giản hơn cho các trường hợp sử dụng cơ bản | Phức tạp hơn để thiết lập ban đầu, nhưng đơn giản hơn cho các trường hợp nâng cao | Envoy Gateway có đường cong học tập ban đầu dốc hơn. |
+| **Trường hợp sử dụng** | Các trường hợp sử dụng Ingress cơ bản, các ứng dụng HTTP/HTTPS đơn giản | Các trường hợp sử dụng Ingress nâng cao, đa giao thức, kiến trúc microservice phức tạp | Envoy Gateway phù hợp hơn với các môi trường phức tạp. |
+
+## Triển khai Envoy Gateway
+
+Để bắt đầu với Envoy Gateway, bạn cần một cụm Kubernetes đang chạy.
+
+### Cài đặt Envoy Gateway
+
+Bạn có thể cài đặt Envoy Gateway bằng Helm:
+
+```bash
+helm install envoy-gateway --namespace envoy-gateway --create-namespace oci://docker.io/envoyproxy/envoy-gateway-helm --version v0.0.0
+```
+
+Xác minh rằng các pod Envoy Gateway đang chạy:
+
+```bash
+kubectl get pods -n envoy-gateway
+```
+
+Bạn sẽ thấy một đầu ra tương tự như sau:
+
+```
+NAME                                READY   STATUS    RESTARTS   AGE
+envoy-gateway-0000000000-xxxxx      1/1     Running   0          2m
+envoy-gateway-xxxxxxxxx-xxxxx       1/1     Running   0          2m
+```
+
+### Cấu hình GatewayClass
+
+Đầu tiên, chúng ta định nghĩa một `GatewayClass` để chỉ định bộ điều khiển Envoy Gateway.
+
+    ```
+
+## Installation and Initial Setup
+
+This section outlines the deployment of Envoy Gateway and the initial configuration of Gateway API resources.
+
+### Prerequisites
+
+*   A running Kubernetes cluster (v1.24+).
+*   `kubectl` configured to connect to your cluster.
+*   `helm` (v3.x+) installed.
+
+### Installing Envoy Gateway
+
+Envoy Gateway is typically installed via Helm.
+
+```bash
+# 1. Thêm kho lưu trữ Helm của Envoy Gateway
+helm repo add envoy-gateway https://envoyproxy.github.io/gateway/
+helm repo update
+
+# 2. Tạo một namespace cho Envoy Gateway
+kubectl create namespace envoy-gateway-system
+
+# 3. Cài đặt Envoy Gateway
+helm install envoy-gateway envoy-gateway/envoy-gateway -n envoy-gateway-system --version v0.0.0 # Thay thế bằng phiên bản ổn định mới nhất
+```
+
+Verify the installation:
+
+```bash
+kubectl get pods -n envoy-gateway-system
+# Kết quả mong đợi (ví dụ):
+# NAME                                        READY   STATUS    RESTARTS   AGE
+# envoy-gateway-7b8c7d4f5-abcde               1/1     Running   0          2m
+# envoy-gateway-bootstrap-7b8c7d4f5-abcde     1/1     Running   0          2m
+# eg-gateway-proxy-7b8c7d4f5-abcde            1/1     Running   0          2m
+
+kubectl get gatewayclass
+# Kết quả mong đợi:
+# NAME         CONTROLLER                         ACCEPTED   AGE
+# eg-standard  gateway.envoyproxy.io/gatewayclass-controller   True       2m
+```
+
+### Deploying a Basic Gateway
+
+After installation, the `eg-standard` GatewayClass is available. Now, deploy a `Gateway` resource that will provision an external LoadBalancer.
+
+```yaml
+# gateway.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: eg-public-gateway
+  namespace: envoy-gateway-system # Gateway thường được triển khai trong namespace của bộ điều khiển
+spec:
+  gatewayClassName: eg-standard
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All # Cho phép HTTPRoutes từ bất kỳ namespace nào được đính kèm
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: default-tls-cert # Secret này sẽ được tạo sau với cert-manager
+      allowedRoutes:
+        namespaces:
+          from: All # Cho phép HTTPRoutes từ bất kỳ namespace nào được đính kèm
+```
+
+Apply the Gateway:
+
+```bash
+kubectl apply -f gateway.yaml
+```
+
+Monitor the Gateway status until an external IP/hostname is assigned:
+
+```bash
+kubectl get gateway eg-public-gateway -n envoy-gateway-system -w
+# Kết quả mong đợi (ví dụ):
+# NAME              CLASS         ADDRESS         READY   HTTP    HTTPS   AGE
+# eg-public-gateway eg-standard   <pending>       False   80      443     10s
+# ...
+# eg-public-gateway eg-standard   192.0.2.123     True    80      443     2m
+```
+
+Note the `ADDRESS` assigned to your Gateway. This is the external IP/hostname you will point your DNS records to.
+
+## Core Routing Concepts with Envoy Gateway
+
+This section demonstrates how to configure various routing patterns using Gateway API resources.
+
+### 6.1. HTTPRoute
+
+`HTTPRoute` is the primary resource for routing HTTP/HTTPS traffic.
+
+#### Basic Path-Based Routing
+
+Route requests to `/api/v1` to `my-api-service` and `/web` to `my-web-service`.
+
+```yaml
+# services.yaml (ví dụ dịch vụ backend)
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-api-service
+spec:
+  selector:
+    app: my-api
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-api-deployment
+spec:
+  selector:
+    matchLabels:
+      app: my-api
+  template:
+    metadata:
+      labels:
+        app: my-api
+    spec:
+      containers:
+        - name: api
+          image: nginxdemos/hello:latest # Ảnh giữ chỗ
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-web-service
+spec:
+  selector:
+    app: my-web
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-web-deployment
+spec:
+  selector:
+    matchLabels:
+      app: my-web
+  template:
+    metadata:
+      labels:
+        app: my-web
+    spec:
+      containers:
+        - name: web
+          image: nginxdemos/hello:latest # Ảnh giữ chỗ
+          ports:
+            - containerPort: 8080
+```
+
+```yaml
+# httproute-path.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: path-routing-example
+  namespace: default
+spec:
+  parentRefs:
+    - name: eg-public-gateway
+      namespace: envoy-gateway-system
+  hostnames:
+    - "app.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/v1
+      backendRefs:
+        - name: my-api-service
+          port: 80
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /web
+      backendRefs:
+        - name: my-web-service
+          port: 80
+```
+
+Apply these manifests:
+
+```bash
+kubectl apply -f services.yaml
+kubectl apply -f httproute-path.yaml
+```
+
+Requests to `http://app.example.com/api/v1/users` will go to `my-api-service`, and `http://app.example.com/web/index.html` to `my-web-service`.
+
+#### Header-Based Routing
+
+Route traffic based on the presence or value of an HTTP header. This is useful for A/B testing or routing internal tools.
+
+```yaml
+# httproute-header.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: header-routing-example
+  namespace: default
+spec:
+  parentRefs:
+    - name: eg-public-gateway
+      namespace: envoy-gateway-system
+  hostnames:
+    - "app.example.com"
+  rules:
+    - matches:
+        - headers:
+            - name: X-Internal-User
+              value: "true"
+          path:
+            type: PathPrefix
+            value: /admin
+      backendRefs:
+        - name: my-admin-service # Giả sử dịch vụ này tồn tại
+          port: 80
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /admin
+      backendRefs:
+        - name: my-public-service # Giả sử dịch vụ này tồn tại
+          port: 80
+```
+
+In this example, requests to `app.example.com/admin` with `X-Internal-User: true` header will go to `my-admin-service`, otherwise to `my-public-service`.
+
+### 6.2. GRPCRoute
+
+`GRPCRoute` enables routing based on gRPC service and method names.
+
+```yaml
+# grpc-service.yaml (ví dụ backend gRPC)
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-grpc-service
+spec:
+  selector:
+    app: my-grpc-app
+  ports:
+    - protocol: TCP
+      port: 50051
+      targetPort: 50051
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-grpc-deployment
+spec:
+  selector:
+    matchLabels:
+      app: my-grpc-app
+  template:
+    metadata:
+      labels:
+        app: my-grpc-app
+    spec:
+      containers:
+        - name: grpc-server
+          image: grpc/go-grpc-example-server:latest # Máy chủ gRPC giữ chỗ
+          ports:
+            - containerPort: 50051
+```
+
+```yaml
+# grpcroute.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: grpc-routing-example
+  namespace: default
+spec:
+  parentRefs:
+    - name: eg-public-gateway
+      namespace: envoy-gateway-system
+  hostnames:
+    - "grpc.example.com"
+  rules:
+    - matches:
+        - method:
+            service: "helloworld.Greeter" # Tên dịch vụ gRPC
+            method: "SayHello" # Tên phương thức gRPC
+            type: Exact
+      backendRefs:
+        - name: my-grpc-service
+          port: 50051
+    - matches:
+        - method:
+            service: "helloworld.Greeter"
+            type: Exact # Khớp với bất kỳ phương thức nào trong dịch vụ Greeter
+      backendRefs:
+        - name: my-grpc-service
+          port: 50051
+```
+
+Apply these manifests:
+
+```bash
+kubectl apply -f grpc-service.yaml
+kubectl apply -f grpcroute.yaml
+```
+
+### 6.3. TLSRoute
+
+`TLSRoute` is used for SNI-based routing, typically for TLS passthrough where the backend service handles TLS termination.
+
+```yaml
+# tls-service.yaml (ví dụ backend TLS)
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-secure-service
+spec:
+  selector:
+    app: my-secure-app
+  ports:
+    - protocol: TCP
+      port: 8443
+      targetPort: 8443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-secure-deployment
+spec:
+  selector:
+    matchLabels:
+      app: my-secure-app
+  template:
+    metadata:
+      labels:
+        app: my-secure-app
+    spec:
+      containers:
+        - name: secure-app
+          image: nginxdemos/hello:latest # Giữ chỗ, phải là ứng dụng hỗ trợ TLS
+          ports:
+            - containerPort: 8443
+```
+
+```yaml
+# tlsroute.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata:
+  name: tls-routing-example
+  namespace: default
+spec:
+  parentRefs:
+    - name: eg-public-gateway
+      namespace: envoy-gateway-system
+      sectionName: https # Đính kèm vào listener HTTPS
+  hostnames:
+    - "secure.example.com"
+  rules:
+    - backendRefs:
+        - name: my-secure-service
+          port: 8443
+```
+
+Apply these manifests:
+
+```bash
+kubectl apply -f tls-service.yaml
+kubectl apply -f tlsroute.yaml

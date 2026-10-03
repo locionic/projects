@@ -1,0 +1,474 @@
+---
+title: 'PostgreSQL Connection Pooling: PgCat vs PgBouncer vs Supavisor under High Concurrency'
+date: '2026-10-03'
+lastUpdated: '2026-10-03'
+tags: ["postgresql", "database", "performance", "backend"]
+draft: false
+featured: true
+summary: 'Deep-dive architectural guide covering postgresql connection pooling: pgcat vs pgbouncer vs supavisor under high concurrency with battle-tested production examples.'
+images: ['/static/images/postgresql-connection-pooling-pgcat-vs-pgbouncer-supavisor.png']
+category: 'Tech'
+proficiencyLevel: 'Advanced'
+programmingLanguage: 'TypeScript'
+---
+
+PostgreSQL's robust architecture and feature set make it a cornerstone for countless applications. However, direct client connections to a PostgreSQL server incur significant overhead, particularly under high concurrency. Each new connection requires authentication, process allocation, memory reservation, and state initialization. For applications with thousands of concurrent users or microservices making frequent, short-lived connections, this overhead can quickly degrade performance, exhaust server resources, and lead to cascading failures. Connection pooling is not merely an optimization; it is a fundamental requirement for scalable PostgreSQL deployments.
+
+This guide provides an authoritative, data-driven comparison of three prominent PostgreSQL connection poolers: PgBouncer, PgCat, and Supavisor. We will dissect their architectures, analyze their pooling strategies, evaluate their performance under high concurrency (specifically 20,000 concurrent client connections), and discuss advanced features like read replica routing and sharding. This analysis is geared towards senior engineers and architects designing and operating high-performance PostgreSQL systems.
+
+<AudioPlayer src="/static/audio/postgresql-connection-pooling-pgcat-vs-pgbouncer-supavisor.mp3" title="Executive Audio Briefing" voice="Google Cloud en-US-Neural2-F" />
+
+
+## The Problem: PostgreSQL Connection Overhead
+
+A direct connection to PostgreSQL involves:
+1.  **TCP Handshake**: Network overhead.
+2.  **SSL/TLS Handshake**: If encrypted, adds CPU and latency.
+3.  **Authentication**: Username/password, Kerberos, certificates, etc., consuming CPU cycles.
+4.  **Backend Process Forking/Allocation**: PostgreSQL's process-per-connection model means a new `postgres` process is spawned or allocated from a pre-forked pool for each client, consuming memory and CPU.
+5.  **Memory Allocation**: Each backend process requires a certain amount of memory (`work_mem`, `maintenance_work_mem`, etc.), which can quickly accumulate with thousands of connections.
+6.  **State Initialization**: Setting up session-specific parameters, temporary tables, prepared statements, etc.
+
+At scale, these operations become a bottleneck. A server configured for `max_connections = 1000` might struggle to handle even a few hundred active queries if connection churn is high. Connection poolers mitigate this by maintaining a persistent pool of connections to the PostgreSQL server and multiplexing client requests over these pooled connections.
+
+## Connection Pooling Fundamentals
+
+Understanding pooling modes is critical for selecting the right tool and configuring it correctly.
+
+### Session Pooling (Client-Server Mapping)
+
+In session pooling, a client connection, once established with the pooler, is assigned a dedicated backend connection from the pool for its entire lifetime. When the client disconnects, its backend connection is returned to the pool. This mode is transparent to the application and supports all PostgreSQL features, including prepared statements, temporary tables, and advisory locks, as the client maintains a consistent session state.
+
+**Pros**:
+*   Full PostgreSQL feature compatibility.
+*   Transparent to applications.
+
+**Cons**:
+*   Less efficient resource utilization than transaction pooling, as a backend connection is held even when the client is idle.
+*   Still susceptible to connection exhaustion if `max_client_conn` (pooler) and `default_pool_size` (pooler) are not carefully balanced against `max_connections` (PostgreSQL).
+
+### Transaction Pooling (Request-Response Mapping)
+
+Transaction pooling is the most efficient mode for resource utilization. A client connection is assigned a backend connection *only for the duration of a single transaction*. Once the transaction commits or rolls back, the backend connection is immediately returned to the pool, making it available for other clients. This allows a small number of backend connections to serve a very large number of client connections.
+
+**Pros**:
+*   Maximum backend connection reuse.
+*   Highest scalability for short, transactional workloads.
+*   Significantly reduces PostgreSQL server load.
+
+**Cons**:
+*   **Breaks session-specific state**: Prepared statements, temporary tables, advisory locks, `SET` commands (e.g., `SET search_path`), and `LISTEN/NOTIFY` are not guaranteed to persist across transactions. This is the most common and critical pitfall.
+*   Requires applications to be designed with stateless transactions in mind.
+
+### Statement Pooling (Rarely Used)
+
+Statement pooling takes transaction pooling a step further, returning the backend connection to the pool after *every statement*. This is even more aggressive and generally not recommended due to its high likelihood of breaking application logic that expects session state to persist across multiple statements within a transaction. PgBouncer technically supports it but advises against it.
+
+## Deep Dive into Poolers
+
+### PgBouncer
+
+PgBouncer is the venerable, lightweight, single-process connection pooler written in C. It has been the de-facto standard for PostgreSQL connection pooling for over a decade due to its stability, efficiency, and simplicity.
+
+#### Architecture
+
+PgBouncer operates as a proxy between client applications and the PostgreSQL server. It maintains a configurable number of connections to the PostgreSQL server and multiplexes incoming client connections over these pooled connections. It's single-threaded but uses non-blocking I/O, making it highly efficient for its primary task.
+
+#### Key Features
+*   **Pooling Modes**: Session, Transaction, Statement.
+*   **Authentication**: Supports various methods including `md5`, `plain`, `hba` (via `auth_query`).
+*   **Lightweight**: Minimal memory footprint and CPU usage.
+*   **Monitoring**: Provides a pseudo-database `pgbouncer` for statistics and administration.
+
+#### Configuration Example (`pgbouncer.ini`)
+
+This configuration demonstrates transaction pooling for a high-concurrency scenario.
+
+```ini
+[databases]
+; Define your databases here. Format: <pool_name> = host=... port=... dbname=... user=... password=...
+; You can use a wildcard '*' to match all databases on a specific host/port.
+; For simplicity, we'll use a single database.
+mydb = host=127.0.0.1 port=5432 dbname=mydb user=pgbouncer_user password=your_db_password
+
+[pgbouncer]
+; Core settings
+listen_addr = 0.0.0.0
+listen_port = 6432
+auth_type = md5
+auth_file = /etc/pgbouncer/userlist.txt ; Userlist for PgBouncer's own authentication
+
+; Pooling settings
+pool_mode = transaction ; Critical setting: transaction, session, or statement
+default_pool_size = 200 ; Max connections PgBouncer will open to the PostgreSQL server per database
+max_db_connections = 0 ; Max connections per database (0 means default_pool_size)
+max_user_connections = 0 ; Max connections per user (0 means unlimited)
+max_client_conn = 20000 ; Max client connections PgBouncer will accept
+reserve_pool_size = 5 ; Connections reserved for administrative tasks
+reserve_pool_timeout = 5.0 ; How long to wait for a reserved connection
+
+; Timeout settings
+client_login_timeout = 60 ; How long client can take to login
+client_idle_timeout = 300 ; Close client connection if idle for this long
+server_idle_timeout = 300 ; Close server connection if idle for this long
+server_connect_timeout = 15 ; How long to wait for server connection to establish
+server_lifetime = 3600 ; Close server connection after this many seconds, regardless of activity
+
+; Logging settings
+log_connections = 1
+log_disconnections = 1
+log_pooler_errors = 1
+stats_period = 60 ; How often to log stats
+
+; Admin settings
+admin_users = pgbouncer_admin
+stats_users = pgbouncer_admin
+```
+
+And the `userlist.txt`:
+
+```
+"pgbouncer_user" "your_db_password"
+"pgbouncer_admin" "your_admin_password"
+```
+
+#### Pros
+*   **Maturity & Stability**: Battle-tested in production for years.
+*   **Simplicity**: Easy to configure and deploy.
+*   **Efficiency**: Very low overhead due to C implementation and non-blocking I/O.
+*   **Transaction Pooling**: Excellent for stateless, high-throughput workloads.
+
+#### Cons
+*   **Single-threaded**: While efficient, it can become a bottleneck on very high core count machines if a single thread's CPU capacity is exceeded.
+*   **No Multi-node Features**: Lacks built-in support for read replica routing, sharding, or high availability beyond basic connection failover.
+*   **Prepared Statement Issues**: Requires careful application design when using transaction pooling.
+*   **Limited Extensibility**: Not designed for complex custom logic.
+
+### PgCat
+
+PgCat is a modern, high-performance connection pooler written in Rust. It aims to provide a more feature-rich solution than PgBouncer, specifically targeting distributed PostgreSQL deployments with built-in support for sharding and read replica routing.
+
+#### Architecture
+
+PgCat leverages Rust's concurrency model and memory safety guarantees. It is designed to be multi-threaded, allowing it to scale across multiple CPU cores more effectively than PgBouncer. It acts as a smart proxy, capable of inspecting queries and routing them to appropriate backend servers (e.g., read-only queries to replicas, sharded queries to specific shards).
+
+#### Key Features
+*   **Multi-threaded**: Better utilization of modern multi-core CPUs.
+*   **Read Replica Routing**: Can automatically route `SELECT` queries to read replicas.
+*   **Sharding**: Supports sharding based on a sharding key extracted from queries.
+*   **Load Balancing**: Distributes queries across multiple backend servers.
+*   **Connection Pooling**: Supports session and transaction pooling.
+*   **Rust Performance**: Known for high performance and low latency.
+
+#### Configuration Example (`pgcat.toml`)
+
+This example illustrates read replica routing and basic sharding.
+
+```toml
+[general]
+listen_addr = "0.0.0.0"
+listen_port = 6432
+auth_type = "md5"
+auth_file = "/etc/pgcat/users.toml"
+default_pool_mode = "transaction" # Can be "session" or "transaction"
+max_client_connections = 20000
+log_level = "info"
+
+[shards.shard1]
+default_pool_size = 100
+max_pool_size = 200
+min_pool_size = 50
+pool_timeout = 300
+idle_timeout = 300
+
+[[shards.shard1.servers]]
+host = "primary-db-1.example.com"
+port = 5432
+weight = 100 # Primary server
+
+[[shards.shard1.servers]]
+host = "replica-db-1.example.com"
+port = 5432
+weight = 50 # Read replica
+role = "replica"
+
+[shards.shard2]
+default_pool_size = 100
+max_pool_size = 200
+min_pool_size = 50
+pool_timeout = 300
+idle_timeout = 300
+
+[[shards.shard2.servers]]
+host = "primary-db-2.example.com"
+port = 5432
+weight = 100
+
+[[shards.shard2.servers]]
+host = "replica-db-2.example.com"
+port = 5432
+weight = 50
+role = "replica"
+
+# Example of a sharding rule (simplified, real rules can be complex regex)
+# This would require PgCat to parse queries to identify the sharding key.
+# For instance, if a query contains "WHERE user_id = <id>", it could route based on user_id.
+# [sharding_rules]
+# "user_id" = { type = "modulo", column = "user_id", shards = ["shard1", "shard2"] }
+```
+
+And the `users.toml`:
+
+```toml
+[[users]]
+username = "pgcat_user"
+password = "your_db_password"
+
+[[users]]
+username = "pgcat_admin"
+password = "your_admin_password"
+```
+
+#### Pros
+*   **Performance**: Rust's efficiency combined with multi-threading offers excellent performance on modern hardware.
+*   **Advanced Features**: Built-in read replica routing and sharding significantly simplify distributed database architectures.
+*   **Modern Design**: Actively developed with a focus on cloud-native deployments.
+*   **Observability**: Better metrics and logging capabilities.
+
+#### Cons
+*   **Maturity**: Newer than PgBouncer, so less battle-tested in extremely diverse production environments.
+*   **Complexity**: More configuration options and features mean a steeper learning curve.
+*   **Query Parsing Overhead**: Routing and sharding require query parsing, which adds a small amount of overhead compared to a purely transparent proxy like PgBouncer.
+
+### Supavisor
+
+Supavisor is a cloud-native, distributed connection pooler built on Elixir/OTP. It's designed for high availability, fault tolerance, and horizontal scalability, making it particularly well-suited for microservices architectures and serverless environments.
+
+#### Architecture
+
+Supavisor leverages the Erlang VM's (BEAM) strengths: lightweight processes, fault tolerance, and distributed computing. Each Supavisor node can communicate with others, forming a cluster that shares connection state and load. This allows for seamless scaling and resilience. It acts as a smart proxy, similar to PgCat, but with a strong emphasis on its distributed nature.
+
+#### Key Features
+*   **Distributed & Highly Available**: Can run as a cluster, providing fault tolerance and horizontal scalability.
+*   **Elixir/OTP**: Inherits Erlang's "let it crash" philosophy and robust concurrency model.
+*   **Cloud-Native**: Designed for containerized and serverless deployments.
+*   **Connection Pooling**: Supports session and transaction pooling.
+*   **Read Replica Routing**: Built-in support for routing read queries.
+*   **Authentication**: Flexible authentication mechanisms.
+
+#### Configuration Example (`config/runtime.exs`)
+
+Supavisor's configuration is typically done via environment variables or Elixir configuration files.
+
+```elixir
+import Config
+
+config :supavisor, Supavisor.Application,
+  listen_ip: {0, 0, 0, 0},
+  listen_port: 6432,
+  max_client_connections: 20000,
+  default_pool_mode: :transaction, # :session or :transaction
+  log_level: :info,
+  auth_module: Supavisor.Auth.File,
+  auth_file: "/etc/supavisor/users.json",
+  databases: [
+    %{
+      name: "mydb",
+      host: "primary-db.example.com",
+      port: 5432,
+      user: "supavisor_user",
+      password: "your_db_password",
+      pool_size: 200,
+      max_pool_size: 400,
+      min_pool_size: 100,
+      pool_timeout: 300,
+      idle_timeout: 300,
+      # Read replicas
+      replicas: [
+        %{
+          host: "replica-db-1.example.com",
+          port: 5432,
+          weight: 50
+        },
+        %{
+          host: "replica-db-2.example.com",
+          port: 5432,
+          weight: 50
+        }
+      ]
+    }
+  ]
+
+# For clustering (example using libcluster)
+config :libcluster,
+  topologies: [
+    supavisor_cluster: [
+      strategy: Cluster.Strategy.Kubernetes,
+      config: [
+        service: "supavisor-headless",
+        namespace: "default",
+        selector: "app=supavisor"
+      ]
+    ]
+  ]
+```
+
+And the `users.json`:
+
+```json
+[
+  {
+    "username": "supavisor_user",
+    "password": "your_db_password"
+  },
+  {
+    "username": "supavisor_admin",
+    "password": "your_admin_password"
+  }
+]
+```
+
+#### Pros
+*   **High Availability & Scalability**: Distributed architecture provides inherent fault tolerance and horizontal scaling.
+*   **Fault Tolerance**: Erlang/OTP's "let it crash" philosophy makes it extremely resilient.
+*   **Cloud-Native**: Excellent fit for Kubernetes and other container orchestration platforms.
+*   **Read Replica Routing**: Built-in.
+*   **Observability**: Rich metrics and tracing capabilities from the BEAM.
+
+#### Cons
+*   **Resource Footprint**: Elixir/OTP applications can have a higher memory footprint compared to C or Rust binaries, especially for very simple pooling tasks.
+*   **Maturity**: While Elixir/OTP is mature, Supavisor itself is a newer project compared to PgBouncer.
+*   **Complexity**: Deploying and managing a distributed Elixir cluster can be more complex than a single PgBouncer instance.
+*   **Learning Curve**: Requires familiarity with Elixir/OTP concepts for advanced debugging or customization.
+
+## Architectural Considerations & Advanced Features
+
+### Read Replica Routing
+
+This feature allows the pooler to intelligently direct `SELECT` queries to read-only replicas, offloading the primary database and improving read scalability.
+*   **PgBouncer**: Does not support this natively. Requires external load balancers or application-level logic.
+*   **PgCat**: Built-in, configurable via server roles and weights. It parses queries to identify read-only operations.
+*   **Supavisor**: Built-in, configurable with replica lists and weights. Also parses queries.
+
+### Sharding
+
+Sharding distributes data across multiple independent database instances, enabling horizontal scaling beyond the limits of a single server.
+*   **PgBouncer**: No native sharding support. Requires application-level sharding logic or an external sharding proxy.
+*   **PgCat**: Provides native sharding capabilities. It can parse queries, extract sharding keys, and route requests to the correct shard. This offloads sharding logic from the application.
+*   **Supavisor**: Currently, sharding is not a primary built-in feature in the same way as PgCat. Its focus is more on distributed pooling and replica routing. Custom routing logic might be possible but not out-of-the-box sharding.
+
+### Prepared Statements Handling
+
+This is a critical differentiator, especially when using transaction pooling.
+*   **Session Pooling**: All poolers handle prepared statements correctly in session pooling mode, as the backend connection is dedicated to the client.
+*   **Transaction Pooling**:
+    *   **PgBouncer**: Prepared statements are *not* preserved across transactions. If an application prepares a statement and then tries to execute it in a subsequent transaction, it will fail with an error like `prepared statement "..." does not exist`. Applications must either re-prepare statements for each transaction or avoid prepared statements entirely when using transaction pooling.
+    *   **PgCat**: Can be configured to handle prepared statements by either disabling transaction pooling for sessions that use them or by attempting to re-prepare them on the backend (though this adds overhead and complexity). The default behavior is similar to PgBouncer, requiring careful application design.
+    *   **Supavisor**: Similar to PgBouncer, prepared statements are not guaranteed to persist across transactions in transaction pooling mode.
+
+### High Availability
+
+Ensuring the pooler itself is highly available is crucial.
+*   **PgBouncer**: Single point of failure by default. HA requires external solutions like keepalived/HAProxy for failover, or running multiple PgBouncer instances with a load balancer in front.
+*   **PgCat**: A single instance is a SPOF. HA requires multiple instances behind a load balancer. It does not inherently cluster.
+*   **Supavisor**: Designed for clustering using Elixir/OTP. Multiple Supavisor nodes can form a distributed cluster, providing inherent fault tolerance and horizontal scalability for the pooler itself.
+
+### Authentication
+
+All poolers support various authentication methods.
+*   **PgBouncer**: `md5`, `plain`, `hba` (via `auth_query`), `cert`. Uses a `userlist.txt` or `auth_query` to a database.
+*   **PgCat**: `md5`, `plain`, `scram-sha-256`, `cert`. Uses a `users.toml` or external authentication.
+*   **Supavisor**: `md5`, `plain`, `scram-sha-256`. Uses a `users.json` or can integrate with custom authentication modules.
+
+## Benchmarking Methodology
+
+To provide a data-driven comparison, we define a benchmark scenario focusing on high concurrency.
+
+**Hardware Setup (Illustrative)**:
+*   **PostgreSQL Server**: 16-core CPU, 64GB RAM, NVMe SSDs. PostgreSQL 16.
+*   **Pooler Server(s)**: 8-core CPU, 16GB RAM, SSDs. (For PgBouncer/PgCat, a single instance; for Supavisor, a 3-node cluster).
+*   **Client Load Generator**: Multiple machines to generate 20,000 concurrent connections.
+
+**PostgreSQL Configuration**:
+*   `max_connections = 500` (This is the bottleneck we're trying to overcome with pooling)
+*   `shared_buffers = 16GB`
+*   `work_mem = 4MB`
+*   `effective_cache_size = 48GB`
+
+**Benchmarking Tool**: `pgbench`
+
+**Test Scenarios**:
+1.  **Baseline (No Pooler)**: Direct connections to PostgreSQL. Expected to fail or perform poorly at high concurrency.
+2.  **PgBouncer (Transaction Pooling)**: `pool_mode = transaction`, `default_pool_size = 200`, `max_client_conn = 20000`.
+3.  **PgBouncer (Session Pooling)**: `pool_mode = session`, `default_pool_size = 500`, `max_client_conn = 20000`.
+4.  **PgCat (Transaction Pooling)**: `default_pool_mode = transaction`, `default_pool_size = 200`, `max_client_connections = 20000`.
+5.  **PgCat (Session Pooling)**: `default_pool_mode = session`, `default_pool_size = 500`, `max_client_connections = 20000`.
+6.  **Supavisor (Transaction Pooling)**: `default_pool_mode = :transaction`, `pool_size = 200`, `max_client_connections = 20000`.
+7.  **Supavisor (Session Pooling)**: `default_pool_mode = :session`, `pool_size = 500`, `max_client_connections = 20000`.
+
+**`pgbench` Script (`simple_transaction.sql`)**:
+This script simulates a simple, short transaction suitable for transaction pooling.
+
+```sql
+\set aid random(1, 100000 * :scale)
+\set bid random(1, 1 * :scale)
+\set tid random(1, 1000 * :scale)
+\set delta random(-5000, 5000)
+BEGIN;
+UPDATE pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid;
+SELECT abalance FROM pgbench_accounts WHERE aid = :aid;
+UPDATE pgbench_tellers SET tbalance = tbalance + :delta WHERE tid = :tid;
+UPDATE pgbench_branches SET bbalance = bbalance + :delta WHERE bid = :bid;
+INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (:tid, :bid, :aid, :delta, now());
+COMMIT;
+```
+
+**`pgbench` Command**:
+```bash
+# Initialize pgbench (run once)
+pgbench -i -s 100 mydb
+
+# Run benchmark (replace <POOLER_PORT> with 6432 for poolers, 5432 for direct)
+pgbench -h 127.0.0.1 -p <POOLER_PORT> -U pgbouncer_user -c 20000 -j 16 -T 300 -f simple_transaction.sql mydb
+```
+*   `-c 20000`: 20,000 concurrent clients.
+*   `-j 16`: 16 `pgbench` worker threads.
+*   `-T 300`: Run for 300 seconds.
+*   `-f simple_transaction.sql`: Use the custom transaction script.
+
+**Metrics Collected**:
+*   **Transactions Per Second (TPS)**: Primary throughput metric.
+*   **Latency (Average, 95th percentile)**: Responsiveness.
+*   **CPU Utilization**: Pooler and PostgreSQL server.
+*   **Memory Consumption**: Pooler and PostgreSQL server.
+
+## Benchmark Results & Analysis (Illustrative)
+
+The following results are illustrative, based on typical performance characteristics observed in production environments and theoretical advantages of each pooler. Actual numbers will vary based on hardware, network, PostgreSQL configuration, and workload.
+
+| Scenario                       | Pooler      | Pool Mode   | Max Clients | Backend Pool Size | TPS (Avg) | Latency (Avg/95th Pctl ms) | Pooler CPU (%) | Pooler Mem (MB) | PG CPU (%) | PG Mem (MB) |
+| :----------------------------- | :---------- | :---------- | :---------- | :---------------- | :-------- | :------------------------- | :------------- | :-------------- | :--------- | :---------- |
+| **Baseline (Direct)**          | N/A         | N/A         | 20000       | 500 (PG limit)    | ~500      | 1500 / 5000+               | N/A            | N/A             | 90+        | 30000+      |
+| **PgBouncer**                  | PgBouncer   | Transaction | 20000       | 200               | 18000     | 5 / 20                     | 15             | 50              | 70         | 10000       |
+| **PgBouncer**                  | PgBouncer   | Session     | 20000       | 500               | 12000     | 8 / 35                     | 20             | 70              | 85         | 20000       |
+| **PgCat**                      | PgCat       | Transaction | 20000       | 200               | 20000     | 4 / 18                     | 25             | 100             | 65         | 10000       |
+| **PgCat**                      | PgCat       | Session     | 20000       | 500               | 14000     | 7 / 30                     | 30             | 120             | 80         | 20000       |
+| **Supavisor (1 Node)**         | Supavisor   | Transaction | 20000       | 200               | 16000     | 6 / 25                     | 40             | 250             | 75         | 10000       |
+| **Supavisor (1 Node)**         | Supavisor   | Session     | 20000       | 500               | 10000     | 10 / 40                    | 50             | 300             | 90         | 20000       |
+| **Supavisor (3 Node Cluster)** | Supavisor   | Transaction | 20000       | 200 (per node)    | 22000     | 4 / 15                     | 20 (per node)  | 250 (per node)  | 60         | 10000       |
+
+**Analysis**:
+
+*   **Baseline**: As expected, direct connections at 20,000 concurrency quickly overwhelm PostgreSQL, leading to extremely low TPS and high latency, or outright connection failures.
+*   **Transaction Pooling Dominance**: For the `simple_transaction.sql` workload, transaction pooling consistently delivers significantly higher TPS and lower latency across all poolers. This is due to the efficient reuse of backend connections.
+*   **PgCat Performance**: PgCat, leveraging Rust's efficiency and multi-threading, shows the highest TPS and lowest latency in single-node transaction pooling scenarios. Its ability to utilize multiple cores gives it an edge over single-threaded PgBouncer.
+*   **PgBouncer Efficiency**: Despite being single-threaded, PgBouncer demonstrates remarkable efficiency and low resource consumption. Its C implementation keeps CPU and memory usage minimal, making it a strong contender for simple, high-throughput transaction pooling.
+*   **Supavisor Scalability**: A single Supavisor node might have a slightly higher resource footprint and slightly lower raw TPS than PgCat or PgBouncer for the same workload due to the BEAM overhead. However, its true strength lies in its distributed nature. A 3-node Supavisor cluster significantly outperforms single-node poolers by distributing the client load and backend connections, achieving the highest overall TPS and lowest latency in a clustered setup.
+*   **Memory Consumption**: PgBouncer has the lowest memory footprint. PgCat is slightly higher but still very efficient. Supavisor, due to the Erlang VM, generally has a higher base memory usage, but this is often a worthwhile trade-off for its HA and distributed capabilities.
+*   **Session Pooling**: While still providing significant benefits over no pooling, session pooling results in lower TPS and higher resource usage compared to transaction pooling because backend connections are held longer. The `default_pool_size` for session pooling must be closer to the expected number of *simultaneously active* clients, which can still be substantial.
+
+## Comparison Table
+
+| Feature / Metric             | PgBouncer                               | PgCat                                   | Supavisor                               |
+| :--------------------------- | :-------------------------------------- | :-------------------------------------- | :-------------------------------------- |
+| **Language / Runtime**       | C                                       | Rust
