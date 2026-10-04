@@ -1,0 +1,784 @@
+---
+title: 'eBPF Security Observability with Cilium Tetragon: Real-Time Runtime Enforcement in Kubernetes'
+images: ['/static/images/ebpf-cilium-tetragon-kubernetes-security.png']
+date: '2026-10-04'
+lastUpdated: '2026-10-04'
+tags: ["kubernetes", "security", "devops", "cloud", "ebpf"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: 'Comprehensive guide covering ebpf security observability with cilium tetragon: real-time runtime enforcement in kubernetes with production-grade architecture and code examples.'
+---
+
+Kubernetes runtime security demands granular, low-latency visibility and enforcement. Traditional approaches, relying on `ptrace` or user-space agents, introduce significant overhead and are susceptible to evasion. eBPF, specifically through Cilium Tetragon, offers a kernel-native solution for real-time security observability and enforcement with minimal performance impact. This guide details its implementation for production Kubernetes environments.
+
+<AudioPlayer src="/static/audio/ebpf-cilium-tetragon-kubernetes-security.mp3" title="Executive Audio Briefing" voice="Google Cloud en-US-Neural2-F" />
+
+
+## eBPF for Runtime Security: The Kernel Advantage
+
+eBPF enables the execution of sandboxed programs within the Linux kernel, triggered by various events like syscalls, network events, and kernel tracepoints. This provides an unparalleled vantage point for security monitoring and enforcement. Unlike user-space agents, eBPF programs operate directly in the kernel, observing events before they are processed by user applications, thus offering:
+
+1.  **Zero User-Space Latency Overhead:** Events are captured and processed in-kernel, eliminating context switching and data copying to user-space for initial analysis.
+2.  **Tamper Resistance:** eBPF programs are loaded into the kernel and are difficult for compromised user-space processes to disable or evade.
+3.  **Granular Visibility:** Access to raw syscall arguments, process context, and network metadata provides deep insights into runtime behavior.
+4.  **Dynamic Enforcement:** eBPF programs can modify syscall return values, block operations, or inject errors, enabling real-time enforcement.
+
+Cilium Tetragon leverages eBPF to provide a Kubernetes-native security observability and enforcement platform. It deploys as a DaemonSet, attaching eBPF programs to critical kernel hooks to trace syscalls such as `execve`, `openat`, `connect`, `bind`, and `accept`.
+
+### Architecture Overview
+
+Tetragon's architecture is straightforward:
+
+```mermaid
+graph TD
+    subgraph Kubernetes Node
+        K[Kernel]
+        TetragonAgent(Tetragon Agent DaemonSet)
+        AppPod1(Application Pod 1)
+        AppPodN(Application Pod N)
+    end
+
+    subgraph Control Plane / Monitoring
+        TetragonOperator(Tetragon Operator)
+        ClickHouse(ClickHouse DB)
+        Prometheus(Prometheus)
+        Grafana(Grafana)
+    end
+
+    AppPod1 -- Syscalls --> K
+    AppPodN -- Syscalls --> K
+    K -- eBPF Tracepoints --> TetragonAgent
+    TetragonAgent -- JSON Events --> ClickHouse
+    TetragonAgent -- Metrics --> Prometheus
+    Prometheus -- Scrapes --> Grafana
+    TetragonOperator -- Manages --> TetragonAgent
+    TetragonOperator -- Manages --> TracingPolicy CRDs
+```
+
+The `Tetragon Agent` runs on each node, loading eBPF programs. These programs capture events, filter them based on `TracingPolicy` CRDs, and then stream structured JSON events to standard output or a configured sink. The `Tetragon Operator` manages the lifecycle of the agents and processes `TracingPolicy` objects.
+
+## Deploying Cilium Tetragon
+
+Assuming a functional Kubernetes cluster with `kubectl` access, deploy Tetragon using Helm.
+
+```bash
+# Add Cilium Helm repository
+helm repo add cilium https://helm.cilium.io/
+
+# Update Helm repositories
+helm repo update
+
+# Install Tetragon
+# Ensure your kernel headers are available on nodes for eBPF compilation.
+# For GKE, AKS, EKS, this is typically handled. For custom kernels, you might need to install them.
+helm install tetragon cilium/tetragon --namespace kube-system \
+  --set tetragon.exporter.stdout.enabled=true \
+  --set tetragon.exporter.otlp.url="grpc://otel-collector.observability.svc.cluster.local:4317" \
+  --set tetragon.exporter.otlp.enabled=false # We'll enable this later for ClickHouse
+```
+
+Verify the deployment:
+
+```bash
+kubectl get pods -n kube-system -l app.kubernetes.io/name=tetragon
+```
+
+You should see Tetragon agent pods running on each node.
+
+## Defining Security Policies with `TracingPolicy`
+
+`TracingPolicy` is a Kubernetes Custom Resource Definition (CRD) that defines which kernel events to trace and what actions to take.
+
+### Example 1: Detecting Sensitive File Access (`/etc/shadow`)
+
+This policy traces `openat` syscalls and specifically looks for attempts to open `/etc/shadow`.
+
+```yaml
+# sensitive-file-access.yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: detect-shadow-access
+spec:
+  kprobes:
+  - call: "openat"
+    args:
+    - index: 0
+      type: "int" # dirfd
+    - index: 1
+      type: "string" # pathname
+    - index: 2
+      type: "int" # flags
+    - index: 3
+      type: "int" # mode
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Equal"
+        values:
+        - "/etc/shadow"
+      matchPIDs:
+      - operator: NotEqual
+        followForks: true
+        isNamespacePID: true
+        values:
+        - 1 # Exclude PID 1 (init process) to reduce noise
+    action: "Follow" # Log the event
+```
+
+Apply the policy:
+
+```bash
+kubectl apply -f sensitive-file-access.yaml
+```
+
+Now, let's test it. Deploy a simple pod and try to read `/etc/shadow`.
+
+```yaml
+# test-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shadow-test
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["sh", "-c", "cat /etc/shadow || echo 'Access denied'"]
+  restartPolicy: Never
+```
+
+```bash
+kubectl apply -f test-pod.yaml
+kubectl wait --for=condition=complete pod/shadow-test --timeout=60s
+kubectl logs shadow-test
+```
+
+In a separate terminal, observe Tetragon logs:
+
+```bash
+kubectl logs -n kube-system -l app.kubernetes.io/name=tetragon -f | grep "openat" | grep "/etc/shadow"
+```
+
+You will see JSON output similar to this (truncated for brevity):
+
+```json
+{"event":{"open":{"args":[{"index":0,"type":"int","value":-100},{"index":1,"type":"string","value":"/etc/shadow"},{"index":2,"type":"int","value":0},{"index":3,"type":"int","value":0}],"fd":3,"flags":"O_RDONLY","path":"/etc/shadow","pid":12345,"process_id":"shadow-test/busybox","tid":12345,"uid":0}},"node_name":"k8s-node-1","process":{"exec_id":"...","pod":{"container":{"id":"...","name":"busybox"},"name":"shadow-test","namespace":"default"}},"type":"process_open"}
+```
+
+This demonstrates real-time detection of sensitive file access.
+
+### Example 2: Detecting Reverse Shell Execution
+
+Reverse shells often involve `execve` of common shell binaries (`bash`, `sh`, `nc`) followed by network connections. This policy focuses on `execve` of suspicious binaries.
+
+```yaml
+# reverse-shell-exec.yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: detect-reverse-shell-exec
+spec:
+  kprobes:
+  - call: "execve"
+    args:
+    - index: 0
+      type: "string" # filename
+    - index: 1
+      type: "string[]" # argv
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "In"
+        values:
+        - "/bin/bash"
+        - "/bin/sh"
+        - "/usr/bin/nc"
+        - "/usr/bin/ncat"
+        - "/usr/bin/python"
+        - "/usr/bin/perl"
+        - "/usr/bin/php"
+        - "/usr/bin/ruby"
+        - "/usr/bin/zsh"
+      matchPIDs:
+      - operator: NotEqual
+        followForks: true
+        isNamespacePID: true
+        values:
+        - 1
+    action: "Follow"
+```
+
+Apply the policy:
+
+```bash
+kubectl apply -f reverse-shell-exec.yaml
+```
+
+Test it:
+
+```yaml
+# reverse-shell-test-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: reverse-shell-test
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["sh", "-c", "bash -i >& /dev/tcp/127.0.0.1/8080 0>&1 || echo 'Simulated reverse shell'"]
+  restartPolicy: Never
+```
+
+```bash
+kubectl apply -f reverse-shell-test-pod.yaml
+kubectl wait --for=condition=complete pod/reverse-shell-test --timeout=60s
+kubectl logs -n kube-system -l app.kubernetes.io/name=tetragon -f | grep "execve" | grep "/bin/bash"
+```
+
+You'll observe `execve` events for `/bin/bash`. For a more robust detection, you'd combine this with `connect` syscall tracing to identify outbound connections to unusual ports or external IPs.
+
+### Example 3: Namespace Escape Detection (Mounting Host Paths)
+
+A common namespace escape technique involves mounting host paths. While this is typically controlled by Pod Security Standards, detecting attempts to access sensitive host paths from within a container is crucial. This policy traces `openat` on common host paths.
+
+```yaml
+# host-path-access.yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: detect-host-path-access
+spec:
+  kprobes:
+  - call: "openat"
+    args:
+    - index: 0
+      type: "int"
+    - index: 1
+      type: "string"
+    - index: 2
+      type: "int"
+    - index: 3
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Prefix"
+        values:
+        - "/host/proc"
+        - "/host/sys"
+        - "/host/var/lib/docker"
+        - "/host/var/log"
+        - "/host/etc/kubernetes"
+        - "/host/root"
+        - "/host/boot"
+      matchPIDs:
+      - operator: NotEqual
+        followForks: true
+        isNamespacePID: true
+        values:
+        - 1
+    action: "Follow"
+```
+
+Apply the policy:
+
+```bash
+kubectl apply -f host-path-access.yaml
+```
+
+Test it by deploying a pod with a host path mount:
+
+```yaml
+# host-path-test-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: host-path-test
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["sh", "-c", "ls -la /host/proc/self/cgroup || echo 'Host path access attempt'"]
+    volumeMounts:
+    - name: host-proc
+      mountPath: /host/proc
+  volumes:
+  - name: host-proc
+    hostPath:
+      path: /proc
+      type: Directory
+  restartPolicy: Never
+```
+
+```bash
+kubectl apply -f host-path-test-pod.yaml
+kubectl wait --for=condition=complete pod/host-path-test --timeout=60s
+kubectl logs -n kube-system -l app.kubernetes.io/name=tetragon -f | grep "openat" | grep "/host/proc/self/cgroup"
+```
+
+This will log attempts to access `/host/proc/self/cgroup`.
+
+## Real-time Enforcement with `TracingPolicy`
+
+Beyond mere logging, Tetragon can enforce policies by terminating processes or blocking syscalls.
+
+### Example: Blocking Sensitive File Access
+
+Modify the `detect-shadow-access` policy to block the `openat` call.
+
+```yaml
+# sensitive-file-access-block.yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: block-shadow-access
+spec:
+  kprobes:
+  - call: "openat"
+    args:
+    - index: 0
+      type: "int"
+    - index: 1
+      type: "string"
+    - index: 2
+      type: "int"
+    - index: 3
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Equal"
+        values:
+        - "/etc/shadow"
+      matchPIDs:
+      - operator: NotEqual
+        followForks: true
+        isNamespacePID: true
+        values:
+        - 1
+    action: "Override" # This will block the syscall
+    return:
+      isErr: true
+      value: 1 # EPERM (Operation not permitted)
+```
+
+Apply the blocking policy (ensure the previous `detect-shadow-access` is removed or updated):
+
+```bash
+kubectl delete -f sensitive-file-access.yaml
+kubectl apply -f sensitive-file-access-block.yaml
+```
+
+Re-run the `shadow-test` pod:
+
+```bash
+kubectl delete pod shadow-test
+kubectl apply -f test-pod.yaml
+kubectl wait --for=condition=complete pod/shadow-test --timeout=60s
+kubectl logs shadow-test
+```
+
+The output from `kubectl logs shadow-test` should now show "Access denied" or a similar error, indicating the `cat` command failed to open `/etc/shadow`. Tetragon logs will show the `openat` event with an `Override` action.
+
+## Exporting Audit Logs to ClickHouse
+
+For long-term storage, analysis, and alerting, exporting Tetragon events to a robust database like ClickHouse is essential. This requires an OpenTelemetry Collector.
+
+### 1. Deploy OpenTelemetry Collector
+
+```yaml
+# otel-collector.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes", "namespaces"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector
+subjects:
+- kind: ServiceAccount
+  name: otel-collector
+  namespace: observability
+roleRef:
+  kind: ClusterRole
+  name: otel-collector
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: observability
+data:
+  otel-collector-config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+          http:
+    processors:
+      batch:
+        send_batch_size: 1000
+        timeout: 5s
+    exporters:
+      clickhouse:
+        endpoint: "tcp://clickhouse-server.observability.svc.cluster.local:9000"
+        database: "tetragon_events"
+        table: "events"
+        username: "default"
+        password: "" # Use K8s secrets for production
+        tls:
+          insecure: true # Use proper TLS in production
+    service:
+      pipelines:
+        logs:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [clickhouse]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      serviceAccountName: otel-collector
+      containers:
+      - name: otel-collector
+        image: otel/opentelemetry-collector-contrib:latest
+        command: ["/otelcol-contrib", "--config=/conf/otel-collector-config.yaml"]
+        volumeMounts:
+        - name: otel-collector-config-vol
+          mountPath: /conf
+        ports:
+        - containerPort: 4317 # OTLP gRPC
+        - containerPort: 4318 # OTLP HTTP
+      volumes:
+      - name: otel-collector-config-vol
+        configMap:
+          name: otel-collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: observability
+spec:
+  selector:
+    app: otel-collector
+  ports:
+  - name: otlp-grpc
+    protocol: TCP
+    port: 4317
+    targetPort: 4317
+  - name: otlp-http
+    protocol: TCP
+    port: 4318
+    targetPort: 4318
+```
+
+Create the `observability` namespace and apply:
+
+```bash
+kubectl create namespace observability
+kubectl apply -f otel-collector.yaml
+```
+
+### 2. Deploy ClickHouse
+
+For simplicity, a single-node ClickHouse deployment. In production, use a highly available setup.
+
+```yaml
+# clickhouse.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: clickhouse
+  namespace: observability
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clickhouse-server
+  namespace: observability
+spec:
+  selector:
+    matchLabels:
+      app: clickhouse-server
+  template:
+    metadata:
+      labels:
+        app: clickhouse-server
+    spec:
+      serviceAccountName: clickhouse
+      containers:
+      - name: clickhouse-server
+        image: clickhouse/clickhouse-server:latest
+        ports:
+        - containerPort: 8123 # HTTP
+        - containerPort: 9000 # Client
+        - containerPort: 9009 # Inter-server
+        volumeMounts:
+        - name: clickhouse-storage
+          mountPath: /var/lib/clickhouse
+        - name: clickhouse-config
+          mountPath: /etc/clickhouse-server/config.d
+        - name: clickhouse-users
+          mountPath: /etc/clickhouse-server/users.d
+      volumes:
+      - name: clickhouse-storage
+        emptyDir: {} # Use PersistentVolumeClaim in production
+      - name: clickhouse-config
+        configMap:
+          name: clickhouse-config
+      - name: clickhouse-users
+        configMap:
+          name: clickhouse-users
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse-server
+  namespace: observability
+spec:
+  selector:
+    app: clickhouse-server
+  ports:
+  - name: http
+    protocol: TCP
+    port: 8123
+    targetPort: 8123
+  - name: client
+    protocol: TCP
+    port: 9000
+    targetPort: 9000
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-config
+  namespace: observability
+data:
+  logging.xml: |
+    <yandex>
+        <logger>
+            <level>trace</level>
+            <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+            <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</log>
+            <size_log>1000M</size_log>
+            <count_log>10</count_log>
+        </logger>
+    </yandex>
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-users
+  namespace: observability
+data:
+  users.xml: |
+    <yandex>
+        <users>
+            <default>
+                <password></password>
+                <networks>
+                    <ip>::/0</ip>
+                </networks>
+                <profile>default</profile>
+                <quota>default</quota>
+            </default>
+        </users>
+    </yandex>
+```
+
+```bash
+kubectl apply -f clickhouse.yaml
+```
+
+Wait for ClickHouse to be ready. Then, connect and create the database and table:
+
+```bash
+kubectl exec -it deployment/clickhouse-server -n observability -- clickhouse-client -q "CREATE DATABASE IF NOT EXISTS tetragon_events;"
+kubectl exec -it deployment/clickhouse-server -n observability -- clickhouse-client -q "
+CREATE TABLE IF NOT EXISTS tetragon_events.events (
+    Timestamp DateTime64(9),
+    NodeName String,
+    EventType String,
+    ProcessExecID String,
+    ProcessPID UInt64,
+    ProcessTID UInt64,
+    ProcessUID UInt64,
+    ProcessName String,
+    ProcessArgs Array(String),
+    ProcessCwd String,
+    ProcessPodNamespace String,
+    ProcessPodName String,
+    ProcessContainerName String,
+    EventData String
+) ENGINE = MergeTree()
+ORDER BY (Timestamp, NodeName, EventType)
+SETTINGS index_granularity = 8192;
+"
+```
+
+### 3. Configure Tetragon to Export to OTLP
+
+Update the Tetragon Helm release to enable OTLP export:
+
+```bash
+helm upgrade tetragon cilium/tetragon --namespace kube-system \
+  --set tetragon.exporter.stdout.enabled=false \
+  --set tetragon.exporter.otlp.url="otel-collector.observability.svc.cluster.local:4317" \
+  --set tetragon.exporter.otlp.enabled=true
+```
+
+Now, re-run your test pods. Events will flow through the OpenTelemetry Collector to ClickHouse. You can query ClickHouse to see the data:
+
+```bash
+kubectl exec -it deployment/clickhouse-server -n observability -- clickhouse-client -q "SELECT * FROM tetragon_events.events LIMIT 10;"
+```
+
+## Exporting Metrics to Prometheus/Grafana
+
+Tetragon exposes Prometheus metrics. You'll need a Prometheus instance configured to scrape Tetragon pods.
+
+### 1. Deploy Prometheus (if not already present)
+
+Assuming a standard Prometheus Operator deployment, you'd create a `ServiceMonitor`.
+
+```yaml
+# prometheus-servicemonitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: tetragon-servicemonitor
+  namespace: kube-system # Or your monitoring namespace
+  labels:
+    release: prometheus-operator # Match your Prometheus operator's selector
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tetragon
+  namespaceSelector:
+    matchNames:
+    - kube-system
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+```
+
+Apply this `ServiceMonitor`. Prometheus will automatically discover and scrape Tetragon metrics.
+
+### 2. Grafana Dashboards
+
+Import pre-built Tetragon dashboards into Grafana, or create custom ones. Key metrics include:
+
+*   `tetragon_events_total`: Total events processed.
+*   `tetragon_policy_events_total`: Events matching a policy.
+*   `tetragon_policy_actions_total`: Total actions taken (e.g., `Override`).
+*   `tetragon_bpf_progs_total`: Number of eBPF programs loaded.
+*   `tetragon_bpf_map_entries_total`: eBPF map entries.
+
+These metrics provide insights into Tetragon's operational health and policy effectiveness.
+
+## Security Policy Comparison
+
+| Feature             | Traditional User-Space Agent (e.g., Falco, OSSEC) | Cilium Tetragon (eBPF)                                |
+| :------------------ | :------------------------------------------------ | :---------------------------------------------------- |
+| **Mechanism**       | `ptrace`, auditd, kernel modules, user-space hooks | eBPF programs attached to kernel tracepoints/kprobes  |
+| **Latency**         | High (context switching, data copying)            | Near zero (in-kernel processing)                      |
+| **Overhead**        | Significant CPU/memory                            | Minimal CPU/memory                                    |
+| **Tamper Resistance** | Vulnerable to user-space attacks                  | High (kernel-level, sandboxed)                        |
+| **Granularity**     | Good, but often post-event                        | Excellent (pre-syscall, raw arguments)                |
+| **Enforcement**     | Limited (process kill, firewall rules)            | Granular (syscall blocking, return value modification)|
+| **Deployment**      | DaemonSet, requires specific kernel modules       | DaemonSet, leverages standard eBPF kernel features    |
+| **Kubernetes Native** | Often requires custom integrations                | First-class Kubernetes CRDs (`TracingPolicy`)         |
+
+## Production Gotchas & Troubleshooting
+
+1.  **Kernel Headers Mismatch:**
+    *   **Symptom:** Tetragon pods fail to start, logs show errors like "failed to load BPF program: kernel headers not found" or "BPF compilation failed."
+    *   **Cause:** eBPF programs are compiled against the running kernel's headers. If the headers are missing or don't match the kernel version, compilation fails.
+    *   **Fix:** Ensure kernel headers are installed on all nodes and match the exact kernel version. For cloud providers, this is usually managed, but for custom AMIs or on-prem, you might need to install `linux-headers-$(uname -r)` or similar packages. Some distributions require `kernel-devel` or `kernel-headers`.
+
+2.  **Excessive Event Volume:**
+    *   **Symptom:** Tetragon logs are overwhelming, OTLP collector is backlogged, ClickHouse ingestion struggles, high CPU/memory usage on Tetragon agents.
+    *   **Cause:** Overly broad `TracingPolicy` definitions (e.g., tracing all `openat` calls without specific filters) can generate millions of events per second.
+    *   **Fix:**
+        *   **Refine Policies:** Be highly specific with `matchArgs`, `matchPIDs`, and `matchNamespaces`. Use `Prefix` or `Suffix` operators where appropriate.
+        *   **Rate Limiting:** Tetragon has internal rate limiting. Configure `tetragon.eventRateLimit` in Helm values.
+        *   **Batching:** Ensure your OTLP collector has appropriate batching configured (`batch` processor).
+        *   **Sampling:** For high-volume events, consider probabilistic sampling if full fidelity isn't strictly required for all events.
+
+3.  **Policy Not Triggering:**
+    *   **Symptom:** Events expected to be caught by a `TracingPolicy` are not appearing in logs or ClickHouse.
+    *   **Cause:**
+        *   Incorrect `TracingPolicy` YAML (e.g., wrong syscall name, incorrect argument index/type, `matchArgs` logic error).
+        *   Process is running in a different namespace/container than expected.
+        *   The syscall is not actually being made (e.g., `cat` uses `openat`, not `open`).
+    *   **Fix:**
+        *   **Verify Syscall:** Use `strace` on a test binary to confirm the exact syscalls and arguments.
+        *   **Check Tetragon Agent Logs:** Look for errors when applying the policy.
+        *   **Start Broad, Then Refine:** Begin with a very broad policy (e.g., trace all `execve`) and then add `matchArgs` and `matchPIDs` selectors.
+        *   **`isNamespacePID: true`:** Remember that PIDs inside a container are namespace-specific. If you're matching against host PIDs, set `isNamespacePID: false`.
+
+4.  **Enforcement (`Override`) Causing Application Issues:**
+    *   **Symptom:** Applications crash or behave unexpectedly after applying an `Override` policy.
+    *   **Cause:** Blocking a critical syscall that an application legitimately needs.
+    *   **Fix:**
+        *   **Test Thoroughly:** Always test `Override` policies in non-production environments first.
+        *   **Use `Follow` First:** Start with `action: Follow` to observe events and ensure your policy matches only malicious behavior.
+        *   **Granular Whitelisting:** If an application needs to perform a sensitive action, create a specific `TracingPolicy` to whitelist that exact action for that specific application (e.g., by `podLabels` or `containerName`).
+
+5.  **Resource Consumption on Control Plane (ClickHouse/Prometheus):**
+    *   **Symptom:** ClickHouse or Prometheus instances become overloaded due to the volume of Tetragon data.
+    *   **Cause:** High event rates from Tetragon, insufficient resources allocated to the backend systems.
+    *   **Fix:**
+        *   **Optimize Tetragon Policies:** Reduce event volume at the source.
+        *   **Scale Backend:** Vertically or horizontally scale ClickHouse and Prometheus.
+        *   **ClickHouse Optimization:** Optimize table schemas, use appropriate engines (e.g., `MergeTree`), and consider partitioning.
+        *   **Prometheus Retention:** Adjust Prometheus retention policies to manage disk usage.
+
+## Frequently Asked Questions
+
+1.  **What is the performance overhead of Tetragon?**
+    Tetragon, being eBPF-based, has minimal overhead. eBPF programs execute directly in the kernel, avoiding context switches and data copies to user-space. Benchmarks typically show single-digit percentage CPU overhead, even under high event loads, making it significantly more efficient than `ptrace`-based or user-space agents.
+
+2.  **Can Tetragon block network connections?**
+    Yes, Tetragon can block network connections by overriding syscalls like `connect`, `bind`, or `accept`. You can define `TracingPolicy` rules to match specific destination IPs, ports, or process contexts and then use `action: Override` to return an error (e.g., `EPERM`) to the calling process.
+
+3.  **How does Tetragon compare to Falco?**
+    Both Falco and Tetragon provide runtime security. Falco traditionally uses kernel modules (`falco-probe`) or `ptrace` to hook into syscalls and generates events based on user-defined rules. Tetragon exclusively uses eBPF. Tetragon generally offers lower overhead, more granular control over syscall arguments, and direct in-kernel enforcement capabilities (blocking/overriding syscalls) that are harder to achieve with Falco's traditional architecture. Falco has a broader rule set and community, but Tetragon is rapidly catching up, especially for Kubernetes-native use cases.
+
+4.  **Is Tetragon only for Kubernetes?**
+    While Tetragon is deeply integrated with Kubernetes (using CRDs, pod/container context), the underlying eBPF technology and the Tetragon agent itself can be deployed on any Linux host to monitor and enforce policies. The Kubernetes integration primarily provides the `TracingPolicy` CRD and enriches events with Kubernetes metadata.
+
+5.  **How do I handle policy management at scale across many clusters?**
+    For large-scale deployments, manage `TracingPolicy` CRDs using GitOps principles. Store policies in a Git repository and use tools like Argo CD or Flux CD to synchronize them across clusters. This ensures version control, auditability, and consistent policy application. Consider using policy generators or templating tools if you have many similar policies with minor variations.

