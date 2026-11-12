@@ -1,0 +1,220 @@
+---
+title: 'Python非同期処理＆並行処理リファレンス：イベントループ、TaskGroup、本番環境のパターン（2026年）'
+date: '2026-10-06'
+lastUpdated: '2026-10-06'
+tags: ["python", "asyncio", "concurrency", "backend", "performance"]
+draft: false
+featured: true
+summary: 'Pythonにおける非同期プログラミングの決定版リファレンス。イベントループの内部構造、TaskGroupによる構造化並行処理、フリーストレッド版CPython 3.13、コネクションプーリング、イベントループ枯渇のプロファイリングを網羅する。'
+images: ['/static/images/python-async-complete-reference.png']
+authors: ['default']
+category: Tech
+---
+
+
+
+Pythonの非同期プログラミングは、Twistedのdeferredやコールバックスパゲッティの時代から、ファーストクラスで高度に最適化された並行処理ランタイムへと変貌を遂げた。Python 3.11で導入された`asyncio.TaskGroup`のような最新機能や、Python 3.13のフリーストレッド版CPythonによるグローバルインタプリタロック（GIL）の実験的廃止に伴い、並行処理サービスの構築にはアーキテクチャの最新の理解が求められている。
+
+本リファレンスは、シニアバックエンドエンジニアおよびシステムアーキテクトに向け、Python非同期処理の内部構造、構造化並行処理のパターン、IOプーリング、そして運用におけるデバッグ手法を実践的かつ明確に解き明かす。
+
+---
+
+## 1. 内部構造：Asyncio イベントループ
+
+`asyncio`のコアは、シングルスレッドによる協調的マルチタスクである。この違いの理解は極めて重要だ。**CPUバウンドなコードをマルチコアで並列実行するものではない**。代わりに、IOの待機時間をインターリーブ（交差割り当て）することでスループットを最大化する。
+
+```
++--------------------------------------------------------------+
+| Thread Execution Context                                     |
+|                                                              |
+|   +-------------------+                                      |
+|   | Ready Queue       | ---> [Task A] ---> [Task B]          |
+|   +-------------------+                                      |
+|             ^                                                |
+|             | (epoll / kqueue notification)                  |
+|             |                                                |
+|   +-------------------+                                      |
+|   | OS Kernel Select  | ---> Waiting on Sockets, DB, HTTP    |
+|   +-------------------+                                      |
++--------------------------------------------------------------+
+```
+
+コルーチンが`await`を呼び出すと、実行制御がイベントループに返される。イベントループはOSのソケット通知システム（Linuxの`epoll`、macOS/BSDの`kqueue`）で読み書き可能になったソケットを確認し、Readyキューから次のタスクを選択して実行を再開する。
+
+### Asyncioの鉄則
+> イベントループのスレッド内で直接、同期的かつブロッキングなIOや、時間のかかるCPUバウンドな処理を実行してはならない。たった一つの`time.sleep()`や同期的なデータベース呼び出しが、そのワーカープロセスが処理しているすべての並行リクエストをブロックする。
+
+---
+
+## 2. 適切な並行処理モデルの選択
+
+現代のPythonは主に4つの並行処理メカニズムを提供する。誤ったモデルの選択は、不必要な複雑さとメモリオーバーヘッドを招く。
+
+| モデル | メカニズム | 最適なユースケース | 主な制約 |
+|---|---|---|---|
+| **Asyncio** | 協調的シングルスレッド多重化 | 大量のネットワークIO（API、Webhook、マイクロサービス） | CPU処理がイベントループをブロックする |
+| **スレッド (`threading`)** | GILのタイムスライスによるOSスレッド | レガシーなブロッキングC拡張、ディスクIO | メモリオーバーヘッド、GILの競合 |
+| **マルチプロセス (`multiprocessing`)** | 独立したヒープを持つ別OSプロセス | CPU負荷の高いデータ処理、画像/動画エンコーディング | IPC（プロセス間通信）のシリアライズコスト |
+| **フリーストレッドCPython (3.13+)** | GILに依存しないネイティブマルチコアスレッド | 単一プロセスでの共有メモリ型マルチコア演算 | エコシステムの成熟度 |
+
+---
+
+## 3. asyncio.TaskGroup による構造化並行処理
+
+Python 3.11以前は、並行タスクの調整には主に`asyncio.gather()`が用いられていた。機能要件は満たしていたものの、`gather`には危険な障害モードが存在した。1つのタスクが例外を送出しても、他のタスクは孤児（オーファン）として実行され続け、バックグラウンドタスクがリークしてしまうのだ。
+
+Python 3.11で導入された`asyncio.TaskGroup`により、真の**構造化並行処理（Structured Concurrency）**が実装された。
+
+```python
+import asyncio
+from typing import Dict, Any
+
+async def fetch_user_profile(user_id: str) -> Dict[str, Any]:
+    await asyncio.sleep(0.05) # ネットワーク呼び出しのシミュレーション
+    return {"id": user_id, "name": "Alice"}
+
+async def fetch_user_permissions(user_id: str) -> list[str]:
+    await asyncio.sleep(0.08)
+    return ["read:articles", "write:comments"]
+
+async def load_user_dashboard(user_id: str) -> Dict[str, Any]:
+    # コンテキストマネージャーにより、ブロックを抜ける際に生成された全タスクの完了またはキャンセルが保証される
+    async with asyncio.TaskGroup() as tg:
+        task_profile = tg.create_task(fetch_user_profile(user_id))
+        task_perms = tg.create_task(fetch_user_permissions(user_id))
+    
+    # ブロックを抜けた時点で、両タスクの完了が保証される
+    return {
+        "profile": task_profile.result(),
+        "permissions": task_perms.result(),
+    }
+```
+
+### TaskGroupの優位性
+1. **孤児タスクの撲滅**: コンテキストブロック内のいずれかのタスクが処理されない例外を送出した場合、`TaskGroup`はグループ内の他のすべての保留中タスクを即座にキャンセルする。
+2. **例外グループ（ExceptionGroup）**: 複数の並行エラーは`ExceptionGroup`に集約される。モダンな`except*`構文を使用することで、スタックトレースを欠落させることなく各例外を検査できる。
+
+---
+
+## 4. asyncpg による本番環境のデータベースコネクションプーリング
+
+着信するWebリクエストごとに新しいTCPハンドシェイクとPostgreSQLバックエンドプロセスを生成することは、深刻なレイテンシススパイクとコネクションプールの枯渇を引き起こす。アプリケーションのライフサイクル初期化時に、永続的なコネクションプールを必ず確立すべきである。
+
+```python
+import asyncpg
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Depends
+
+class DatabasePool:
+    def __init__(self, dsn: str):
+        self.dsn = dsn
+        self.pool: asyncpg.Pool | None = None
+
+    async def connect(self):
+        self.pool = await asyncpg.create_pool(
+            self.dsn,
+            min_size=10,
+            max_size=50,
+            max_inactive_connection_lifetime=300.0,
+            command_timeout=60.0,
+        )
+
+    async def disconnect(self):
+        if self.pool:
+            await self.pool.close()
+
+db_pool = DatabasePool("postgresql://app_user:secret@localhost:5432/production_db")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # スタートアップ: コネクションプールを確立する
+    await db_pool.connect()
+    yield
+    # シャットダウン: プールされたオープンコネクションをグレースフルに閉じる
+    await db_pool.disconnect()
+
+app = FastAPI(lifespan=lifespan)
+
+async def get_db():
+    async with db_pool.pool.acquire() as connection:
+        yield connection
+```
+
+---
+
+## 5. CPUバウンドおよびブロッキングタスクの安全なオフロード
+
+レガシーな同期ライブラリ（例：標準の`requests`、古いSDK、ディスク暗号化など）とやり取りする必要がある場合は、`asyncio.to_thread`を使用して処理をオフロードする。
+
+```python
+import asyncio
+import hashlib
+
+def calculate_argon2_hash(payload: bytes) -> str:
+    # イベントループをブロックしてしまうCPUバウンドなハッシュ計算
+    return hashlib.sha256(payload).hexdigest()
+
+async def secure_hash_endpoint(data: bytes) -> str:
+    # デフォルトのThreadPoolExecutorが管理するOSワーカースレッドへ安全にオフロードする
+    return await asyncio.to_thread(calculate_argon2_hash, data)
+```
+
+---
+
+## 6. イベントループの枯渇とレイテンシススパイクの診断
+
+中程度の負荷において非同期サービスの動作が遅延する場合、その原因はほぼ例外なく**イベントループのブロッキング**である。
+
+### イベントループのデバッグモードの有効化
+
+テスト環境やステージング環境では、asyncioのデバッグモードを有効にし、設定した閾値を超えてスレッドを占有するコルーチンをログに出力する。
+
+```python
+import asyncio
+import logging
+
+logging.basicConfig(level=logging.WARNING)
+
+async def main():
+    loop = asyncio.get_running_loop()
+    loop.set_debug(True)
+    # 100ミリ秒以上スレッドを独占するタスクに警告を出す
+    loop.slow_callback_duration = 0.100
+```
+
+ブロッキング呼び出しが実行されると、asyncioは直ちに詳細な警告を標準エラー出力に吐き出す。
+```text
+WARNING:asyncio:Executing <Task pending name='Task-4' coro=<sync_work()>> took 0.412 seconds
+```
+
+---
+
+## 7. 本番環境向けチェックリスト
+
+自身の非同期Pythonコードベース全体にわたり、以下のプラクティスが徹底されていることを確認すべきである。
+
+- [ ] **構造化並行処理**: すべてのビジネスロジックフローにおいて、`asyncio.gather()`を`asyncio.TaskGroup()`に置き換える。
+- [ ] **コネクションプーリング**: リクエストごとにアドホックなクライアントを作成するのではなく、コネクションプール（`asyncpg.create_pool`、`httpx.AsyncClient(limits=...)`）を使用する。
+- [ ] **全IOへのタイムアウト**: 信頼できない外部呼び出しは常に`asyncio.timeout(seconds)`でラップし、タスクの無限なハングを防ぐ。
+- [ ] **裸のタスク（Naked Tasks）の禁止**: 参照を保持せずにfire-and-forget（撃ち放し）スタイルで`asyncio.create_task()`を実行してはならない。バックグラウンドタスクが実行途中にガベージコレクションされる可能性がある。
+- [ ] **グレースフルなシグナル処理**: `SIGTERM`および`SIGINT`のハンドラを登録し、プロセス終了前に保留中のバックグラウンドタスクを待機し、コネクションプールをフラッシュする。
+
+---
+
+## 合わせて読みたい
+
+- [Python Asyncio 深掘り：コルーチン、タスク、イベントループ (2026年)](/ja/blog/python-asyncio-deep-dive)
+- [2026年のPython並行処理：AsyncIO vs スレッド vs プロセス](/ja/blog/multi_thread_process_and_coroutine)
+- [本番環境におけるPython非同期メモリリークのプロファイリング](/ja/blog/python-async-memory-leak-profiling)
+- [高並行処理に向けたFastAPIの最適化：Uvicorn、ワーカー、非同期パターン (2026年)](/ja/blog/optimizing-fastapi-high-concurrency)
+
+## よくある質問
+
+### Python 3.13のフリーストレッドモードにより、asyncioは時代遅れになるのか？
+ならない。フリーストレッド版PythonはGILを排除し、マルチスレッドによるCPUバウンドな並列処理に恩恵をもたらす。しかし、スレッドスタックのオーバーヘッドなしに数万の同時ネットワーク接続を処理する上で、asyncioは依然として最もメモリ効率の高いモデルである。
+
+### Python 3.11以降における `asyncio.timeout` のオーバーヘッドはどの程度か？
+Python 3.11以降では、`asyncio.timeout`はイベントループのスケジューリングに直接結びついた非同期コンテキストマネージャーとして再記述されており、レガシーな`asyncio.wait_for()`と比較してオーバーヘッドが削減されている。
+
+### HTTPレスポンスを返した後も存続するバックグラウンドタスクをどう実行すべきか？
+FastAPIのようなフレームワークでは、軽量なレスポンス後の処理に`BackgroundTasks`を使用する。より堅牢な分散タスク処理が必要な場合は、Celery、Redis RQ、ARQといったメッセージブローカーキューへ委譲する。
